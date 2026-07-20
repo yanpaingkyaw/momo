@@ -1,0 +1,30 @@
+{
+  "name": "momo-orchestrator",
+  "version": "0.1.0",
+  "description": "Momo, a local software-engineering orchestrator built with the Pi SDK",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "momo": "./dist/cli.js"
+  },
+  "scripts": {
+    "dev": "tsc -p tsconfig.build.json --watch",
+    "build": "tsc -p tsconfig.build.json && shx chmod +x dist/cli.js",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "start": "node dist/cli.js"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "0.80.10",
+    "typebox": "1.1.38"
+  },
+  "devDependencies": {
+    "@types/node": "24.12.4",
+    "shx": "0.4.0",
+    "typescript": "5.9.3",
+    "vitest": "4.1.9"
+  }
+}
