@@ -1,8 +1,25 @@
 # Momo Orchestrator Specification
 
-Status: Implemented baseline; authenticated manual acceptance pending  
-Version: 1.0.0  
-Last updated: 2026-07-20
+Status: Implemented baseline; authenticated manual acceptance pending;
+Herdr pane-worker target approved, implementation pending
+Spec version: 1.1.0
+Package implementation version: 0.1.0 (`package.json` — unchanged; do not bump
+for documentation-only Milestone 0A)
+Last updated: 2026-07-26
+
+Implementation-status summary (does not weaken normative requirements below):
+
+- Automated checks on 2026-07-26: `npm run typecheck` passed; `npm test`
+  passed 43/43 across six files; `npm run build` passed; compiled
+  `--help` / `--version` / unknown-option smoke checks passed.
+- Authenticated manual acceptance in §27 remains incomplete.
+- Current-state architecture is recorded in `Architecture.md` Part A.
+- Known implementation gaps versus some presentation/redaction expectations
+  are called out inline as **Implementation status** notes.
+- Spec 1.1.0 adds §32, the user-approved Herdr target contract.
+  **§32 implementation status: pending** until code lands. Until then, the
+  running system remains the in-process baseline described elsewhere in this
+  document and in `Architecture.md` Part A.
 
 ## 1. Purpose
 
@@ -26,16 +43,21 @@ Momo must:
 1. Provide an executable named `momo`.
 2. Reuse Pi's complete interactive terminal UI.
 3. Use the user's existing Pi models, credentials, settings, skills, and
-   repository context.
+   repository context for the parent session.
 4. Preserve the main conversation between launches.
 5. Delegate work to isolated scout, planner, implementer, and reviewer agents.
 6. Support single, parallel, and sequential delegation.
 7. Enforce a single-writer policy through tool permissions and scheduling.
 8. Stream specialist progress into the parent Pi session.
-9. Propagate failures and cancellation without leaking child processes or
-   sessions.
+9. Propagate failures and cancellation without leaking child sessions or
+   residual active child work.
 10. Provide enough structured result data for Momo to synthesize an accurate
     final response.
+
+**Implementation status:** Specialist isolation is implemented with in-process
+Pi child **sessions** (`SessionManager.inMemory`), not operating-system child
+processes. Goal 9 still requires that cancelled or finished work does not leave
+active child sessions behind.
 
 ## 3. Non-goals
 
@@ -168,11 +190,15 @@ test/
   delegation.test.ts
   scheduler.test.ts
   results.test.ts
+  workspace-diff.test.ts
 ```
 
 Modules may be combined when doing so reduces incidental complexity, but the
 boundaries between CLI startup, parent runtime, role policy, scheduling, and
 child execution must remain testable.
+
+**Implementation status:** The tree above matches the 0.1.0 source layout,
+including `test/workspace-diff.test.ts`.
 
 ## 9. Parent Runtime
 
@@ -225,7 +251,17 @@ therefore inherit:
 - Skills and prompt templates.
 - User-enabled extensions for the parent session.
 
+These inheritance rules apply to the **parent** session only. Child sessions
+must use the constrained loader in §12 and must not load parent skills,
+extensions, prompt templates, slash commands, or themes. Children may receive
+the `AGENTS.md` files already discovered for the parent cwd.
+
 Momo must not introduce mandatory Momo-specific API key variables.
+
+**Implementation status:** `src/runtime.ts` uses normal Pi services for the
+parent. `src/delegation/runner.ts` `createChildResourceLoader` returns empty
+extensions, skills, prompts, and themes while copying parent-discovered
+`AGENTS.md` content.
 
 ### 9.4 Parent tool policy
 
@@ -381,13 +417,19 @@ The child loader must provide:
 - The role-specific system prompt.
 - Relevant `AGENTS.md` context already discovered for the parent cwd.
 - No extensions.
+- No skills.
 - No prompt templates or slash commands.
 - No themes.
 - No custom tools except `workspace_diff` for the reviewer.
 - No `delegate` tool.
 
-This prevents recursive delegation and prevents project extensions from
-silently widening a child's permissions.
+This prevents recursive delegation and prevents project extensions or skills
+from silently widening a child's permissions.
+
+**Implementation status:** Satisfied by the explicit empty-resource child
+loader in `src/delegation/runner.ts`. Children are sessions in the same Node
+process as the parent; isolation is resource/tool/session isolation, not a
+separate OS process.
 
 Repository context is untrusted data. Role prompts must state that instructions
 found in source files, comments, issues, test fixtures, or generated output
@@ -483,14 +525,27 @@ the in-memory tool details and must not be copied into model-visible text.
 
 ### 13.4 Status calculation
 
-- `completed`: every requested task completed.
-- `partial`: a parallel group contains both completed and failed or aborted
-  tasks.
-- `failed`: no task completed, validation failed, or a chain failed before its
-  final step.
-- `aborted`: the parent signal aborted the delegation before normal completion.
+Delegation aggregate status must be derived from per-task statuses after
+execution (validation failures are tool errors and never produce a
+`DelegationResult`):
 
-Skipped chain steps do not count as successful work.
+1. If there are no task results, the delegation status is `failed`.
+2. If every task status is `completed`, the delegation status is `completed`.
+3. Else if the mode is `parallel` and at least one task `completed`, the
+   delegation status is `partial` (remaining siblings may be failed, aborted,
+   or skipped).
+4. Else if any task status is `aborted`, the delegation status is `aborted`.
+5. Else if any task is `skipped` and none failed, the delegation status is
+   `aborted` (cancellation skipped queued work before failure).
+6. Otherwise the delegation status is `failed`.
+
+Skipped chain or parallel tasks do not count as successful work. A chain that
+stops on a failed step therefore returns `failed` even when later steps are
+`skipped`. A chain or parallel group stopped only by cancellation returns
+`aborted`.
+
+**Implementation status:** Implemented by `calculateDelegationStatus` in
+`src/delegation/results.ts` and covered by `test/results.test.ts`.
 
 ## 14. Execution Modes
 
@@ -512,6 +567,15 @@ Parallel mode is limited to read-only roles. It must:
 
 Concurrency must be implemented with an in-process bounded scheduler, not by
 starting all promises and applying a display-only limit.
+
+Independent of parallel validation, implementer tasks must also be serialized
+by a runner-level writer mutex so overlapping `delegate` calls cannot mutate
+the repository concurrently.
+
+**Implementation status:** `writerTail` in `src/delegation/runner.ts`
+serializes `canWrite` tasks across concurrent `run()` invocations on the same
+`DelegationRunner` instance. The mutex is process-local and per-runner; it does
+not coordinate separate Momo processes.
 
 ### 14.3 Chain
 
@@ -549,6 +613,10 @@ For each task, the runner must:
 Children must never be reused across tasks. This guarantees isolated context
 and avoids one specialist's instructions contaminating another specialist.
 
+**Implementation status:** Child workers are Pi `AgentSession` instances created
+in the parent Node process. Lifecycle dispose/abort applies to those sessions;
+Momo does not spawn specialist OS child processes.
+
 ## 16. Progress Streaming
 
 The delegate tool should emit updates for:
@@ -566,6 +634,19 @@ update callback was supplied.
 
 Tool arguments may be summarized for display, but secrets and full environment
 variables must never be rendered.
+
+**Implementation status:**
+
+- Text deltas are coalesced on an approximately 100ms cadence in
+  `src/delegation/runner.ts`.
+- Tool progress messages currently include the tool name only and do not
+  forward tool arguments.
+- Thinking/hidden-reasoning blocks are not used as final task output
+  (`extractLastAssistantText`), but streamed `text_delta` progress is forwarded
+  as plain text with **no dedicated secret-redaction filter**.
+- The normative "secrets must never be rendered" requirement therefore remains
+  only partially met: argument omission helps, but progress text is not
+  scrubbed.
 
 ## 17. Output Extraction and Limits
 
@@ -645,6 +726,14 @@ be idempotent.
 The CLI must dispose the parent runtime in `finally` during normal exit and
 handled startup failure.
 
+**Implementation status:** The bounded wait applies to each child's abort
+promise and defaults to five seconds (`CHILD_ABORT_TIMEOUT_MS` in
+`src/delegation/runner.ts`). There is **no** overall per-task or
+per-delegation execution timeout in version 0.1.0; wall-clock task timeouts
+remain deferred (§29). Cancellation therefore depends on cooperative Pi
+session abort plus the five-second abort-promise wait, after which disposal
+still runs.
+
 ## 21. Error Handling
 
 Expected failures must become structured task or tool errors rather than
@@ -685,11 +774,15 @@ The implementation must enforce these available boundaries:
 - Children cannot delegate recursively.
 - Delegation cannot override cwd, model, tools, role prompt, or session storage.
 - Reviewer commands are fixed and do not accept shell input.
-- Child sessions do not load project extensions.
+- Child sessions do not load project extensions or skills.
 - Temporary secrets must not be logged or returned in progress output.
 
 The documentation must clearly state that an implementer's shell commands run
 with the same operating-system permissions as the Momo process.
+
+**Implementation status:** Extension/skill isolation and tool allowlists are
+enforced in code. Progress secret redaction remains incomplete (§16). Writer
+serialization is per-runner/process-local (§14.2).
 
 ## 23. Observability
 
@@ -713,6 +806,12 @@ Expanded tool output should additionally show:
 
 Momo must not create a separate telemetry service in version 1.
 
+**Implementation status:** Version 0.1.0 relies on **default Pi tool-result
+rendering** plus delegate progress/`formatDelegationResult` text. Momo does
+not implement a custom collapsed/expanded presentation layer. Whether Pi's
+default rendering satisfies the collapsed/expanded checklist above is
+**unverified**; authenticated UI acceptance remains pending (§27).
+
 ## 24. Configuration
 
 Version 1 intentionally has few Momo-specific settings.
@@ -726,12 +825,17 @@ Fixed defaults:
 | Maximum parallel concurrency | 4 |
 | Model-visible output per task | 50 KiB |
 | Child abort wait timeout | 5 seconds |
+| Overall task / delegation timeout | None in v1 (deferred) |
 | Parent session storage | Persistent Pi session |
 | Child session storage | In memory |
 | Child delegation | Disabled |
 
 These values should be named constants and covered by tests. They are not CLI
 flags in version 1.
+
+**Implementation status:** Named constants exist for task caps, parallel
+concurrency, 50 KiB output, and the five-second abort wait. There is still no
+overall task timeout setting.
 
 ## 25. Build and Development Scripts
 
@@ -844,7 +948,25 @@ Compiled CLI smoke tests must verify:
 - Positional arguments become one initial message.
 - Startup failures exit `1` with a concise diagnostic.
 
+### 26.8 Workspace diff tests
+
+Tests must cover the fixed reviewer Git tool:
+
+- Exact command argument arrays.
+- Non-Git cwd returns a non-fatal explanation.
+- Output truncation uses the shared 50 KiB limit.
+
 Automated tests must not require network access or real provider credentials.
+
+**Implementation status (2026-07-26):** `npm test` passed 43/43 across the six
+files listed in §8. Remaining coverage gaps relative to this section:
+
+- Compiled CLI binary smoke checks (help/version/unknown-option) were verified
+  outside Vitest on 2026-07-26; startup-failure exit `1` remains less
+  thoroughly automated against a live Pi runtime failure.
+- No automated test asserts active secret redaction of streamed progress text.
+- No automated test asserts a custom collapsed/expanded TUI presentation.
+- No authenticated end-to-end delegation test with a real model provider.
 
 ## 27. Manual Acceptance Scenarios
 
@@ -892,7 +1014,8 @@ Pi account and a disposable Git fixture repository.
 2. Press Ctrl+C while children are active.
 3. Confirm active child sessions abort.
 4. Confirm queued tasks never start.
-5. Confirm no child process or session remains active.
+5. Confirm no child session remains active (specialists are in-process
+   sessions, not separate OS processes).
 6. Confirm Momo can accept another prompt or exit cleanly.
 
 ## 28. Definition of Done
@@ -910,6 +1033,10 @@ Momo version 1 is complete only when:
 8. Cancellation and all failure paths dispose child sessions.
 9. User-facing documentation explains setup, usage, role behavior, and the
    absence of operating-system sandboxing.
+10. Current-state architecture is documented in `Architecture.md`.
+11. When claiming Herdr pane-worker support, §32 and its acceptance matrix are
+    satisfied. Until then, §32 remains implementation-pending and must not be
+    advertised as shipped behavior.
 
 ## 29. Deferred Enhancements
 
@@ -918,7 +1045,8 @@ The following may be considered after version 1:
 - User-defined roles loaded from trusted global configuration.
 - Project roles with explicit trust confirmation.
 - Per-role model and thinking-level selection.
-- Git worktree isolation for parallel implementers.
+- Git worktree isolation for parallel implementers as a **product runtime**
+  feature (distinct from delivery-governance worktrees in §32.12).
 - Configurable concurrency and output limits.
 - A non-interactive print mode.
 - JSON-RPC integration.
@@ -926,32 +1054,58 @@ The following may be considered after version 1:
 - Cost budgets and task timeouts.
 - Containerized implementers.
 - Remote workers and distributed scheduling.
+- Upstream Herdr native `momo` agent kind (until then §32 uses kind `pi` with
+  display name Momo).
 
 Deferred features must not weaken the version 1 permission boundaries when
 introduced.
+
+**Note:** §32 Herdr pane workers are an approved additive target tracked in
+spec 1.1.0. They are not deferred; they are **implementation-pending**.
 
 ## 30. Verified Implementation Notes
 
 The version 0.1.0 implementation established these SDK-specific details:
 
+- Spec contract version is `1.1.0` after Milestone 0A documentation; the
+  published package metadata version remains `0.1.0` until Herdr code ships.
+  Do not treat those numbers as interchangeable.
 - The delegate schema uses `Type.Unsafe` to emit a JSON Schema string enum.
   This matches Pi's `StringEnum` wire shape without adding a direct dependency
   on the transitive `@earendil-works/pi-ai` package.
 - A runner-level promise mutex serializes implementers across separate,
-  concurrently requested delegations. Parallel request validation alone is not
-  sufficient to enforce the single-writer invariant.
+  concurrently requested delegations on the same runner. The lock is
+  process-local; parallel request validation alone is not sufficient.
+- Children are ephemeral in-process Pi sessions with empty extensions/skills
+  loaders. They are not OS child processes and do not inherit parent
+  extensions.
+- Aggregate delegation status follows `calculateDelegationStatus` (§13.4).
 - When cancellation occurs before child startup, one affected task is marked
   `aborted` and later unstarted tasks are marked `skipped`. This preserves an
   aggregate `aborted` status while accurately describing work that never ran.
-- Truncated task output is capped for model visibility while the complete text
-  remains available as optional `fullOutput` in in-memory tool details.
+- Cancellation waits up to five seconds for each child's abort promise and does
+  not impose an overall task timeout.
+- Truncated task output is capped at 50 KiB for model visibility while the
+  complete text remains available as optional `fullOutput` in in-memory tool
+  details.
+- Progress uses default Pi tool updates; custom collapsed/expanded presentation
+  from §23 is unverified. Progress text is not actively redacted for secrets.
 - Parent startup creates the Pi sessions parent directory for a clean first-run
   environment. No Momo-specific session store is introduced.
+- Current Herdr observations (operator-run smoke executed and captured by Pi
+  in the operator environment on 2026-07-26; authoritative for that run, but
+  **not** covered by repository automated tests or a checked-in evidence
+  artifact): Momo launched in a disposable Herdr pane (historical pane id
+  `w1:p5`), loaded `herdr-agent-state.ts`, was reported as `agent: pi` with
+  title `π - momo`, and `herdr agent prompt` failed with `agent_not_ready`
+  because Momo was no longer considered the pane foreground process. This is
+  a confirmed observed limitation from that smoke, not established Herdr
+  compatibility and not a future design.
 
-As of 2026-07-20, type-checking, 42 automated tests, the production build,
-compiled CLI help/version/error checks, and an SDK runtime construction smoke
-test pass. Authenticated TUI execution and the manual scenarios in section 27
-remain pending because this environment has no configured Pi credentials.
+As of 2026-07-26, `npm run typecheck` passed, `npm test` passed 43/43 across
+six files, `npm run build` passed, and compiled CLI help/version/unknown-option
+smoke checks passed. Authenticated TUI execution and the manual scenarios in
+section 27 remain incomplete.
 
 ## 31. References
 
@@ -960,3 +1114,180 @@ remain pending because this environment has no configured Pi credentials.
   <https://github.com/earendil-works/pi/tree/main/packages/coding-agent/examples/extensions/subagent>
 - Pi coding agent package:
   <https://www.npmjs.com/package/@earendil-works/pi-coding-agent>
+- Herdr home: <https://herdr.dev>
+- Herdr socket API docs: <https://herdr.dev/docs/socket-api/>
+- Current-state and approved-target architecture: `Architecture.md`
+
+## 32. Herdr Pane-Worker Target Contract (Approved; Implementation Pending)
+
+This section is normative for the user-approved Herdr target. Requirements use
+**must**, **must not**, **should**, and **may** as elsewhere.
+
+**Implementation status:** Pending. No package implementation version bump is
+authorized by documentation-only Milestone 0A. Until the implementation lands
+and acceptance in §32.11 passes, Momo must continue to behave according to the
+baseline in-process contract when Herdr mode is not active.
+
+Architecture companion: `Architecture.md` §13–§14 (ADR-009 through ADR-014).
+
+### 32.1 Mode selection
+
+Momo must select a specialist backend as follows:
+
+1. If Herdr is not detected, Momo must use the in-process specialist backend.
+2. If an explicit in-process override is set, Momo must use the in-process
+   backend even when Herdr is detected.
+3. If Herdr is detected and no in-process override is set, Momo must use the
+   Herdr pane-worker backend for every accepted specialist task.
+4. If Herdr is detected but the environment is incompatible or unusable for the
+   pane-worker backend, Momo must **fail closed**: return a clear delegation
+   error and must not silently fall back to in-process execution.
+
+### 32.2 Parent process and identity
+
+1. The `momo` executable must act as a thin wrapper that launches a canonical
+   Pi foreground parent session suitable for Herdr agent detection.
+2. The underlying Herdr agent kind must be `pi`.
+3. The user-visible display name must be **Momo**, provided through a Momo
+   parent Pi extension and Herdr metadata reporting.
+4. An upstream native Herdr kind named `momo` is deferred and must not block
+   this target.
+5. Specialist pane creation must use no-focus allocation so the parent pane
+   remains the user's controllable foreground agent whenever practical.
+
+### 32.3 Pane-per-worker execution
+
+For each accepted `scout`, `planner`, `implementer`, or `reviewer` task while
+the Herdr pane-worker backend is active, Momo must:
+
+1. Create one **new** Herdr pane for that task.
+2. Allocate that pane when the task is accepted/queued, not only when it becomes
+   active.
+3. Launch a **full Pi TUI** worker in that pane, constrained to the task role.
+4. Expose detailed live specialist activity in that pane for human observation.
+
+Momo must not keep Herdr-mode specialists as invisible in-process-only sessions.
+
+### 32.4 Concurrency and writer lease
+
+While the Herdr pane-worker backend is active:
+
+1. Momo must run at most four **active** read-only workers at a time.
+2. Momo must run at most one implementer at a time across processes via a
+   cross-process writer lease.
+3. Queued tasks may own allocated panes while waiting, but must not become
+   active in violation of (1) or (2).
+4. Parallel delegation must continue to reject implementers at validation time.
+5. The in-process runner mutex remains necessary for the in-process backend but
+   is not sufficient alone for Herdr workers.
+
+### 32.5 Role and tool restrictions
+
+Herdr workers must enforce the same role tool allowlists as the baseline roles:
+
+- scout/planner: `read`, `grep`, `find`, `ls`
+- implementer: `read`, `grep`, `find`, `ls`, `bash`, `edit`, `write`
+- reviewer: `read`, `grep`, `find`, `ls`, `workspace_diff`
+
+Workers must not receive `delegate`. Workers must not load capability-widening
+skills or extensions. A minimal Herdr/Momo reporter hook may load only if it
+cannot add tools or widen permissions.
+
+### 32.6 Authoritative IPC
+
+1. Parent and worker must communicate through a private, versioned IPC schema
+   for task input, heartbeats, progress, and final results.
+2. IPC must be the authoritative channel for orchestration and `TaskResult`
+   ingestion.
+3. Momo must not scrape pane TTY output or `herdr pane read` to determine
+   completion or to extract final results.
+4. Pane TTY output is for humans and debugging only.
+
+### 32.7 Herdr CLI invocation
+
+1. Momo must invoke the `herdr` CLI with an argv array and must not use a
+   shell for those invocations.
+2. Momo must validate Herdr JSON responses before acting on identifiers, pane
+   state, or errors.
+3. Initial supported platforms are macOS and Linux.
+4. Acceptance must record the aligned tested Pi SDK version and Herdr CLI /
+   protocol version used.
+
+### 32.8 Cancellation, heartbeat, crash, and uncertain write
+
+1. Parent cancellation must stop scheduling, signal active workers, bound the
+   wait for shutdown, and mark tasks `aborted` or `skipped` per baseline status
+   rules.
+2. Workers must renew an IPC heartbeat while running. A stale heartbeat must be
+   treated as worker failure/unresponsiveness.
+3. A crash or exit without a valid result record must not be reported as
+   successful completion.
+4. If an implementer held the writer lease and ends without a clean successful
+   result after it may have mutated the repository, Momo must surface an
+   **uncertain-write** condition to the parent/user and must not claim verified
+   success.
+5. Writer lease release semantics must be deterministic and tested for success,
+   abort, crash, and uncertain-write paths.
+
+### 32.9 Pane retention and cleanup
+
+1. Panes for completed, failed, and aborted specialist tasks must be retained
+   until explicit cleanup.
+2. Momo must not auto-close those panes on completion as part of this target.
+3. Momo must provide an explicit cleanup path (command and/or documented
+   operator procedure) for retained specialist panes.
+4. Parent shutdown must still track pane IDs and must not leave unmanaged
+   worker processes running, even when panes remain for inspection.
+
+### 32.10 Fallback summary
+
+| Condition | Required backend |
+|---|---|
+| Herdr not detected | In-process |
+| Explicit in-process override | In-process |
+| Herdr detected and compatible | Pane-per-worker |
+| Herdr detected but incompatible | Fail closed (error) |
+
+### 32.11 Manual / live Herdr acceptance matrix
+
+Before the Herdr target is considered implemented, operators must verify at
+least the following with a real Herdr session and configured Pi model:
+
+1. Parent launches as controllable Pi foreground with display name Momo.
+2. `herdr agent prompt` against the parent succeeds while the parent is the
+   pane foreground agent.
+3. A single scout task opens a new pane with a full Pi TUI and live activity.
+4. Parallel read-only tasks allocate panes immediately and never exceed four
+   active read-only workers.
+5. An implementer acquires the cross-process writer lease; a second implementer
+   waits or is serialized; parallel implementer validation still fails.
+6. Progress and final results arrive over IPC; killing TTY readability does not
+   corrupt authoritative completion if IPC remains intact.
+7. Cancellation aborts active workers and skips queued work without orphan
+   processes.
+8. Crash and uncertain-write paths surface correctly for implementers.
+9. Completed/failed/aborted panes remain until explicit cleanup.
+10. Outside Herdr, specialists remain in-process.
+11. Explicit in-process override works inside Herdr.
+12. Incompatible Herdr detection fails closed with a clear error.
+13. macOS and Linux smoke notes recorded with Pi SDK and Herdr versions.
+
+Automated mocked-Herdr tests must cover IPC, lease, allocation, cancellation,
+and fail-closed logic without requiring a live Herdr server. Live Herdr tests
+may be env-gated and must not be required for credential-free CI.
+
+### 32.12 Delivery governance
+
+1. Implementation of §32 must occur in a separate development Git worktree /
+   feature branch and be submitted through a GitHub pull request.
+2. That worktree/PR process is **delivery governance only**.
+3. Momo must not automatically create Git worktrees as a product runtime
+   mechanism for Herdr specialists in this target.
+
+### 32.13 Non-goals for this target
+
+- Upstream Herdr native `momo` kind.
+- Automatic product Git worktrees for specialist isolation.
+- Windows support in the initial delivery.
+- TTY scraping as an orchestration control plane.
+- Silent in-process fallback when Herdr is detected but broken.
