@@ -514,6 +514,20 @@ export async function adoptPoolWorkers(
 					}
 
 					if (!getRole(worker.role).canWrite) {
+						// Read-only active/no-result: retain exact busy only while Herdr
+						// proves live work. Idle/done/unknown/missing → unhealthy so
+						// default cleanup can terminalize without leaving a stopped
+						// worker stuck busy. Preserve active assignment evidence.
+						const herdrLive =
+							info.agentStatus === "working" || info.agentStatus === "blocked";
+						if (herdrLive) {
+							return;
+						}
+						pool.upsert({
+							...current,
+							status: "unhealthy",
+							updatedAt: new Date().toISOString(),
+						});
 						return;
 					}
 

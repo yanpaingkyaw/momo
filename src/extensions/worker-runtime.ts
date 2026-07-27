@@ -921,18 +921,44 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 					? error.message
 					: String(error);
 			protocolUnhealthy = true;
-			markRegistry("unhealthy");
+			if (heartbeatTimer) clearInterval(heartbeatTimer);
+			if (pollTimer) clearInterval(pollTimer);
+
 			if (active && !active.resultWritten) {
-				writeResultDurable(active, {
+				// Do not preemptively mark unhealthy: ambiguous writer state must
+				// remain/become uncertain so leases and active evidence stay recoverable.
+				const ambiguous =
+					role.canWrite && (active.mutationAttempted || active.leaseHeld);
+				const persisted = writeResultDurable(active, {
 					status: "failed",
 					messages: active.assistantMessages,
 					errorMessage: message,
-					uncertainWrite: role.canWrite && active.mutationAttempted,
+					uncertainWrite: ambiguous,
 				});
-				emitAssignment(active, "failed", message);
+				try {
+					emitAssignment(active, "failed", message);
+				} catch {
+					// Terminal event append is best-effort after the durable attempt.
+				}
+				if (!persisted) {
+					markRegistry(ambiguous ? "uncertain" : "unhealthy", {
+						...(ambiguous
+							? {
+									activeAssignmentId: active.assignmentId,
+									...(active.parentEpoch
+										? { activeParentEpoch: active.parentEpoch }
+										: {}),
+									uncertainWrite: true,
+								}
+							: {}),
+					});
+				} else if (!ambiguous) {
+					markRegistry("unhealthy");
+				}
+				// persisted + ambiguous: writeResultDurable already marked uncertain.
+			} else {
+				markRegistry("unhealthy");
 			}
-			if (heartbeatTimer) clearInterval(heartbeatTimer);
-			if (pollTimer) clearInterval(pollTimer);
 		}
 	}
 

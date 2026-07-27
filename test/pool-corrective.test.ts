@@ -23,7 +23,7 @@ import { resolvePoolIdentity, stableWorkerId } from "../src/herdr/pool-identity.
 import { installMomoWorker } from "../src/extensions/worker-runtime.js";
 import { workerControlPaths, assignmentSpoolPaths } from "../src/herdr/assignment-spool.js";
 import { atomicWriteJson } from "../src/ipc/spool.js";
-import { tryReadIpcJson } from "../src/ipc/validate.js";
+import { tryReadIpcJson, validateResult } from "../src/ipc/validate.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createHerdrChildSessionFactory } from "../src/delegation/herdr-factory.js";
 import { HerdrClient } from "../src/herdr/client.js";
@@ -4476,5 +4476,319 @@ describe("implementer pre-start lease uncertain", () => {
 		expect(pool.getByRole("implementer")?.uncertainWrite).toBeUndefined();
 		expect(leases.peekOwner(cwd)?.ownerId).toBe("other_worker_id");
 		expect(pi.sendUserMessage).not.toHaveBeenCalled();
+	});
+});
+
+
+describe("read-only adoption active/no-result", () => {
+	const previousPiDir = process.env.PI_CODING_AGENT_DIR;
+
+	afterEach(() => {
+		if (previousPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousPiDir;
+	});
+
+	function installFakeHerdrExtension(): void {
+		const agentDir = tempDir("momo-pi-agent-");
+		mkdirSync(path.join(agentDir, "extensions"), { recursive: true });
+		writeFileSync(path.join(agentDir, "extensions", "herdr-agent-state.ts"), "// fake\n", "utf8");
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+	}
+
+	async function setupBusyScout(options: {
+		label: string;
+		agentStatus: string;
+		queued?: boolean;
+	}) {
+		const { adoptPoolWorkers } = await import("../src/extensions/parent.js");
+		const cacheRoot = tempDir(`momo-ro-adopt-${options.label}-`);
+		const cwd = tempDir(`momo-ro-adopt-${options.label}-cwd-`);
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const workerId = stableWorkerId(identity.poolKey, "scout");
+		const control = workerControlPaths(pool.poolRoot, "scout");
+		mkdirSync(control.root, { recursive: true, mode: 0o700 });
+		const assignmentA = "roactiveaaaaaa01";
+		const assignmentB = "roqueuedbbbbbb02";
+		pool.upsert({
+			workerId,
+			generation: 1,
+			generationTombstone: 1,
+			role: "scout",
+			paneId: "w1:p1",
+			agentName: "momo_scout",
+			cwd,
+			status: "busy",
+			activeAssignmentId: assignmentA,
+			activeParentEpoch: "e1",
+			updatedAt: new Date().toISOString(),
+		});
+		atomicWriteJson(control.manifest, {
+			version: 2,
+			poolKey: identity.poolKey,
+			workerId,
+			generation: 1,
+			role: "scout",
+			cwd,
+			paneId: "w1:p1",
+			agentName: "momo_scout",
+			createdAt: new Date().toISOString(),
+		});
+		atomicWriteJson(control.heartbeat, {
+			version: 1,
+			runId: "g1",
+			workerId,
+			at: new Date().toISOString(),
+			seq: 1,
+		});
+		atomicWriteJson(control.active, {
+			version: 1,
+			assignmentId: assignmentA,
+			generation: 1,
+			parentEpoch: "e1",
+			dispatchedAt: new Date().toISOString(),
+		});
+		const pathsA = assignmentSpoolPaths(pool.poolRoot, "scout", assignmentA);
+		mkdirSync(pathsA.root, { recursive: true, mode: 0o700 });
+		atomicWriteJson(pathsA.command, {
+			version: 1,
+			type: "prompt",
+			task: "active-a",
+			issuedAt: new Date().toISOString(),
+			runId: assignmentA,
+			workerId,
+			generation: 1,
+			parentEpoch: "e1",
+		});
+		if (options.queued) {
+			enqueueAssignment(pool.poolRoot, "scout", {
+				assignmentId: assignmentB,
+				workerId,
+				generation: 1,
+				parentEpoch: "e1",
+				task: "queued-b",
+			});
+		}
+		const client = new HerdrClient({
+			runCommand: async () => ({
+				code: 0,
+				stdout: JSON.stringify({
+					id: "ok",
+					result: {
+						type: "agent_info",
+						agent: {
+							agent_status: options.agentStatus,
+							pane_id: "w1:p1",
+							name: "momo_scout",
+						},
+					},
+				}),
+				stderr: "",
+			}),
+		});
+		await adoptPoolWorkers(pool, client, identity.poolKey, {
+			ui: { notify: () => undefined },
+		});
+		return { pool, workerId, cwd, cacheRoot, identity, assignmentA, assignmentB, control };
+	}
+
+	it("fresh heartbeat + working remains busy", async () => {
+		const { pool, assignmentA } = await setupBusyScout({
+			label: "working",
+			agentStatus: "working",
+		});
+		const after = pool.getByRole("scout")!;
+		expect(after.status).toBe("busy");
+		expect(after.activeAssignmentId).toBe(assignmentA);
+		expect(selectClosablePoolWorkers([after]).closable).toHaveLength(0);
+	});
+
+	it("fresh heartbeat + idle becomes unhealthy with active evidence", async () => {
+		const { pool, assignmentA } = await setupBusyScout({
+			label: "idle",
+			agentStatus: "idle",
+		});
+		const after = pool.getByRole("scout")!;
+		expect(after.status).toBe("unhealthy");
+		expect(after.activeAssignmentId).toBe(assignmentA);
+		expect(selectClosablePoolWorkers([after]).closable).toHaveLength(1);
+	});
+
+	it("fresh heartbeat + done becomes unhealthy", async () => {
+		const { pool, assignmentA } = await setupBusyScout({
+			label: "done",
+			agentStatus: "done",
+		});
+		const after = pool.getByRole("scout")!;
+		expect(after.status).toBe("unhealthy");
+		expect(after.activeAssignmentId).toBe(assignmentA);
+	});
+
+	it("cleanup terminalizes active A + queued B then N+1 can provision", async () => {
+		const fixture = await setupBusyScout({
+			label: "cleanup-n1",
+			agentStatus: "idle",
+			queued: true,
+		});
+		const { pool, workerId, cwd, cacheRoot, identity, assignmentA, assignmentB } = fixture;
+		expect(pool.getByRole("scout")?.status).toBe("unhealthy");
+		expect(queueCount(pool.poolRoot, "scout")).toBe(1);
+
+		const { installMomoParent } = await import("../src/extensions/parent.js");
+		const closed: string[] = [];
+		const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
+		const pi = {
+			commands,
+			registerTool: vi.fn(),
+			setActiveTools: vi.fn(),
+			sendUserMessage: vi.fn(),
+			sendMessage: vi.fn(),
+			registerCommand: vi.fn(
+				(name: string, def: { handler: (args: string, ctx: unknown) => Promise<void> }) => {
+					commands.set(name, def);
+				},
+			),
+			on() {},
+		};
+		installMomoParent(pi as unknown as ExtensionAPI, {
+			cwd,
+			env: {
+				MOMO_PARENT: "1",
+				MOMO_PARENT_ID: "parent-ro-cleanup",
+				HERDR_ENV: "1",
+				HERDR_PANE_ID: "w1:p0",
+				HERDR_WORKSPACE_ID: "ws",
+				HERDR_SOCKET_PATH: "s",
+			},
+			client: new HerdrClient({
+				runCommand: async (_file, args) => {
+					if (args[0] === "pane" && args[1] === "close") {
+						closed.push(String(args[2]));
+						return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+					}
+					if (args[0] === "agent" && args[1] === "get") {
+						return {
+							code: 0,
+							stdout: JSON.stringify({
+								id: "g",
+								result: {
+									type: "agent_info",
+									agent: { agent_status: "idle", name: "momo_scout", pane_id: "w1:p1" },
+								},
+							}),
+							stderr: "",
+						};
+					}
+					return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+				},
+			}),
+			poolRegistry: pool,
+		});
+		await commands.get("momo-cleanup")!.handler("", {
+			ui: { notify: () => undefined },
+		} as never);
+		expect(closed).toEqual(["w1:p1"]);
+		expect(isArchivalTombstone(pool.getByRole("scout")!)).toBe(true);
+		expect(queueCount(pool.poolRoot, "scout")).toBe(0);
+		for (const id of [assignmentA, assignmentB]) {
+			const paths = assignmentSpoolPaths(pool.poolRoot, "scout", id);
+			const result = validateResult(tryReadIpcJson(paths.result), {
+				runId: id,
+				workerId,
+			});
+			expect(result.status).toBe("failed");
+		}
+
+		// N+1 can provision after archive.
+		installFakeHerdrExtension();
+		let provisionedGen: string | undefined;
+		const factory = createHerdrChildSessionFactory({
+			cwd,
+			parentPaneId: "w1:p0",
+			parentId: "parent-ro-n1",
+			client: new HerdrClient({
+				runCommand: async (_file, args) => {
+					if (args[0] === "pane" && args[1] === "split") {
+						const envArgs = args.filter((_a, i) => args[i - 1] === "--env");
+						provisionedGen = envArgs
+							.find((v) => v.startsWith("MOMO_WORKER_GENERATION="))
+							?.slice("MOMO_WORKER_GENERATION=".length);
+						const controlDir =
+							envArgs.find((v) => v.startsWith("MOMO_CONTROL_DIR="))?.slice(17) ??
+							envArgs.find((v) => v.startsWith("MOMO_IPC_DIR="))?.slice(12) ??
+							"";
+						const wid = envArgs.find((v) => v.startsWith("MOMO_WORKER_ID="))?.slice(15) ?? "";
+						const runId = envArgs.find((v) => v.startsWith("MOMO_RUN_ID="))?.slice(12) ?? "";
+						atomicWriteJson(path.join(controlDir, "ready.json"), {
+							version: 1,
+							runId,
+							workerId: wid,
+							readyAt: new Date().toISOString(),
+						});
+						atomicWriteJson(path.join(controlDir, "heartbeat.json"), {
+							version: 1,
+							runId,
+							workerId: wid,
+							at: new Date().toISOString(),
+							seq: 1,
+						});
+						return {
+							code: 0,
+							stdout: JSON.stringify({ id: "s", result: { pane: { pane_id: "w1:p2" } } }),
+							stderr: "",
+						};
+					}
+					if (args[0] === "agent" && args[1] === "start") {
+						return {
+							code: 0,
+							stdout: JSON.stringify({
+								id: "s",
+								result: {
+									pane_id: "w1:p2",
+									name: args[2],
+									agent: "pi",
+									interactive_ready: true,
+								},
+							}),
+							stderr: "",
+						};
+					}
+					return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+				},
+			}),
+			poolRegistry: pool,
+			cacheRoot,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+			readyTimeoutMs: 2_000,
+			pollIntervalMs: 20,
+			sleep: async (ms) => new Promise((r) => setTimeout(r, ms)),
+		});
+		const session = await factory({ cwd, role: getRole("scout") });
+		const proxy = session as unknown as {
+			assignmentId: string;
+			workerId: string;
+			paths: { result: string };
+		};
+		const wait = session.prompt("n1").then(() => session.agent!.waitForIdle());
+		await new Promise((r) => setTimeout(r, 80));
+		atomicWriteJson(proxy.paths.result, {
+			version: 1,
+			runId: proxy.assignmentId,
+			workerId: proxy.workerId,
+			status: "completed",
+			messages: [{ role: "assistant", content: [{ type: "text", text: "ok" }] }],
+			finishedAt: new Date().toISOString(),
+		});
+		await wait;
+		expect(Number(provisionedGen)).toBeGreaterThanOrEqual(2);
+		expect(pool.getByRole("scout")?.generation).toBeGreaterThanOrEqual(2);
+		void identity;
 	});
 });

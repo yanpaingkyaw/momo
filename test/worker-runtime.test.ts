@@ -650,4 +650,239 @@ describe("worker runtime (persistent pool)", () => {
 		expect(pi.sendUserMessage).toHaveBeenCalledWith("successor");
 		void pathsB;
 	});
+
+	it("pollActive outer catch: mutation + unreadable cancel + unwritable result => uncertain, lease retained", async () => {
+		vi.useFakeTimers();
+		const cacheRoot = tempDir("momo-poll-catch-mut-");
+		const cwd = tempDir("momo-poll-catch-mut-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const workerId = stableWorkerId(identity.poolKey, "implementer");
+		const control = workerControlPaths(pool.poolRoot, "implementer");
+		mkdirSync(control.root, { recursive: true, mode: 0o700 });
+		pool.upsert({
+			workerId,
+			generation: 1,
+			generationTombstone: 1,
+			role: "implementer",
+			paneId: "w1:p2",
+			agentName: "momo_implementer",
+			cwd,
+			status: "idle",
+			updatedAt: new Date().toISOString(),
+		});
+		const leases = new WriterLeaseManager({ cacheRoot, now: () => 1_700_000_000_000 });
+		const assignmentId = "pollcatchmut0001";
+		const paths = assignmentSpoolPaths(pool.poolRoot, "implementer", assignmentId);
+		mkdirSync(paths.root, { recursive: true, mode: 0o700 });
+		const pi = createFakePi();
+		installMomoWorker(pi as unknown as ExtensionAPI, {
+			env: {
+				MOMO_WORKER: "1",
+				MOMO_ROLE: "implementer",
+				MOMO_IPC_DIR: control.root,
+				MOMO_CONTROL_DIR: control.root,
+				MOMO_WORKER_ID: workerId,
+				MOMO_WORKER_GENERATION: "1",
+				MOMO_POOL_KEY: identity.poolKey,
+				MOMO_POOL_ROOT: pool.poolRoot,
+				MOMO_RUN_ID: "g1",
+				MOMO_CWD: cwd,
+			},
+			poolRegistry: pool,
+			leaseManager: leases,
+			now: () => 1_700_000_000_000,
+			sleep: async () => {},
+		});
+		const ctx = {
+			hasUI: true,
+			isIdle: () => true,
+			abort: vi.fn(),
+			cwd,
+		} as unknown as ExtensionContext;
+		await pi.emit("session_start", {}, ctx);
+		atomicWriteJson(paths.command, {
+			version: 1,
+			type: "prompt",
+			task: "mutate",
+			issuedAt: new Date().toISOString(),
+			runId: assignmentId,
+			workerId,
+			generation: 1,
+			parentEpoch: "e1",
+		});
+		atomicWriteJson(control.active, {
+			version: 1,
+			assignmentId,
+			generation: 1,
+			parentEpoch: "e1",
+			dispatchedAt: new Date().toISOString(),
+		});
+		await vi.advanceTimersByTimeAsync(200);
+		expect(pi.sendUserMessage).toHaveBeenCalled();
+		expect(leases.isLocked(cwd)).toBe(true);
+		await pi.emit("tool_call", { toolName: "bash" }, ctx);
+		mkdirSync(paths.cancel, { recursive: true, mode: 0o700 });
+		mkdirSync(paths.result, { recursive: true, mode: 0o700 });
+		await vi.advanceTimersByTimeAsync(150);
+
+		const record = pool.getByRole("implementer")!;
+		expect(record.status).toBe("uncertain");
+		expect(record.uncertainWrite).toBe(true);
+		expect(record.activeAssignmentId).toBe(assignmentId);
+		expect(leases.peekOwner(cwd)?.ownerId).toBe(workerId);
+		const { selectClosablePoolWorkers, isArchivalTombstone } = await import(
+			"../src/herdr/pool-registry.js"
+		);
+		expect(selectClosablePoolWorkers([record]).closable).toHaveLength(0);
+		expect(selectClosablePoolWorkers([record], { force: true }).closable).toHaveLength(1);
+
+		rmSync(paths.result, { recursive: true, force: true });
+		const { installMomoParent } = await import("../src/extensions/parent.js");
+		const { HerdrClient } = await import("../src/herdr/client.js");
+		const closed: string[] = [];
+		const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
+		const parentPi = {
+			commands,
+			registerTool: vi.fn(),
+			setActiveTools: vi.fn(),
+			sendUserMessage: vi.fn(),
+			sendMessage: vi.fn(),
+			registerCommand: vi.fn(
+				(name: string, def: { handler: (args: string, ctx: unknown) => Promise<void> }) => {
+					commands.set(name, def);
+				},
+			),
+			on() {},
+		};
+		installMomoParent(parentPi as unknown as ExtensionAPI, {
+			cwd,
+			env: {
+				MOMO_PARENT: "1",
+				MOMO_PARENT_ID: "parent-poll-catch",
+				HERDR_ENV: "1",
+				HERDR_PANE_ID: "w1:p1",
+				HERDR_WORKSPACE_ID: "ws",
+				HERDR_SOCKET_PATH: "s",
+			},
+			client: new HerdrClient({
+				runCommand: async (_file, args) => {
+					if (args[0] === "pane" && args[1] === "close") {
+						closed.push(String(args[2]));
+						return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+					}
+					if (args[0] === "agent" && args[1] === "get") {
+						return {
+							code: 1,
+							stdout: JSON.stringify({
+								id: "g",
+								error: { code: "agent_not_found", message: "gone" },
+							}),
+							stderr: "",
+						};
+					}
+					return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+				},
+			}),
+			poolRegistry: pool,
+			leaseManager: leases,
+		});
+		await commands.get("momo-cleanup")!.handler("--force", {
+			ui: {
+				confirm: async () => true,
+				notify: () => undefined,
+			},
+		} as never);
+		expect(closed).toEqual(["w1:p2"]);
+		expect(isArchivalTombstone(pool.getByRole("implementer")!)).toBe(true);
+		expect(leases.peekOwner(cwd)).toBeUndefined();
+	});
+
+	it("pollActive outer catch: leaseHeld without mutation still marks uncertain", async () => {
+		vi.useFakeTimers();
+		const cacheRoot = tempDir("momo-poll-catch-lease-");
+		const cwd = tempDir("momo-poll-catch-lease-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const workerId = stableWorkerId(identity.poolKey, "implementer");
+		const control = workerControlPaths(pool.poolRoot, "implementer");
+		mkdirSync(control.root, { recursive: true, mode: 0o700 });
+		pool.upsert({
+			workerId,
+			generation: 1,
+			generationTombstone: 1,
+			role: "implementer",
+			paneId: "w1:p2",
+			agentName: "momo_implementer",
+			cwd,
+			status: "idle",
+			updatedAt: new Date().toISOString(),
+		});
+		const leases = new WriterLeaseManager({ cacheRoot, now: () => 1_700_000_000_000 });
+		const assignmentId = "pollcatchlease001";
+		const paths = assignmentSpoolPaths(pool.poolRoot, "implementer", assignmentId);
+		mkdirSync(paths.root, { recursive: true, mode: 0o700 });
+		const pi = createFakePi();
+		installMomoWorker(pi as unknown as ExtensionAPI, {
+			env: {
+				MOMO_WORKER: "1",
+				MOMO_ROLE: "implementer",
+				MOMO_IPC_DIR: control.root,
+				MOMO_CONTROL_DIR: control.root,
+				MOMO_WORKER_ID: workerId,
+				MOMO_WORKER_GENERATION: "1",
+				MOMO_POOL_KEY: identity.poolKey,
+				MOMO_POOL_ROOT: pool.poolRoot,
+				MOMO_RUN_ID: "g1",
+				MOMO_CWD: cwd,
+			},
+			poolRegistry: pool,
+			leaseManager: leases,
+			now: () => 1_700_000_000_000,
+			sleep: async () => {},
+		});
+		const ctx = {
+			hasUI: true,
+			isIdle: () => true,
+			abort: vi.fn(),
+			cwd,
+		} as unknown as ExtensionContext;
+		await pi.emit("session_start", {}, ctx);
+		atomicWriteJson(paths.command, {
+			version: 1,
+			type: "prompt",
+			task: "hold-lease",
+			issuedAt: new Date().toISOString(),
+			runId: assignmentId,
+			workerId,
+			generation: 1,
+			parentEpoch: "e1",
+		});
+		atomicWriteJson(control.active, {
+			version: 1,
+			assignmentId,
+			generation: 1,
+			parentEpoch: "e1",
+			dispatchedAt: new Date().toISOString(),
+		});
+		await vi.advanceTimersByTimeAsync(200);
+		expect(leases.isLocked(cwd)).toBe(true);
+		mkdirSync(paths.cancel, { recursive: true, mode: 0o700 });
+		mkdirSync(paths.result, { recursive: true, mode: 0o700 });
+		await vi.advanceTimersByTimeAsync(150);
+		const record = pool.getByRole("implementer")!;
+		expect(record.status).toBe("uncertain");
+		expect(record.uncertainWrite).toBe(true);
+		expect(leases.peekOwner(cwd)?.ownerId).toBe(workerId);
+	});
 });
