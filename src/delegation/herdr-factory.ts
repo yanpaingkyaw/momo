@@ -1129,7 +1129,7 @@ export function createHerdrChildSessionFactory(options: HerdrFactoryOptions): Ch
 		if (cwd !== options.cwd) {
 			throw new Error("Child working directory must match the parent working directory");
 		}
-		// Logical preallocation only — no pane/queue until prompt().
+		// Assignment proxy only — no pane/queue until prompt().
 		return new AssignmentProxy(role, runtime);
 	};
 }

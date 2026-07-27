@@ -62,6 +62,24 @@ export const PARENT_ACTIVE_TOOLS = ["read", "grep", "find", "ls", "delegate"] as
  */
 export const ADOPTION_STARTED_GRACE_MS = DEFAULT_HEARTBEAT_STALE_MS;
 
+/** Generation/assignment-fenced timers for post-grace read-only adoption rechecks. */
+const adoptionGraceRechecks = new Map<string, ReturnType<typeof setTimeout>>();
+
+/** @internal test-only: clear pending adoption grace recheck timers. */
+export function __clearAdoptionGraceRechecksForTest(): void {
+	for (const timer of adoptionGraceRechecks.values()) clearTimeout(timer);
+	adoptionGraceRechecks.clear();
+}
+
+/** @internal test-only: pending grace recheck count. */
+export function __adoptionGraceRecheckCountForTest(): number {
+	return adoptionGraceRechecks.size;
+}
+
+function adoptionGraceRecheckKey(poolRoot: string, worker: PoolWorkerRecord): string {
+	return `${poolRoot}:${worker.role}:${worker.generation}:${worker.activeAssignmentId ?? ""}`;
+}
+
 export interface InstallMomoParentOptions {
 	env?: NodeJS.ProcessEnv;
 	cwd?: string;
@@ -520,7 +538,7 @@ export async function adoptPoolWorkers(
 					}
 
 					if (!getRole(worker.role).canWrite) {
-						classifyReadOnlyActiveNoResultAdoption({
+						const classified = classifyReadOnlyActiveNoResultAdoption({
 							pool,
 							current,
 							worker,
@@ -529,6 +547,18 @@ export async function adoptPoolWorkers(
 							agentStatus: info.agentStatus,
 							nowMs: Date.now(),
 						});
+						if (classified.kind === "grace") {
+							scheduleReadOnlyAdoptionGraceRecheck({
+								pool,
+								client,
+								poolKey,
+								leases,
+								ctx,
+								snapshot: worker,
+								delayMs: classified.recheckDelayMs,
+								evidenceKind: classified.evidenceKind,
+							});
+						}
 						return;
 					}
 
@@ -633,7 +663,16 @@ function matchesExactSnapshot(
  * closed to unhealthy while preserving active evidence for cleanup.
  *
  * Must run under the role lock with an exact snapshot fence already applied.
+ * Returns `grace` when the worker is retained only because evidence is still young —
+ * caller should schedule a bounded post-grace recheck carrying `evidenceKind`.
  */
+type AdoptionGraceEvidenceKind = "dispatch" | "started";
+
+type ReadOnlyAdoptionClassifyResult =
+	| { kind: "unchanged" }
+	| { kind: "unhealthy" }
+	| { kind: "grace"; recheckDelayMs: number; evidenceKind: AdoptionGraceEvidenceKind };
+
 function classifyReadOnlyActiveNoResultAdoption(options: {
 	pool: PoolRegistry;
 	current: PoolWorkerRecord;
@@ -644,15 +683,16 @@ function classifyReadOnlyActiveNoResultAdoption(options: {
 	nowMs: number;
 	startedGraceMs?: number;
 	maxFutureSkewMs?: number;
-}): void {
+}): ReadOnlyAdoptionClassifyResult {
 	const { pool, current, worker, controlActivePath, paths } = options;
 	const assignmentId = worker.activeAssignmentId!;
-	const markUnhealthy = (): void => {
+	const markUnhealthy = (): ReadOnlyAdoptionClassifyResult => {
 		pool.upsert({
 			...current,
 			status: "unhealthy",
 			updatedAt: new Date(options.nowMs).toISOString(),
 		});
+		return { kind: "unhealthy" };
 	};
 
 	let parentEpoch: string;
@@ -665,19 +705,16 @@ function classifyReadOnlyActiveNoResultAdoption(options: {
 		});
 		const expectedEpoch = current.activeParentEpoch ?? worker.activeParentEpoch;
 		if (expectedEpoch !== undefined && ptr.parentEpoch !== expectedEpoch) {
-			markUnhealthy();
-			return;
+			return markUnhealthy();
 		}
 		parentEpoch = ptr.parentEpoch;
 		const parsedDispatch = Date.parse(ptr.dispatchedAt);
 		if (!Number.isFinite(parsedDispatch)) {
-			markUnhealthy();
-			return;
+			return markUnhealthy();
 		}
 		dispatchedAtMs = parsedDispatch;
 	} catch {
-		markUnhealthy();
-		return;
+		return markUnhealthy();
 	}
 
 	let startedAtMs: number | undefined;
@@ -692,49 +729,273 @@ function classifyReadOnlyActiveNoResultAdoption(options: {
 			});
 			const parsed = Date.parse(started.startedAt);
 			if (!Number.isFinite(parsed)) {
-				markUnhealthy();
-				return;
+				return markUnhealthy();
 			}
 			startedAtMs = parsed;
 		} catch {
-			markUnhealthy();
-			return;
+			return markUnhealthy();
 		}
 	}
 
 	const status = options.agentStatus;
 	if (status === "working" || status === "blocked") {
-		return;
+		return { kind: "unchanged" };
 	}
 
 	const graceMs = options.startedGraceMs ?? ADOPTION_STARTED_GRACE_MS;
 	const maxFutureSkewMs = options.maxFutureSkewMs ?? DEFAULT_HEARTBEAT_CLOCK_SKEW_MS;
-	const withinGrace = (atMs: number): boolean => {
+	const graceOutcome = (
+		atMs: number,
+		evidenceKind: AdoptionGraceEvidenceKind,
+	): ReadOnlyAdoptionClassifyResult => {
 		const ageMs = options.nowMs - atMs;
-		if (ageMs < -maxFutureSkewMs) return false;
-		return ageMs <= graceMs;
+		if (ageMs < -maxFutureSkewMs) {
+			return markUnhealthy();
+		}
+		if (ageMs <= graceMs) {
+			return {
+				kind: "grace",
+				recheckDelayMs: Math.max(0, graceMs - ageMs),
+				evidenceKind,
+			};
+		}
+		return markUnhealthy();
 	};
 
 	if (status === "idle") {
 		if (startedAtMs === undefined) {
-			// No started.json yet: retain busy only while dispatch is still within grace
-			// (covers the pre-poll window). Stale dispatch → worker likely died before start.
-			if (withinGrace(dispatchedAtMs)) {
-				return;
-			}
-			markUnhealthy();
-			return;
+			return graceOutcome(dispatchedAtMs, "dispatch");
 		}
-		if (withinGrace(startedAtMs)) {
-			// Recent start + idle: settlement/result race — retain busy.
-			return;
-		}
-		markUnhealthy();
-		return;
+		return graceOutcome(startedAtMs, "started");
 	}
 
 	// done / unknown / missing: no live execution proof.
-	markUnhealthy();
+	return markUnhealthy();
+}
+
+function scheduleReadOnlyAdoptionGraceRecheck(options: {
+	pool: PoolRegistry;
+	client: HerdrClient;
+	poolKey: string;
+	leases: WriterLeaseManager;
+	ctx: { ui?: { notify?: (message: string) => void } };
+	snapshot: PoolWorkerRecord;
+	delayMs: number;
+	evidenceKind: AdoptionGraceEvidenceKind;
+}): void {
+	const key = adoptionGraceRecheckKey(options.pool.poolRoot, options.snapshot);
+	const previous = adoptionGraceRechecks.get(key);
+	if (previous) clearTimeout(previous);
+
+	const timer = setTimeout(() => {
+		adoptionGraceRechecks.delete(key);
+		void recheckReadOnlyAdoptionAfterGrace(options);
+	}, Math.max(0, options.delayMs));
+	// Keep the event loop alive under Vitest fake timers; unref in production.
+	if (process.env.VITEST !== "true") {
+		timer.unref?.();
+	}
+	adoptionGraceRechecks.set(key, timer);
+}
+
+/**
+ * Bounded post-grace recheck: full identity/manifest/heartbeat/Herdr/result path with
+ * exact snapshot fence. No-ops when generation/assignment advanced (successor B / N+1).
+ *
+ * At most two timers per generation/assignment:
+ * - `dispatch` expiry: if a valid started.json appeared, schedule exactly one
+ *   `started` follow-up; otherwise mark unhealthy.
+ * - `started` expiry: mark unhealthy unless result / working|blocked / successor.
+ * Never reschedules a third timer.
+ */
+async function recheckReadOnlyAdoptionAfterGrace(options: {
+	pool: PoolRegistry;
+	client: HerdrClient;
+	poolKey: string;
+	leases: WriterLeaseManager;
+	ctx: { ui?: { notify?: (message: string) => void } };
+	snapshot: PoolWorkerRecord;
+	evidenceKind: AdoptionGraceEvidenceKind;
+}): Promise<void> {
+	const { pool, client, poolKey, ctx, snapshot: worker, evidenceKind } = options;
+	if (!worker.paneId || !worker.agentName || !worker.activeAssignmentId) return;
+
+	const control = workerControlPaths(pool.poolRoot, worker.role);
+	try {
+		const currentBefore = pool.getByRole(worker.role);
+		if (!matchesExactSnapshot(currentBefore, worker)) return;
+
+		const manifestRaw = tryReadIpcJson(control.manifest);
+		if (!manifestRaw || typeof manifestRaw !== "object") {
+			throw new Error("missing manifest");
+		}
+		const manifest = manifestRaw as {
+			version?: number;
+			poolKey?: string;
+			workerId?: string;
+			generation?: number;
+			paneId?: string;
+			agentName?: string;
+			role?: string;
+			cwd?: string;
+		};
+		if (
+			manifest.version !== 2 ||
+			manifest.poolKey !== poolKey ||
+			manifest.workerId !== worker.workerId ||
+			manifest.generation !== worker.generation ||
+			manifest.paneId !== worker.paneId ||
+			manifest.agentName !== worker.agentName ||
+			manifest.role !== worker.role
+		) {
+			throw new Error("manifest identity mismatch");
+		}
+		if (worker.cwd === undefined || typeof manifest.cwd !== "string") {
+			throw new Error("missing canonical cwd on registry or manifest");
+		}
+		if (manifest.cwd !== worker.cwd) {
+			throw new Error("manifest cwd mismatch");
+		}
+
+		const heartbeatRaw = tryReadIpcJson(control.heartbeat);
+		if (!heartbeatRaw) {
+			throw new Error("missing heartbeat");
+		}
+		const heartbeat = validateHeartbeat(heartbeatRaw, {
+			runId: `g${worker.generation}`,
+			workerId: worker.workerId,
+		});
+		assertHeartbeatFreshness(heartbeat.at, {
+			now: Date.now(),
+			staleMs: DEFAULT_HEARTBEAT_STALE_MS,
+		});
+
+		const info = await client.agentGet(worker.agentName);
+		if (info.paneId !== worker.paneId) {
+			throw new Error("Herdr pane identity mismatch");
+		}
+
+		await withRoleLockAsync(pool.poolRoot, worker.role, () => {
+			const current = pool.getByRole(worker.role);
+			if (!matchesExactSnapshot(current, worker)) return;
+
+			const paths = assignmentSpoolPaths(
+				pool.poolRoot,
+				worker.role,
+				worker.activeAssignmentId!,
+			);
+			const resultRaw = tryReadIpcJson(paths.result);
+			if (resultRaw) {
+				const result = validateResult(resultRaw, {
+					runId: worker.activeAssignmentId!,
+					workerId: worker.workerId,
+				});
+				if (result.uncertainWrite) {
+					pool.upsert({
+						...current,
+						status: "uncertain",
+						uncertainWrite: true,
+						updatedAt: new Date().toISOString(),
+					});
+				} else {
+					completeCleanAssignmentLocked({
+						pool,
+						role: worker.role,
+						workerId: worker.workerId,
+						generation: worker.generation,
+						finishedAssignmentId: worker.activeAssignmentId!,
+					});
+				}
+				return;
+			}
+
+			// Worker advanced to live Herdr work — preserve busy; no further timer.
+			if (info.agentStatus === "working" || info.agentStatus === "blocked") {
+				return;
+			}
+
+			const markUnhealthy = (): void => {
+				pool.upsert({
+					...current,
+					status: "unhealthy",
+					updatedAt: new Date().toISOString(),
+				});
+			};
+
+			// Started-grace expiry: still idle / no result → cleanup-eligible.
+			// Do not preserve solely because started.json exists (that was the grace evidence).
+			if (evidenceKind === "started") {
+				markUnhealthy();
+				return;
+			}
+
+			// Dispatch-grace expiry: if a valid start appeared, schedule exactly one
+			// started-grace follow-up (same generation/assignment key). Otherwise unhealthy.
+			if (existsSync(paths.started)) {
+				try {
+					const activeRaw = tryReadIpcJson(control.active);
+					const ptr = validateActivePointer(activeRaw, {
+						generation: worker.generation,
+						assignmentId: worker.activeAssignmentId!,
+					});
+					const started = validateStarted(tryReadIpcJson(paths.started), {
+						runId: worker.activeAssignmentId!,
+						workerId: worker.workerId,
+						generation: worker.generation,
+						parentEpoch: ptr.parentEpoch,
+					});
+					const startedAtMs = Date.parse(started.startedAt);
+					if (!Number.isFinite(startedAtMs)) {
+						markUnhealthy();
+						return;
+					}
+					const nowMs = Date.now();
+					const ageMs = nowMs - startedAtMs;
+					const maxFutureSkewMs = DEFAULT_HEARTBEAT_CLOCK_SKEW_MS;
+					if (ageMs < -maxFutureSkewMs) {
+						markUnhealthy();
+						return;
+					}
+					const graceMs = ADOPTION_STARTED_GRACE_MS;
+					if (ageMs > graceMs) {
+						// Started evidence already aged out — no second timer.
+						markUnhealthy();
+						return;
+					}
+					scheduleReadOnlyAdoptionGraceRecheck({
+						...options,
+						snapshot: worker,
+						delayMs: Math.max(0, graceMs - ageMs),
+						evidenceKind: "started",
+					});
+					return;
+				} catch {
+					markUnhealthy();
+					return;
+				}
+			}
+
+			// Still idle with no start (or done/unknown) → mark unhealthy.
+			markUnhealthy();
+		});
+	} catch (error) {
+		await withRoleLockAsync(pool.poolRoot, worker.role, () => {
+			const current = pool.getByRole(worker.role);
+			if (!matchesExactSnapshot(current, worker)) return;
+			pool.upsert({
+				...current,
+				status: "unhealthy",
+				updatedAt: new Date().toISOString(),
+			});
+		});
+		ctx.ui?.notify?.(
+			`Adoption grace recheck failed for ${worker.workerId}: ${
+				error instanceof IpcValidationError || error instanceof Error
+					? error.message
+					: String(error)
+			}`,
+		);
+	}
 }
 
 /** Current live record is an active writer assignment (any id). */

@@ -4483,9 +4483,12 @@ describe("implementer pre-start lease uncertain", () => {
 describe("read-only adoption active/no-result", () => {
 	const previousPiDir = process.env.PI_CODING_AGENT_DIR;
 
-	afterEach(() => {
+	afterEach(async () => {
 		if (previousPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = previousPiDir;
+		const { __clearAdoptionGraceRechecksForTest } = await import("../src/extensions/parent.js");
+		__clearAdoptionGraceRechecksForTest();
+		vi.useRealTimers();
 	});
 
 	function installFakeHerdrExtension(): void {
@@ -4498,6 +4501,8 @@ describe("read-only adoption active/no-result", () => {
 	async function setupBusyScout(options: {
 		label: string;
 		agentStatus: string;
+		/** Mutable Herdr agent_status for mid-test transitions (defaults to agentStatus). */
+		agentStatusRef?: { value: string };
 		queued?: boolean;
 		/** When set, write a valid started.json at this age (ms before now). */
 		startedAgeMs?: number;
@@ -4612,6 +4617,8 @@ describe("read-only adoption active/no-result", () => {
 				task: "queued-b",
 			});
 		}
+		const statusRef = options.agentStatusRef ?? { value: options.agentStatus };
+		statusRef.value = options.agentStatus;
 		const client = new HerdrClient({
 			runCommand: async () => ({
 				code: 0,
@@ -4620,7 +4627,7 @@ describe("read-only adoption active/no-result", () => {
 					result: {
 						type: "agent_info",
 						agent: {
-							agent_status: options.agentStatus,
+							agent_status: statusRef.value,
 							pane_id: "w1:p1",
 							name: "momo_scout",
 						},
@@ -4632,7 +4639,22 @@ describe("read-only adoption active/no-result", () => {
 		await adoptPoolWorkers(pool, client, identity.poolKey, {
 			ui: { notify: () => undefined },
 		});
-		return { pool, workerId, cwd, cacheRoot, identity, assignmentA, assignmentB, control, pathsA };
+		return {
+			pool,
+			workerId,
+			cwd,
+			cacheRoot,
+			identity,
+			assignmentA,
+			assignmentB,
+			control,
+			pathsA,
+			statusRef,
+		};
+	}
+
+	async function flushMicrotasks(times = 10): Promise<void> {
+		for (let i = 0; i < times; i++) await Promise.resolve();
 	}
 
 	it("fresh heartbeat + working remains busy", async () => {
@@ -4656,6 +4678,307 @@ describe("read-only adoption active/no-result", () => {
 		expect(after.status).toBe("busy");
 		expect(after.activeAssignmentId).toBe(assignmentA);
 		expect(selectClosablePoolWorkers([after]).closable).toHaveLength(0);
+	});
+
+	it("post-grace recheck marks retained recent-dispatch idle/no-start unhealthy", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date("2024-01-01T00:00:00.000Z"));
+		const { ADOPTION_STARTED_GRACE_MS, __clearAdoptionGraceRechecksForTest, __adoptionGraceRecheckCountForTest } =
+			await import("../src/extensions/parent.js");
+		__clearAdoptionGraceRechecksForTest();
+		const { pool, assignmentA } = await setupBusyScout({
+			label: "grace-recheck",
+			agentStatus: "idle",
+			dispatchAgeMs: 0,
+		});
+		expect(pool.getByRole("scout")?.status).toBe("busy");
+		expect(__adoptionGraceRecheckCountForTest()).toBe(1);
+		await vi.advanceTimersByTimeAsync(ADOPTION_STARTED_GRACE_MS + 1);
+		await vi.runAllTimersAsync();
+		await flushMicrotasks();
+		expect(__adoptionGraceRecheckCountForTest()).toBe(0);
+		const after = pool.getByRole("scout")!;
+		expect(after.status).toBe("unhealthy");
+		expect(after.activeAssignmentId).toBe(assignmentA);
+	});
+
+	it("post-grace recheck no-ops when generation advances", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date("2024-01-01T00:00:00.000Z"));
+		const { ADOPTION_STARTED_GRACE_MS, __clearAdoptionGraceRechecksForTest } = await import(
+			"../src/extensions/parent.js"
+		);
+		__clearAdoptionGraceRechecksForTest();
+		const { pool, workerId } = await setupBusyScout({
+			label: "grace-gen",
+			agentStatus: "idle",
+			dispatchAgeMs: 0,
+		});
+		expect(pool.getByRole("scout")?.status).toBe("busy");
+		const prior = pool.getByRole("scout")!;
+		pool.upsert({
+			workerId,
+			generation: 2,
+			generationTombstone: 2,
+			role: "scout",
+			paneId: "w1:p9",
+			agentName: "momo_scout_n1",
+			...(prior.cwd ? { cwd: prior.cwd } : {}),
+			status: "idle",
+			updatedAt: new Date().toISOString(),
+		});
+		await vi.advanceTimersByTimeAsync(ADOPTION_STARTED_GRACE_MS + 1);
+		await flushMicrotasks();
+		const after = pool.getByRole("scout")!;
+		expect(after.generation).toBe(2);
+		expect(after.status).toBe("idle");
+		expect(after.paneId).toBe("w1:p9");
+	});
+
+	it("dispatch-grace then started-grace: marker mid-way schedules second; second marks unhealthy", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date("2024-01-01T00:00:00.000Z"));
+		const {
+			ADOPTION_STARTED_GRACE_MS,
+			__clearAdoptionGraceRechecksForTest,
+			__adoptionGraceRecheckCountForTest,
+		} = await import("../src/extensions/parent.js");
+		__clearAdoptionGraceRechecksForTest();
+		const { pool, assignmentA, pathsA, workerId, control } = await setupBusyScout({
+			label: "grace-dispatch-then-started",
+			agentStatus: "idle",
+			dispatchAgeMs: 0,
+		});
+		expect(pool.getByRole("scout")?.status).toBe("busy");
+		expect(__adoptionGraceRecheckCountForTest()).toBe(1);
+
+		await vi.advanceTimersByTimeAsync(Math.floor(ADOPTION_STARTED_GRACE_MS / 2));
+		atomicWriteJson(pathsA.started, {
+			version: 1,
+			runId: assignmentA,
+			workerId,
+			generation: 1,
+			parentEpoch: "e1",
+			startedAt: new Date().toISOString(),
+		});
+		atomicWriteJson(control.heartbeat, {
+			version: 1,
+			runId: "g1",
+			workerId,
+			at: new Date().toISOString(),
+			seq: 2,
+		});
+
+		await vi.advanceTimersByTimeAsync(Math.floor(ADOPTION_STARTED_GRACE_MS / 2) + 1);
+		await flushMicrotasks();
+		expect(pool.getByRole("scout")?.status).toBe("busy");
+		expect(__adoptionGraceRecheckCountForTest()).toBe(1);
+
+		atomicWriteJson(control.heartbeat, {
+			version: 1,
+			runId: "g1",
+			workerId,
+			at: new Date().toISOString(),
+			seq: 3,
+		});
+		await vi.advanceTimersByTimeAsync(ADOPTION_STARTED_GRACE_MS + 1);
+		await flushMicrotasks();
+		expect(__adoptionGraceRecheckCountForTest()).toBe(0);
+		expect(pool.getByRole("scout")?.status).toBe("unhealthy");
+		expect(pool.getByRole("scout")?.activeAssignmentId).toBe(assignmentA);
+	});
+
+	it("started-grace recheck no-ops when Herdr becomes working", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date("2024-01-01T00:00:00.000Z"));
+		const {
+			ADOPTION_STARTED_GRACE_MS,
+			__clearAdoptionGraceRechecksForTest,
+			__adoptionGraceRecheckCountForTest,
+		} = await import("../src/extensions/parent.js");
+		__clearAdoptionGraceRechecksForTest();
+		const statusRef = { value: "idle" };
+		const { pool, assignmentA, pathsA, workerId, control } = await setupBusyScout({
+			label: "grace-working-noop",
+			agentStatus: "idle",
+			agentStatusRef: statusRef,
+			dispatchAgeMs: 0,
+		});
+		await vi.advanceTimersByTimeAsync(Math.floor(ADOPTION_STARTED_GRACE_MS / 2));
+		atomicWriteJson(pathsA.started, {
+			version: 1,
+			runId: assignmentA,
+			workerId,
+			generation: 1,
+			parentEpoch: "e1",
+			startedAt: new Date().toISOString(),
+		});
+		atomicWriteJson(control.heartbeat, {
+			version: 1,
+			runId: "g1",
+			workerId,
+			at: new Date().toISOString(),
+			seq: 2,
+		});
+		await vi.advanceTimersByTimeAsync(Math.floor(ADOPTION_STARTED_GRACE_MS / 2) + 1);
+		await flushMicrotasks();
+		expect(__adoptionGraceRecheckCountForTest()).toBe(1);
+
+		statusRef.value = "working";
+		atomicWriteJson(control.heartbeat, {
+			version: 1,
+			runId: "g1",
+			workerId,
+			at: new Date().toISOString(),
+			seq: 3,
+		});
+		await vi.advanceTimersByTimeAsync(ADOPTION_STARTED_GRACE_MS + 1);
+		await flushMicrotasks();
+		expect(__adoptionGraceRecheckCountForTest()).toBe(0);
+		expect(pool.getByRole("scout")?.status).toBe("busy");
+		expect(pool.getByRole("scout")?.activeAssignmentId).toBe(assignmentA);
+	});
+
+	it("started-grace recheck completes when result appears", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date("2024-01-01T00:00:00.000Z"));
+		const {
+			ADOPTION_STARTED_GRACE_MS,
+			__clearAdoptionGraceRechecksForTest,
+			__adoptionGraceRecheckCountForTest,
+		} = await import("../src/extensions/parent.js");
+		__clearAdoptionGraceRechecksForTest();
+		const { pool, assignmentA, pathsA, workerId, control } = await setupBusyScout({
+			label: "grace-result-noop",
+			agentStatus: "idle",
+			dispatchAgeMs: 0,
+		});
+		await vi.advanceTimersByTimeAsync(Math.floor(ADOPTION_STARTED_GRACE_MS / 2));
+		atomicWriteJson(pathsA.started, {
+			version: 1,
+			runId: assignmentA,
+			workerId,
+			generation: 1,
+			parentEpoch: "e1",
+			startedAt: new Date().toISOString(),
+		});
+		atomicWriteJson(control.heartbeat, {
+			version: 1,
+			runId: "g1",
+			workerId,
+			at: new Date().toISOString(),
+			seq: 2,
+		});
+		await vi.advanceTimersByTimeAsync(Math.floor(ADOPTION_STARTED_GRACE_MS / 2) + 1);
+		await flushMicrotasks();
+		expect(__adoptionGraceRecheckCountForTest()).toBe(1);
+
+		atomicWriteJson(pathsA.result, {
+			version: 1,
+			runId: assignmentA,
+			workerId,
+			status: "completed",
+			messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
+			finishedAt: new Date().toISOString(),
+		});
+		atomicWriteJson(control.heartbeat, {
+			version: 1,
+			runId: "g1",
+			workerId,
+			at: new Date().toISOString(),
+			seq: 3,
+		});
+		await vi.advanceTimersByTimeAsync(ADOPTION_STARTED_GRACE_MS + 1);
+		await flushMicrotasks();
+		expect(__adoptionGraceRecheckCountForTest()).toBe(0);
+		const after = pool.getByRole("scout")!;
+		expect(after.status).toBe("idle");
+		expect(after.activeAssignmentId).toBeUndefined();
+	});
+
+	it("started-grace recheck no-ops when successor generation replaces snapshot", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date("2024-01-01T00:00:00.000Z"));
+		const {
+			ADOPTION_STARTED_GRACE_MS,
+			__clearAdoptionGraceRechecksForTest,
+			__adoptionGraceRecheckCountForTest,
+		} = await import("../src/extensions/parent.js");
+		__clearAdoptionGraceRechecksForTest();
+		const { pool, assignmentA, pathsA, workerId, control } = await setupBusyScout({
+			label: "grace-successor-noop",
+			agentStatus: "idle",
+			dispatchAgeMs: 0,
+		});
+		await vi.advanceTimersByTimeAsync(Math.floor(ADOPTION_STARTED_GRACE_MS / 2));
+		atomicWriteJson(pathsA.started, {
+			version: 1,
+			runId: assignmentA,
+			workerId,
+			generation: 1,
+			parentEpoch: "e1",
+			startedAt: new Date().toISOString(),
+		});
+		atomicWriteJson(control.heartbeat, {
+			version: 1,
+			runId: "g1",
+			workerId,
+			at: new Date().toISOString(),
+			seq: 2,
+		});
+		await vi.advanceTimersByTimeAsync(Math.floor(ADOPTION_STARTED_GRACE_MS / 2) + 1);
+		await flushMicrotasks();
+		expect(__adoptionGraceRecheckCountForTest()).toBe(1);
+
+		const prior = pool.getByRole("scout")!;
+		pool.upsert({
+			workerId,
+			generation: 2,
+			generationTombstone: 2,
+			role: "scout",
+			paneId: "w1:p9",
+			agentName: "momo_scout_n1",
+			...(prior.cwd ? { cwd: prior.cwd } : {}),
+			status: "idle",
+			updatedAt: new Date().toISOString(),
+		});
+		await vi.advanceTimersByTimeAsync(ADOPTION_STARTED_GRACE_MS + 1);
+		await flushMicrotasks();
+		expect(__adoptionGraceRecheckCountForTest()).toBe(0);
+		const after = pool.getByRole("scout")!;
+		expect(after.generation).toBe(2);
+		expect(after.status).toBe("idle");
+		expect(after.paneId).toBe("w1:p9");
+	});
+
+	it("initial started-grace timer marks unhealthy at expiry while still idle", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date("2024-01-01T00:00:00.000Z"));
+		const {
+			ADOPTION_STARTED_GRACE_MS,
+			__clearAdoptionGraceRechecksForTest,
+			__adoptionGraceRecheckCountForTest,
+		} = await import("../src/extensions/parent.js");
+		__clearAdoptionGraceRechecksForTest();
+		const { pool, assignmentA, workerId, control } = await setupBusyScout({
+			label: "grace-started-direct",
+			agentStatus: "idle",
+			startedAgeMs: Math.floor(ADOPTION_STARTED_GRACE_MS / 2),
+		});
+		expect(pool.getByRole("scout")?.status).toBe("busy");
+		expect(__adoptionGraceRecheckCountForTest()).toBe(1);
+		atomicWriteJson(control.heartbeat, {
+			version: 1,
+			runId: "g1",
+			workerId,
+			at: new Date().toISOString(),
+			seq: 2,
+		});
+		await vi.advanceTimersByTimeAsync(ADOPTION_STARTED_GRACE_MS + 1);
+		await flushMicrotasks();
+		expect(__adoptionGraceRecheckCountForTest()).toBe(0);
+		expect(pool.getByRole("scout")?.status).toBe("unhealthy");
+		expect(pool.getByRole("scout")?.activeAssignmentId).toBe(assignmentA);
 	});
 
 	it("old dispatch + idle + no started becomes unhealthy (died before start)", async () => {

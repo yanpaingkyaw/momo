@@ -1168,11 +1168,12 @@ Momo must select a specialist backend as follows:
 For each accepted `scout`, `planner`, `implementer`, or `reviewer` task while
 the Herdr pane-worker backend is active, Momo must:
 
-1. Logically preallocate an assignment proxy for **parallel** tasks that will
-   run (allocation failures become structured failed `TaskResult`s without
-   discarding healthy siblings). **Single** and **chain** allocate lazily one
-   step at a time — chain tails that never prompt must not create sessions or
-   panes.
+1. Allocate assignment proxies **lazily** under a concurrency bound for
+   **parallel** tasks (`maxParallelConcurrency` bounds both `createChildSession`
+   and execution). Allocation failures become structured failed `TaskResult`s
+   without discarding healthy siblings; abort skips not-yet-started slots.
+   **Single** and **chain** allocate one step at a time — chain tails that never
+   prompt must not create sessions or panes.
 2. Create or reuse exactly **one persistent Herdr pane per role** per pool key
    (canonical git root + Herdr workspace + socket/server identity; excludes
    parent pane id). Persistent workers launch and execute from the **canonical
@@ -1182,7 +1183,7 @@ the Herdr pane-worker backend is active, Momo must:
    missing or subdirectory cwd fails closed (`/momo-cleanup`). Registry
    transitions must retain the canonical cwd.
 3. Create the physical pane **lazily** when the assignment prompt executes, not
-   at prepare time.
+   when the parallel concurrency slot merely begins allocating a proxy.
 4. When the role worker is busy, enqueue the assignment on a cross-parent FIFO
    queue with **no overflow panes**.
 5. Launch/reuse a **full Pi TUI** worker constrained to the task role.

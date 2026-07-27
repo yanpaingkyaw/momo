@@ -65,12 +65,6 @@ export interface RunDelegationOptions {
 	onProgress?: (progress: DelegationProgress) => void;
 }
 
-export interface PreparedChild {
-	task: DelegatedTask;
-	role: AgentRole;
-	session: ChildSession;
-}
-
 export interface ChildSession {
 	readonly messages: readonly unknown[];
 	readonly agent?: {
@@ -79,7 +73,7 @@ export interface ChildSession {
 	subscribe(listener: (event: any) => void): () => void;
 	prompt(text: string): Promise<void>;
 	abort(): Promise<void>;
-	/** Terminal-skip a prepared but never-prompted worker (Herdr). */
+	/** Terminal-skip a never-prompted worker (Herdr). */
 	skip?(reason: string): Promise<void>;
 	dispose(): void | Promise<void>;
 }
@@ -262,14 +256,6 @@ function skippedResult(task: DelegatedTask): TaskResult {
 	};
 }
 
-function allocationFailedResult(task: DelegatedTask, error: unknown): TaskResult {
-	return {
-		...skippedResult(task),
-		status: "failed",
-		error: { message: errorMessage(error) },
-	};
-}
-
 function taskOutput(output: string): Pick<TaskResult, "output" | "outputTruncated" | "fullOutput"> {
 	const visible = truncateUtf8(output);
 	return {
@@ -307,63 +293,15 @@ export function createDelegationRunner(options: DelegationRunnerOptions): Delega
 		}
 	};
 
-	const allocateChild = async (task: DelegatedTask): Promise<PreparedChild> => {
-		const role = roles.get(task.agent);
-		if (!role) throw new Error(`Unknown agent: ${task.agent}`);
-		const session = await options.createChildSession({ cwd, role });
-		return { task, role, session };
-	};
-
-	const terminalSkipPrepared = async (prepared: PreparedChild, reason: string): Promise<void> => {
-		try {
-			if (typeof prepared.session.skip === "function") {
-				await prepared.session.skip(reason);
-			}
-		} catch {
-			// best effort
-		}
-		try {
-			await prepared.session.dispose();
-		} catch {
-			// ignore
-		}
-	};
-
-	/**
-	 * Parallel allocation: settle each child independently. Failures become
-	 * structured TaskResults — never dispose healthy siblings without running them.
-	 */
-	const allocateParallelSlots = async (
-		tasks: readonly DelegatedTask[],
-	): Promise<
-		Array<
-			| { ok: true; prepared: PreparedChild }
-			| { ok: false; task: DelegatedTask; error: unknown }
-		>
-	> => {
-		const outcomes = await Promise.allSettled(tasks.map((task) => allocateChild(task)));
-		return outcomes.map((outcome, index) => {
-			const task = tasks[index]!;
-			if (outcome.status === "fulfilled") {
-				return { ok: true as const, prepared: outcome.value };
-			}
-			return { ok: false as const, task, error: outcome.reason };
-		});
-	};
-
 	const executeTask = async (
 		mode: DelegationRequest["mode"],
 		task: DelegatedTask,
 		index: number,
 		runOptions: RunDelegationOptions,
-		prepared?: PreparedChild,
 	): Promise<TaskResult> => {
-		const role = prepared?.role ?? roles.get(task.agent);
+		const role = roles.get(task.agent);
 		if (!role) throw new Error(`Unknown agent: ${task.agent}`);
 		if (runOptions.signal?.aborted) {
-			if (prepared) {
-				await terminalSkipPrepared(prepared, "cancelled_before_prompt");
-			}
 			return {
 				...skippedResult(task),
 				status: "aborted",
@@ -371,7 +309,7 @@ export function createDelegationRunner(options: DelegationRunnerOptions): Delega
 			};
 		}
 
-		let session: ChildSession | undefined = prepared?.session;
+		let session: ChildSession | undefined;
 		let unsubscribe: (() => void) | undefined;
 		let abortPromise: Promise<void> | undefined;
 		let textBuffer = "";
@@ -409,9 +347,8 @@ export function createDelegationRunner(options: DelegationRunnerOptions): Delega
 		};
 
 		try {
-			if (!session) {
-				session = await options.createChildSession({ cwd, role });
-			}
+			// Allocate lazily when the concurrency slot (or single/chain step) runs.
+			session = await options.createChildSession({ cwd, role });
 			unsubscribe = session.subscribe(onEvent);
 			const abortChild = () => {
 				if (!abortPromise && session) abortPromise = session.abort().catch(() => {});
@@ -499,8 +436,6 @@ export function createDelegationRunner(options: DelegationRunnerOptions): Delega
 				error !== null &&
 				"uncertainWrite" in error &&
 				(error as { uncertainWrite?: unknown }).uncertainWrite === true;
-			// Uncertain implementer writes outrank parent abort: never report a generic
-			// aborted TaskResult when the child surfaced uncertainWrite:true.
 			const status = uncertain ? "failed" : aborted ? "aborted" : "failed";
 			const messages = session?.messages ?? [];
 			const preserved = extractLastAssistantText(messages) ?? "";
@@ -549,10 +484,9 @@ export function createDelegationRunner(options: DelegationRunnerOptions): Delega
 		task: DelegatedTask,
 		index: number,
 		runOptions: RunDelegationOptions,
-		prepared?: PreparedChild,
 	): Promise<TaskResult> => {
-		const role = prepared?.role ?? roles.get(task.agent);
-		if (!role?.canWrite) return executeTask(mode, task, index, runOptions, prepared);
+		const role = roles.get(task.agent);
+		if (!role?.canWrite) return executeTask(mode, task, index, runOptions);
 
 		let release!: () => void;
 		const lock = new Promise<void>((resolve) => {
@@ -562,7 +496,7 @@ export function createDelegationRunner(options: DelegationRunnerOptions): Delega
 		writerTail = precedingWriter.then(() => lock);
 		await precedingWriter;
 		try {
-			return await executeTask(mode, task, index, runOptions, prepared);
+			return await executeTask(mode, task, index, runOptions);
 		} finally {
 			release();
 		}
@@ -586,7 +520,6 @@ export function createDelegationRunner(options: DelegationRunnerOptions): Delega
 			if (request.mode === "single") {
 				const task = { agent: request.agent, task: request.task };
 				reportProgress(runOptions, { mode: request.mode, phase: "queued", index: 0, agent: task.agent, message: `${task.agent} queued` });
-				// Lazy: allocate inside executeTask so allocation failures are TaskResults.
 				return finish(request.mode, [await runTask(request.mode, task, 0, runOptions)]);
 			}
 
@@ -594,19 +527,15 @@ export function createDelegationRunner(options: DelegationRunnerOptions): Delega
 				for (const [index, task] of request.tasks.entries()) {
 					reportProgress(runOptions, { mode: request.mode, phase: "queued", index, agent: task.agent, message: `${task.agent} queued` });
 				}
-				const slots = await allocateParallelSlots(request.tasks);
-				type ParallelSlot = (typeof slots)[number];
-				const scheduled = await mapWithConcurrency<ParallelSlot, TaskResult>(
-					slots,
-					async (slot, index, signal) => {
-						if (!slot.ok) {
-							return allocationFailedResult(slot.task, slot.error);
-						}
-						return runTask(request.mode, slot.prepared.task, index, {
+				// Lazy createChildSession inside mapWithConcurrency so maxParallelConcurrency
+				// bounds both session allocation and execution; abort skips queued slots.
+				const scheduled = await mapWithConcurrency(
+					request.tasks,
+					async (task, index, signal) =>
+						runTask(request.mode, task, index, {
 							...runOptions,
 							...(signal === undefined ? {} : { signal }),
-						}, slot.prepared);
-					},
+						}),
 					{
 						concurrency,
 						...(runOptions.signal === undefined ? {} : { signal: runOptions.signal }),
@@ -624,14 +553,12 @@ export function createDelegationRunner(options: DelegationRunnerOptions): Delega
 				for (let index = 0; index < scheduled.length; index += 1) {
 					const item = scheduled[index];
 					const task = request.tasks[index];
-					const slot = slots[index];
-					if (!task || !item || !slot) throw new Error(`Missing parallel task at index ${index}`);
+					if (!task || !item) throw new Error(`Missing parallel task at index ${index}`);
 					if (item.status === "fulfilled") {
 						results.push(item.value);
 						continue;
 					}
 					if (item.status === "skipped") {
-						if (slot.ok) await terminalSkipPrepared(slot.prepared, "parallel_skipped");
 						results.push(skippedResult(task));
 						continue;
 					}
@@ -654,8 +581,6 @@ export function createDelegationRunner(options: DelegationRunnerOptions): Delega
 				return finish(request.mode, results);
 			}
 
-			// Chain: allocate one step at a time (lazy). Failed/aborted steps skip
-			// remaining tails without creating their sessions.
 			const results: TaskResult[] = [];
 			let previous = "";
 			for (let index = 0; index < request.steps.length; index++) {

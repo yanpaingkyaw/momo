@@ -201,6 +201,7 @@ describe("herdr factory + runner integration", () => {
 		const runner = createDelegationRunner({
 			cwd,
 			roles: ROLE_LIST,
+			maxParallelConcurrency: 1,
 			createChildSession: async ({ role }) => {
 				n += 1;
 				const workerId = `${role.name}_${n}`;
@@ -229,7 +230,9 @@ describe("herdr factory + runner integration", () => {
 					],
 					agent: { waitForIdle: async () => {} },
 					subscribe: () => () => {},
-					prompt: async () => {},
+					prompt: async () => {
+						controller.abort();
+					},
 					abort: vi.fn(async () => {}),
 					skip,
 					dispose,
@@ -242,7 +245,7 @@ describe("herdr factory + runner integration", () => {
 					paneId: `w1:p${n}`,
 					agentName: `momo_${workerId}`,
 					spoolRoot: `/tmp/${workerId}`,
-						cwd,
+					cwd,
 
 					status: "ready",
 					updatedAt: new Date().toISOString(),
@@ -252,7 +255,7 @@ describe("herdr factory + runner integration", () => {
 		});
 
 		const controller = new AbortController();
-		const parallelPromise = runner.run(
+		const parallel = await runner.run(
 			{
 				mode: "parallel",
 				tasks: [
@@ -263,13 +266,12 @@ describe("herdr factory + runner integration", () => {
 			},
 			{ signal: controller.signal },
 		);
-		// Abort after preparation begins so some workers may be skipped while queued.
-		controller.abort();
-		const parallel = await parallelPromise;
 		expect(parallel.results.some((r) => r.status === "skipped" || r.status === "aborted")).toBe(
 			true,
 		);
-		expect(sessions.some((s) => s.skip.mock.calls.length > 0)).toBe(true);
+		// Lazy parallel + concurrency 1: abort during first prompt skips remaining allocations.
+		expect(sessions.length).toBe(1);
+		expect(parallel.results.filter((r) => r.status === "skipped")).toHaveLength(2);
 
 		sessions.length = 0;
 		n = 0;
@@ -329,6 +331,7 @@ describe("herdr factory + runner integration", () => {
 		const runner = createDelegationRunner({
 			cwd,
 			roles: ROLE_LIST,
+			maxParallelConcurrency: 2,
 			createChildSession: async ({ role }) => {
 				count += 1;
 				if (role.name === "planner") throw new Error("split failed");
@@ -370,6 +373,105 @@ describe("herdr factory + runner integration", () => {
 		expect(prompts).toContain("scout:a");
 		expect(prompts).toContain("reviewer:c");
 		expect(count).toBe(3);
+	});
+
+	it("bounds concurrent createChildSession by maxParallelConcurrency", async () => {
+		const cwd = tempDir("momo-bound-cwd-");
+		let activeCreates = 0;
+		let maxCreates = 0;
+		const gates: Array<() => void> = [];
+		const runner = createDelegationRunner({
+			cwd,
+			roles: ROLE_LIST,
+			maxParallelConcurrency: 2,
+			createChildSession: async ({ role }) => {
+				activeCreates += 1;
+				maxCreates = Math.max(maxCreates, activeCreates);
+				await new Promise<void>((resolve) => gates.push(resolve));
+				activeCreates -= 1;
+				return {
+					messages: [
+						{
+							role: "assistant",
+							content: [{ type: "text", text: `${role.name}-ok` }],
+							usage: { input: 1, output: 1, totalTokens: 2, cost: { total: 0 } },
+						},
+					],
+					agent: { waitForIdle: async () => {} },
+					subscribe: () => () => {},
+					prompt: async () => {},
+					abort: async () => {},
+					dispose: async () => {},
+				};
+			},
+		});
+		const run = runner.run({
+			mode: "parallel",
+			tasks: [
+				{ agent: "scout", task: "a" },
+				{ agent: "planner", task: "b" },
+				{ agent: "reviewer", task: "c" },
+			],
+		});
+		const waitForGates = async (n: number) => {
+			for (let i = 0; i < 100; i++) {
+				if (gates.length >= n) return;
+				await new Promise((r) => setTimeout(r, 0));
+			}
+			throw new Error(`expected ${n} gates, got ${gates.length}`);
+		};
+		await waitForGates(2);
+		expect(maxCreates).toBe(2);
+		expect(activeCreates).toBe(2);
+		gates.shift()?.();
+		gates.shift()?.();
+		await waitForGates(1);
+		expect(maxCreates).toBe(2);
+		gates.shift()?.();
+		await run;
+		expect(maxCreates).toBe(2);
+	});
+
+	it("abort prevents tail createChildSession allocations", async () => {
+		const cwd = tempDir("momo-abort-alloc-");
+		const created: string[] = [];
+		const controller = new AbortController();
+		const runner = createDelegationRunner({
+			cwd,
+			roles: ROLE_LIST,
+			maxParallelConcurrency: 1,
+			createChildSession: async ({ role }) => {
+				created.push(role.name);
+				if (role.name === "scout") controller.abort();
+				return {
+					messages: [
+						{
+							role: "assistant",
+							content: [{ type: "text", text: "ok" }],
+							usage: { input: 1, output: 1, totalTokens: 2, cost: { total: 0 } },
+						},
+					],
+					agent: { waitForIdle: async () => {} },
+					subscribe: () => () => {},
+					prompt: async () => {},
+					abort: async () => {},
+					dispose: async () => {},
+				};
+			},
+		});
+		const result = await runner.run(
+			{
+				mode: "parallel",
+				tasks: [
+					{ agent: "scout", task: "a" },
+					{ agent: "planner", task: "b" },
+					{ agent: "reviewer", task: "c" },
+				],
+			},
+			{ signal: controller.signal },
+		);
+		expect(created).toEqual(["scout"]);
+		expect(result.results.map((r) => r.status)).toEqual(["aborted", "skipped", "skipped"]);
 	});
 
 	it("returns failed TaskResult for single allocation failure", async () => {

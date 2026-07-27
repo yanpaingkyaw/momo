@@ -453,7 +453,7 @@ Shipped modules are listed in **§13.0** (not the obsolete “not yet created”
 
 - **Status:** Accepted (**implemented** in `0.2.0` candidate; live Herdr acceptance incomplete)
 - **Context:** Pane-per-task allocation created duplicate implementer/reviewer panes for repeated work.
-- **Decision:** Under Herdr mode, keep exactly one persistent Momo-managed pane per role per `poolKey` (canonical repo + Herdr workspace + socket). Runner allocates parallel proxies concurrently (failures are structured task results); single/chain allocate lazily per step. Physical panes are lazy on prompt; busy same-role work FIFO-queues without overflow panes. Workers always run from the canonical repo root so subdirectory parents share cwd and panes.
+- **Decision:** Under Herdr mode, keep exactly one persistent Momo-managed pane per role per `poolKey` (canonical repo + Herdr workspace + socket). Runner allocates parallel proxies lazily inside the concurrency scheduler (failures are structured task results; abort skips queued allocations); single/chain allocate lazily per step. Physical panes are lazy on prompt; busy same-role work FIFO-queues without overflow panes. Workers always run from the canonical repo root so subdirectory parents share cwd and panes.
 - **Consequences:** Shared cross-parent pool requires transaction locks and adoption identity checks; legacy v1 panes must be migrated/closed, never adopted.
 
 ### ADR-011 — Structured versioned IPC
