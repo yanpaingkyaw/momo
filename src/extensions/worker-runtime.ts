@@ -34,6 +34,7 @@ import {
 import {
 	appendEvent,
 	atomicWriteJson,
+	EventsFileCapacityError,
 	MAX_IPC_JSON_BYTES,
 	type IpcActivePointer,
 	type IpcCommand,
@@ -85,6 +86,8 @@ interface ActiveAssignment {
 	parentEpoch?: string;
 	/** A cancellation is terminal even when Pi settles without an assistant message. */
 	cancelRequested?: string;
+	/** Progress event log hit the byte cap; further non-authoritative events are dropped. */
+	eventsCapacityExhausted?: boolean;
 }
 
 export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOptions = {}): void {
@@ -182,6 +185,7 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 		message?: string,
 		extra: Partial<IpcEvent> = {},
 	): void {
+		if (assignment.eventsCapacityExhausted) return;
 		assignment.eventSeq += 1;
 		const event: IpcEvent = {
 			version: 1,
@@ -193,7 +197,15 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 			...extra,
 		};
 		if (message !== undefined) event.message = message.slice(0, 8192);
-		appendEvent(assignment.paths.events, event);
+		try {
+			appendEvent(assignment.paths.events, event);
+		} catch (error) {
+			if (error instanceof EventsFileCapacityError) {
+				assignment.eventsCapacityExhausted = true;
+				return;
+			}
+			throw error;
+		}
 	}
 
 	function writeControlHeartbeat(): void {
@@ -793,10 +805,11 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 		}
 		// Durable result is authoritative. Terminal event append is best-effort
 		// and must never prevent completeCleanAssignment / queue advancement.
+		// Progress emitters rethrow non-capacity faults; capacity is dropped in-place.
 		try {
 			emitAssignment(assignment, eventType, eventType);
 		} catch {
-			// ignore event-log size/I/O failures after durable result
+			// ignore event-log I/O failures after durable result
 		}
 		if (protocolUnhealthy || partial.uncertainWrite) return;
 		// Task failure returns idle (or next queued); protocol failure stays unhealthy.

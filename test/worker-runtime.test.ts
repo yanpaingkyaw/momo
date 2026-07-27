@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, rmSync, existsSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, existsSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -643,6 +643,149 @@ describe("worker runtime (persistent pool)", () => {
 
 		const resultA = readJsonFile(pathsA.result) as { status: string };
 		expect(resultA.status).toBe("completed");
+		expect(pool.getByRole("scout")?.activeAssignmentId).toBe(assignmentB);
+		expect(pool.getByRole("scout")?.status).toBe("busy");
+		expect(queueCount(pool.poolRoot, "scout")).toBe(0);
+		await vi.advanceTimersByTimeAsync(150);
+		expect(pi.sendUserMessage).toHaveBeenCalledWith("successor");
+		void pathsB;
+	});
+
+	it("event capacity exhaustion drops further progress events but still completes and advances queue", async () => {
+		vi.useFakeTimers();
+		const cacheRoot = tempDir("momo-evt-cap-progress-");
+		const cwd = tempDir("momo-evt-cap-progress-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const workerId = stableWorkerId(identity.poolKey, "scout");
+		const control = workerControlPaths(pool.poolRoot, "scout");
+		mkdirSync(control.root, { recursive: true, mode: 0o700 });
+		const assignmentA = "ccccccccccccccc1";
+		const assignmentB = "ddddddddddddddd2";
+		const pathsA = assignmentSpoolPaths(pool.poolRoot, "scout", assignmentA);
+		const pathsB = assignmentSpoolPaths(pool.poolRoot, "scout", assignmentB);
+		mkdirSync(pathsA.root, { recursive: true, mode: 0o700 });
+		mkdirSync(pathsB.root, { recursive: true, mode: 0o700 });
+		pool.upsert({
+			workerId,
+			generation: 1,
+			generationTombstone: 1,
+			role: "scout",
+			paneId: "w1:p2",
+			agentName: "momo_scout",
+			status: "idle",
+			updatedAt: new Date().toISOString(),
+		});
+
+		const pi = createFakePi();
+		installMomoWorker(pi as unknown as ExtensionAPI, {
+			env: {
+				MOMO_WORKER: "1",
+				MOMO_ROLE: "scout",
+				MOMO_IPC_DIR: control.root,
+				MOMO_CONTROL_DIR: control.root,
+				MOMO_WORKER_ID: workerId,
+				MOMO_WORKER_GENERATION: "1",
+				MOMO_POOL_KEY: identity.poolKey,
+				MOMO_POOL_ROOT: pool.poolRoot,
+				MOMO_RUN_ID: "g1",
+				MOMO_CWD: cwd,
+			},
+			poolRegistry: pool,
+			now: () => 1_700_000_000_000,
+			sleep: async () => {},
+		});
+		const ctx = {
+			hasUI: true,
+			isIdle: () => true,
+			abort: vi.fn(),
+			cwd,
+		} as unknown as ExtensionContext;
+		await pi.emit("session_start", {}, ctx);
+		atomicWriteJson(pathsA.command, {
+			version: 1,
+			type: "prompt",
+			task: "first",
+			issuedAt: new Date().toISOString(),
+			runId: assignmentA,
+			workerId,
+			generation: 1,
+			parentEpoch: "epoch1",
+		});
+		atomicWriteJson(control.active, {
+			version: 1,
+			assignmentId: assignmentA,
+			generation: 1,
+			parentEpoch: "epoch1",
+			dispatchedAt: new Date().toISOString(),
+		});
+		pool.upsert({
+			...pool.getByRole("scout")!,
+			status: "busy",
+			activeAssignmentId: assignmentA,
+			activeParentEpoch: "epoch1",
+			updatedAt: new Date().toISOString(),
+		});
+		enqueueAssignment(pool.poolRoot, "scout", {
+			assignmentId: assignmentB,
+			workerId,
+			generation: 1,
+			parentEpoch: "epoch1",
+			task: "successor",
+		});
+		await vi.advanceTimersByTimeAsync(150);
+		expect(pi.sendUserMessage).toHaveBeenCalledWith("first");
+
+		const sizeBeforePad = existsSync(pathsA.events) ? readFileSync(pathsA.events).length : 0;
+		const padBytes = Math.max(0, MAX_EVENTS_FILE_BYTES - sizeBeforePad - 40);
+		writeFileSync(
+			pathsA.events,
+			Buffer.concat([
+				existsSync(pathsA.events) ? readFileSync(pathsA.events) : Buffer.alloc(0),
+				Buffer.alloc(padBytes, 0x20),
+			]),
+			{ mode: 0o600 },
+		);
+		const sizeAtCap = readFileSync(pathsA.events).length;
+		expect(sizeAtCap).toBeLessThanOrEqual(MAX_EVENTS_FILE_BYTES);
+
+		await pi.emit(
+			"message_update",
+			{ assistantMessageEvent: { type: "text_delta", delta: "overflow-progress" } },
+			ctx,
+		);
+		const afterOverflow = readFileSync(pathsA.events);
+		expect(afterOverflow.length).toBe(sizeAtCap);
+		expect(afterOverflow.length).toBeLessThanOrEqual(MAX_EVENTS_FILE_BYTES);
+
+		await pi.emit(
+			"message_update",
+			{ assistantMessageEvent: { type: "text_delta", delta: "should-drop" } },
+			ctx,
+		);
+		expect(readFileSync(pathsA.events).length).toBe(sizeAtCap);
+
+		await pi.emit(
+			"message_end",
+			{
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "done-a" }],
+					stopReason: "stop",
+				},
+			},
+			ctx,
+		);
+		await pi.emit("agent_settled", {}, ctx);
+
+		const resultA = readJsonFile(pathsA.result) as { status: string };
+		expect(resultA.status).toBe("completed");
+		expect(readFileSync(pathsA.events).length).toBeLessThanOrEqual(MAX_EVENTS_FILE_BYTES);
 		expect(pool.getByRole("scout")?.activeAssignmentId).toBe(assignmentB);
 		expect(pool.getByRole("scout")?.status).toBe("busy");
 		expect(queueCount(pool.poolRoot, "scout")).toBe(0);

@@ -15,7 +15,9 @@ import { createHash, randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { AgentName } from "../roles.js";
-import { IpcValidationError } from "./errors.js";
+import { IpcValidationError, EventsFileCapacityError } from "./errors.js";
+
+export { IpcValidationError, EventsFileCapacityError } from "./errors.js";
 
 export const IPC_VERSION = 1;
 export const MAX_IPC_JSON_BYTES = 256 * 1024;
@@ -229,21 +231,48 @@ export function readJsonFile(filePath: string, maxBytes = MAX_IPC_JSON_BYTES): u
 	return JSON.parse(readFileSync(filePath, "utf8"));
 }
 
-export function appendEvent(filePath: string, event: IpcEvent, maxTotalBytes = 2 * 1024 * 1024): void {
+export function appendEvent(
+	filePath: string,
+	event: IpcEvent,
+	maxTotalBytes = MAX_EVENTS_FILE_BYTES,
+): void {
 	ensurePrivateDir(path.dirname(filePath));
+	const line = `${JSON.stringify(event)}\n`;
+	const lineBytes = Buffer.byteLength(line, "utf8");
+	if (lineBytes > MAX_IPC_JSON_BYTES) {
+		throw new Error("IPC event exceeds size limit");
+	}
+
+	let currentSize = 0;
 	if (existsSync(filePath)) {
-		const stat = lstatSync(filePath);
+		let stat: ReturnType<typeof lstatSync>;
+		try {
+			stat = lstatSync(filePath);
+		} catch (error) {
+			throw new Error(
+				`IPC events lstat failed at ${filePath}: ${
+					error instanceof Error ? error.message : String(error)
+				}`,
+			);
+		}
 		if (stat.isSymbolicLink()) {
 			throw new Error(`IPC events path must not be a symlink: ${filePath}`);
 		}
-		if (stat.size > maxTotalBytes) {
-			throw new Error(`IPC events file exceeds total size cap: ${filePath}`);
+		if (!stat.isFile()) {
+			throw new Error(`IPC events path must be a regular file: ${filePath}`);
 		}
+		if (typeof stat.mode === "number" && (stat.mode & 0o077) !== 0) {
+			throw new Error(`IPC events file has group/other permissions: ${filePath}`);
+		}
+		currentSize = stat.size;
 	}
-	const line = `${JSON.stringify(event)}\n`;
-	if (Buffer.byteLength(line, "utf8") > MAX_IPC_JSON_BYTES) {
-		throw new Error("IPC event exceeds size limit");
+
+	if (currentSize + lineBytes > maxTotalBytes) {
+		throw new EventsFileCapacityError(
+			`IPC events file would exceed size cap (${currentSize}+${lineBytes}>${maxTotalBytes}): ${filePath}`,
+		);
 	}
+
 	writeFileSync(filePath, line, { encoding: "utf8", flag: "a", mode: 0o600 });
 }
 

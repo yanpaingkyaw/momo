@@ -1,8 +1,10 @@
-import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+	EventsFileCapacityError,
+	MAX_EVENTS_FILE_BYTES,
 	MAX_IPC_JSON_BYTES,
 	appendEvent,
 	atomicWriteJson,
@@ -139,6 +141,64 @@ describe("IPC spool", () => {
 			const chunk = readEventsSince(file, 0);
 			expect(chunk.events).toHaveLength(1);
 			expect(chunk.malformed).toBe(true);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("allows an exact-fit append and rejects one byte over without mutation", () => {
+		const root = mkdtempSync(path.join(tmpdir(), "momo-ipc-"));
+		try {
+			const file = path.join(root, "events.ndjson");
+			const first = event(1, "exact");
+			const firstLine = `${JSON.stringify(first)}\n`;
+			const firstBytes = Buffer.byteLength(firstLine, "utf8");
+			appendEvent(file, first, firstBytes);
+			expect(readFileSync(file, "utf8")).toBe(firstLine);
+			expect(readFileSync(file).length).toBe(firstBytes);
+
+			const before = readFileSync(file);
+			const second = event(2, "x");
+			expect(() => appendEvent(file, second, firstBytes)).toThrow(EventsFileCapacityError);
+			expect(readFileSync(file)).toEqual(before);
+			expect(readEventsSince(file, 0).events).toHaveLength(1);
+
+			// One byte of headroom is still insufficient for any second event line.
+			expect(() => appendEvent(file, second, firstBytes + 1)).toThrow(EventsFileCapacityError);
+			expect(readFileSync(file)).toEqual(before);
+			expect(readFileSync(file).length).toBeLessThanOrEqual(firstBytes + 1);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("accounts for multibyte UTF-8 when enforcing the total byte cap", () => {
+		const root = mkdtempSync(path.join(tmpdir(), "momo-ipc-"));
+		try {
+			const file = path.join(root, "events.ndjson");
+			const first = event(1, "αβγ");
+			const firstLine = `${JSON.stringify(first)}\n`;
+			const firstBytes = Buffer.byteLength(firstLine, "utf8");
+			expect(firstBytes).toBeGreaterThan(firstLine.length);
+			appendEvent(file, first, firstBytes);
+			const before = readFileSync(file);
+			expect(() => appendEvent(file, event(2, "δ"), firstBytes)).toThrow(EventsFileCapacityError);
+			expect(readFileSync(file)).toEqual(before);
+			expect(JSON.parse(readFileSync(file, "utf8").trim()).message).toBe("αβγ");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("defaults the total cap to MAX_EVENTS_FILE_BYTES", () => {
+		const root = mkdtempSync(path.join(tmpdir(), "momo-ipc-"));
+		try {
+			const file = path.join(root, "events.ndjson");
+			writeFileSync(file, Buffer.alloc(MAX_EVENTS_FILE_BYTES, 0x61), { mode: 0o600 });
+			const before = readFileSync(file);
+			expect(() => appendEvent(file, event(1, "overflow"))).toThrow(EventsFileCapacityError);
+			expect(readFileSync(file)).toEqual(before);
+			expect(readFileSync(file).length).toBe(MAX_EVENTS_FILE_BYTES);
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
