@@ -883,6 +883,367 @@ describe("starting reservation wait (no duplicate provision)", () => {
 		await sessionA.dispose();
 		await sessionB.dispose();
 	}, 15_000);
+
+	it("joiner timeout on pane-less starting archives tombstone so role can reprovision", async () => {
+		installFakeHerdrExtension();
+		const cacheRoot = tempDir("momo-joiner-orphan-");
+		const cwd = tempDir("momo-joiner-orphan-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const workerId = stableWorkerId(identity.poolKey, "scout");
+		pool.upsert({
+			workerId,
+			generation: 1,
+			generationTombstone: 1,
+			role: "scout",
+			agentName: "momo_scout",
+			status: "starting",
+			cwd: identity.canonicalRoot,
+			updatedAt: new Date().toISOString(),
+		});
+		const client = new HerdrClient({
+			runCommand: async () => ({
+				code: 0,
+				stdout: JSON.stringify({ id: "ok", result: {} }),
+				stderr: "",
+			}),
+		});
+		const factory = createHerdrChildSessionFactory({
+			cwd,
+			parentPaneId: "w1:p0",
+			parentId: "parent-joiner-orphan",
+			client,
+			poolRegistry: pool,
+			cacheRoot,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+			readyTimeoutMs: 80,
+			sleep: async (ms) => {
+				await new Promise((r) => setTimeout(r, Math.min(ms, 20)));
+			},
+		});
+		const session = await factory({ cwd, role: getRole("scout") });
+		await expect(session.prompt("join")).rejects.toThrow(/did not become ready/i);
+		const after = pool.getByRole("scout")!;
+		expect(isArchivalTombstone(after)).toBe(true);
+		expect(after.generationTombstone).toBeGreaterThanOrEqual(1);
+		expect(after.paneId).toBeUndefined();
+		// Reprovision allowed.
+		expect(pool.nextGeneration("scout")).toBe(after.generationTombstone + 1);
+		await session.dispose();
+	}, 10_000);
+
+	it("joiner timeout on paneful starting marks unhealthy retaining pane for cleanup", async () => {
+		installFakeHerdrExtension();
+		const cacheRoot = tempDir("momo-joiner-paneful-");
+		const cwd = tempDir("momo-joiner-paneful-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const workerId = stableWorkerId(identity.poolKey, "scout");
+		pool.upsert({
+			workerId,
+			generation: 1,
+			generationTombstone: 1,
+			role: "scout",
+			paneId: "w1:p-orphan",
+			agentName: "momo_scout",
+			status: "starting",
+			cwd: identity.canonicalRoot,
+			updatedAt: new Date().toISOString(),
+		});
+		const client = new HerdrClient({
+			runCommand: async () => ({
+				code: 0,
+				stdout: JSON.stringify({ id: "ok", result: {} }),
+				stderr: "",
+			}),
+		});
+		const factory = createHerdrChildSessionFactory({
+			cwd,
+			parentPaneId: "w1:p0",
+			parentId: "parent-joiner-paneful",
+			client,
+			poolRegistry: pool,
+			cacheRoot,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+			readyTimeoutMs: 80,
+			sleep: async (ms) => {
+				await new Promise((r) => setTimeout(r, Math.min(ms, 20)));
+			},
+		});
+		const session = await factory({ cwd, role: getRole("scout") });
+		await expect(session.prompt("join")).rejects.toThrow(/did not become ready/i);
+		const after = pool.getByRole("scout")!;
+		expect(after.status).toBe("unhealthy");
+		expect(after.paneId).toBe("w1:p-orphan");
+		expect(after.agentName).toBe("momo_scout");
+		expect(isArchivalTombstone(after)).toBe(false);
+		expect(selectClosablePoolWorkers([after]).closable).toHaveLength(1);
+		await session.dispose();
+	}, 10_000);
+
+	it("canceled joiner does not alter live starting provision", async () => {
+		installFakeHerdrExtension();
+		const cacheRoot = tempDir("momo-joiner-cancel-");
+		const cwd = tempDir("momo-joiner-cancel-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const workerId = stableWorkerId(identity.poolKey, "scout");
+		pool.upsert({
+			workerId,
+			generation: 1,
+			generationTombstone: 1,
+			role: "scout",
+			paneId: "w1:p-live",
+			agentName: "momo_scout",
+			status: "starting",
+			cwd: identity.canonicalRoot,
+			updatedAt: new Date().toISOString(),
+		});
+		const client = new HerdrClient({
+			runCommand: async () => ({
+				code: 0,
+				stdout: JSON.stringify({ id: "ok", result: {} }),
+				stderr: "",
+			}),
+		});
+		const factory = createHerdrChildSessionFactory({
+			cwd,
+			parentPaneId: "w1:p0",
+			parentId: "parent-joiner-cancel",
+			client,
+			poolRegistry: pool,
+			cacheRoot,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+			readyTimeoutMs: 5_000,
+			sleep: async (ms) => {
+				await new Promise((r) => setTimeout(r, Math.min(ms, 20)));
+			},
+		});
+		const session = await factory({ cwd, role: getRole("scout") });
+		const prompt = session.prompt("join");
+		await new Promise((r) => setTimeout(r, 40));
+		await session.abort();
+		await prompt.catch(() => undefined);
+		const after = pool.getByRole("scout")!;
+		expect(after.status).toBe("starting");
+		expect(after.paneId).toBe("w1:p-live");
+		expect(after.generation).toBe(1);
+		await session.dispose();
+	}, 10_000);
+
+	it("split persistence: paneId lands under role lock before rename; superseded split closes", async () => {
+		installFakeHerdrExtension();
+		const cacheRoot = tempDir("momo-split-persist-");
+		const cwd = tempDir("momo-split-persist-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const closed: string[] = [];
+		let releaseSplit!: () => void;
+		const splitGate = new Promise<void>((resolve) => {
+			releaseSplit = resolve;
+		});
+		let splitEntered = false;
+		let renameSawPane = false;
+		const client = new HerdrClient({
+			runCommand: async (_file, args) => {
+				if (args[0] === "pane" && args[1] === "split") {
+					splitEntered = true;
+					await splitGate;
+					return {
+						code: 0,
+						stdout: JSON.stringify({
+							id: "s",
+							result: { pane: { pane_id: "w1:p-split" } },
+						}),
+						stderr: "",
+					};
+				}
+				if (args[0] === "pane" && args[1] === "rename") {
+					renameSawPane = pool.getByRole("scout")?.paneId === "w1:p-split";
+					return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+				}
+				if (args[0] === "pane" && args[1] === "close") {
+					closed.push(String(args[2]));
+					return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+				}
+				if (args[0] === "agent" && args[1] === "start") {
+					const control =
+						args.find((_a, i) => false) ??
+						undefined;
+					void control;
+					return {
+						code: 0,
+						stdout: JSON.stringify({
+							id: "s",
+							result: {
+								pane_id: "w1:p-split",
+								name: args[2],
+								agent: "pi",
+								interactive_ready: true,
+							},
+						}),
+						stderr: "",
+					};
+				}
+				return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+			},
+		});
+		const factory = createHerdrChildSessionFactory({
+			cwd,
+			parentPaneId: "w1:p0",
+			parentId: "parent-split-persist",
+			client,
+			poolRegistry: pool,
+			cacheRoot,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+			readyTimeoutMs: 2_000,
+			sleep: async (ms) => {
+				await new Promise((r) => setTimeout(r, Math.min(ms, 10)));
+			},
+		});
+		const session = await factory({ cwd, role: getRole("scout") });
+		const prompt = session.prompt("start");
+		for (let i = 0; i < 50 && !splitEntered; i += 1) {
+			await new Promise((r) => setTimeout(r, 20));
+		}
+		expect(splitEntered).toBe(true);
+		expect(pool.getByRole("scout")?.status).toBe("starting");
+		expect(pool.getByRole("scout")?.paneId).toBeUndefined();
+		// Supersede before split returns so persist fencing rejects and closes the pane.
+		const live = pool.getByRole("scout")!;
+		pool.upsert({
+			...live,
+			generation: 2,
+			generationTombstone: 2,
+			workerId: `${live.workerId}-n2`,
+			status: "starting",
+			updatedAt: new Date().toISOString(),
+		});
+		releaseSplit();
+		await expect(prompt).rejects.toThrow(/superseded/i);
+		expect(closed).toContain("w1:p-split");
+		expect(renameSawPane).toBe(false);
+		const after = pool.getByRole("scout")!;
+		expect(after.generation).toBe(2);
+		expect(after.status).toBe("starting");
+		expect(after.paneId).toBeUndefined();
+		await session.dispose();
+	}, 15_000);
+
+	it("split persistence: paneId is visible in registry before rename runs", async () => {
+		installFakeHerdrExtension();
+		const cacheRoot = tempDir("momo-split-visible-");
+		const cwd = tempDir("momo-split-visible-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		let releaseRename!: () => void;
+		const renameGate = new Promise<void>((resolve) => {
+			releaseRename = resolve;
+		});
+		let paneAtRename: string | undefined;
+		const client = new HerdrClient({
+			runCommand: async (_file, args) => {
+				if (args[0] === "pane" && args[1] === "split") {
+					return {
+						code: 0,
+						stdout: JSON.stringify({
+							id: "s",
+							result: { pane: { pane_id: "w1:p-persist" } },
+						}),
+						stderr: "",
+					};
+				}
+				if (args[0] === "pane" && args[1] === "rename") {
+					paneAtRename = pool.getByRole("scout")?.paneId;
+					await renameGate;
+					return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+				}
+				if (args[0] === "agent" && args[1] === "start") {
+					const envReady = workerControlPaths(pool.poolRoot, "scout");
+					mkdirSync(envReady.root, { recursive: true, mode: 0o700 });
+					const workerId = pool.getByRole("scout")!.workerId;
+					atomicWriteJson(envReady.ready, {
+						version: 1,
+						runId: `g${pool.getByRole("scout")!.generation}`,
+						workerId,
+						readyAt: new Date().toISOString(),
+					});
+					return {
+						code: 0,
+						stdout: JSON.stringify({
+							id: "s",
+							result: {
+								pane_id: "w1:p-persist",
+								name: args[2],
+								agent: "pi",
+								interactive_ready: true,
+							},
+						}),
+						stderr: "",
+					};
+				}
+				return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+			},
+		});
+		const factory = createHerdrChildSessionFactory({
+			cwd,
+			parentPaneId: "w1:p0",
+			parentId: "parent-split-visible",
+			client,
+			poolRegistry: pool,
+			cacheRoot,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+			readyTimeoutMs: 3_000,
+			sleep: async (ms) => {
+				await new Promise((r) => setTimeout(r, Math.min(ms, 10)));
+			},
+		});
+		const session = await factory({ cwd, role: getRole("scout") });
+		const prompt = session.prompt("start");
+		for (let i = 0; i < 50 && paneAtRename === undefined; i += 1) {
+			await new Promise((r) => setTimeout(r, 20));
+		}
+		expect(paneAtRename).toBe("w1:p-persist");
+		releaseRename();
+		await prompt;
+		expect(pool.getByRole("scout")?.paneId).toBe("w1:p-persist");
+		await session.dispose();
+	}, 15_000);
 });
 
 describe("dispatch/claim durable order fault injection", () => {

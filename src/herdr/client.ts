@@ -125,6 +125,8 @@ export class HerdrCliError extends Error {
 export const AGENT_PANE_BUSY_CODE = "agent_pane_busy";
 /** Structured Herdr CLI code when an agent name is unknown / already gone. */
 export const AGENT_NOT_FOUND_CODE = "agent_not_found";
+/** Structured Herdr CLI code when a pane is already gone / unknown. */
+export const PANE_NOT_FOUND_CODE = "pane_not_found";
 
 export function isAgentPaneBusyError(error: unknown): boolean {
 	if (error instanceof HerdrCliError) {
@@ -147,6 +149,15 @@ export function isAgentPaneBusyError(error: unknown): boolean {
 export function isAgentNotFoundError(error: unknown): boolean {
 	if (!(error instanceof HerdrCliError)) return false;
 	return error.code === AGENT_NOT_FOUND_CODE || error.code === "not_found";
+}
+
+/**
+ * Narrow recognition of structured pane-not-found failures on pane close.
+ * Only typed HerdrCliError codes — never message matching.
+ */
+export function isPaneNotFoundError(error: unknown): boolean {
+	if (!(error instanceof HerdrCliError)) return false;
+	return error.code === PANE_NOT_FOUND_CODE || error.code === "not_found";
 }
 
 /** Bound for waiting until a freshly split pane becomes an available shell. */

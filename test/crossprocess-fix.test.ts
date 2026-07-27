@@ -1230,6 +1230,216 @@ describe("force cleanup recovery retention", () => {
 		expect(isArchivalTombstone(pool.getByRole("implementer")!)).toBe(true);
 		expect(leases.peekOwner(fixture.identity.canonicalRoot)).toBeUndefined();
 	});
+
+	it("structured pane_not_found close treats as already closed; agent missing/done archives", async () => {
+		async function run(options: {
+			label: string;
+			closeCode: string;
+			agentGet: () => Promise<{ code: number; stdout: string; stderr: string }>;
+		}) {
+			const cwd = tempDir(`momo-pane-nf-${options.label}-cwd-`);
+			const cacheRoot = tempDir(`momo-pane-nf-${options.label}-cache-`);
+			const fixture = setupPoolWorkerFixture({ cacheRoot, cwd, role: "scout" });
+			const pool = fixture.pool;
+			pool.upsert({
+				workerId: fixture.workerId,
+				generation: fixture.generation,
+				generationTombstone: fixture.generation,
+				role: "scout",
+				paneId: "w1:p-missing",
+				agentName: "momo_scout",
+				cwd: fixture.identity.canonicalRoot,
+				status: "unhealthy",
+				updatedAt: new Date().toISOString(),
+			});
+			const closed: string[] = [];
+			const notifies: string[] = [];
+			const pi = createFakePi();
+			installMomoParent(pi as unknown as ExtensionAPI, {
+				cwd,
+				env: {
+					MOMO_PARENT: "1",
+					MOMO_PARENT_ID: `parent-pane-nf-${options.label}`,
+					HERDR_ENV: "1",
+					HERDR_PANE_ID: "w1:p1",
+					HERDR_WORKSPACE_ID: "test-ws",
+					HERDR_SOCKET_PATH: "test-sock",
+				},
+				client: new HerdrClient({
+					runCommand: async (_file, args) => {
+						if (args[0] === "pane" && args[1] === "close") {
+							closed.push(String(args[2]));
+							return {
+								code: 1,
+								stdout: JSON.stringify({
+									id: "c",
+									error: { code: options.closeCode, message: "gone" },
+								}),
+								stderr: "",
+							};
+						}
+						if (args[0] === "agent" && args[1] === "get") {
+							return options.agentGet();
+						}
+						return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+					},
+				}),
+				poolRegistry: pool,
+			});
+			await pi.commands.get("momo-cleanup")!.handler("", {
+				ui: { notify: (m: string) => notifies.push(m) },
+			} as never);
+			return { pool, closed, notifies };
+		}
+
+		const missing = await run({
+			label: "agent-missing",
+			closeCode: "pane_not_found",
+			agentGet: async () => ({
+				code: 1,
+				stdout: JSON.stringify({
+					id: "g",
+					error: { code: "agent_not_found", message: "no such agent" },
+				}),
+				stderr: "",
+			}),
+		});
+		expect(missing.closed).toEqual(["w1:p-missing"]);
+		expect(isArchivalTombstone(missing.pool.getByRole("scout")!)).toBe(true);
+
+		const done = await run({
+			label: "agent-done",
+			closeCode: "not_found",
+			agentGet: async () => ({
+				code: 0,
+				stdout: JSON.stringify({
+					id: "g",
+					result: {
+						type: "agent_info",
+						agent: { agent_status: "done", name: "momo_scout" },
+					},
+				}),
+				stderr: "",
+			}),
+		});
+		expect(done.closed).toEqual(["w1:p-missing"]);
+		expect(isArchivalTombstone(done.pool.getByRole("scout")!)).toBe(true);
+	});
+
+	it("transient/unstructured pane close refusal retains row; generation supersession refuses", async () => {
+		const cwd = tempDir("momo-pane-close-refuse-cwd-");
+		const cacheRoot = tempDir("momo-pane-close-refuse-cache-");
+		const fixture = setupPoolWorkerFixture({ cacheRoot, cwd, role: "scout" });
+		const pool = fixture.pool;
+		pool.upsert({
+			workerId: fixture.workerId,
+			generation: fixture.generation,
+			generationTombstone: fixture.generation,
+			role: "scout",
+			paneId: "w1:p9",
+			agentName: "momo_scout",
+			cwd: fixture.identity.canonicalRoot,
+			status: "unhealthy",
+			updatedAt: new Date().toISOString(),
+		});
+		const notifies: string[] = [];
+		const pi = createFakePi();
+		installMomoParent(pi as unknown as ExtensionAPI, {
+			cwd,
+			env: {
+				MOMO_PARENT: "1",
+				MOMO_PARENT_ID: "parent-pane-refuse",
+				HERDR_ENV: "1",
+				HERDR_PANE_ID: "w1:p1",
+				HERDR_WORKSPACE_ID: "test-ws",
+				HERDR_SOCKET_PATH: "test-sock",
+			},
+			client: new HerdrClient({
+				runCommand: async (_file, args) => {
+					if (args[0] === "pane" && args[1] === "close") {
+						return {
+							code: 1,
+							stdout: JSON.stringify({
+								id: "c",
+								error: { code: "timeout", message: "pane close timed out" },
+							}),
+							stderr: "",
+						};
+					}
+					return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+				},
+			}),
+			poolRegistry: pool,
+		});
+		await pi.commands.get("momo-cleanup")!.handler("", {
+			ui: { notify: (m: string) => notifies.push(m) },
+		} as never);
+		expect(notifies.join("\n")).toMatch(/Failed to close|timed out/i);
+		expect(pool.getByRole("scout")?.status).toBe("unhealthy");
+		expect(pool.getByRole("scout")?.paneClosed).not.toBe(true);
+		expect(isArchivalTombstone(pool.getByRole("scout")!)).toBe(false);
+
+		// Generation supersession after structured missing close: refuse archive.
+		const cwd2 = tempDir("momo-pane-close-super-cwd-");
+		const cacheRoot2 = tempDir("momo-pane-close-super-cache-");
+		const fixture2 = setupPoolWorkerFixture({ cacheRoot: cacheRoot2, cwd: cwd2, role: "scout" });
+		const pool2 = fixture2.pool;
+		pool2.upsert({
+			workerId: fixture2.workerId,
+			generation: fixture2.generation,
+			generationTombstone: fixture2.generation,
+			role: "scout",
+			paneId: "w1:p9",
+			agentName: "momo_scout",
+			cwd: fixture2.identity.canonicalRoot,
+			status: "unhealthy",
+			updatedAt: new Date().toISOString(),
+		});
+		const notifies2: string[] = [];
+		const pi2 = createFakePi();
+		installMomoParent(pi2 as unknown as ExtensionAPI, {
+			cwd: cwd2,
+			env: {
+				MOMO_PARENT: "1",
+				MOMO_PARENT_ID: "parent-pane-super",
+				HERDR_ENV: "1",
+				HERDR_PANE_ID: "w1:p1",
+				HERDR_WORKSPACE_ID: "test-ws",
+				HERDR_SOCKET_PATH: "test-sock",
+			},
+			client: new HerdrClient({
+				runCommand: async (_file, args) => {
+					if (args[0] === "pane" && args[1] === "close") {
+						pool2.upsert({
+							...pool2.getByRole("scout")!,
+							generation: fixture2.generation + 1,
+							generationTombstone: fixture2.generation + 1,
+							workerId: `${fixture2.workerId}-n1`,
+							status: "idle",
+							paneId: "w1:p-new",
+							updatedAt: new Date().toISOString(),
+						});
+						return {
+							code: 1,
+							stdout: JSON.stringify({
+								id: "c",
+								error: { code: "pane_not_found", message: "gone" },
+							}),
+							stderr: "",
+						};
+					}
+					return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+				},
+			}),
+			poolRegistry: pool2,
+		});
+		await pi2.commands.get("momo-cleanup")!.handler("", {
+			ui: { notify: (m: string) => notifies2.push(m) },
+		} as never);
+		expect(notifies2.join("\n")).toMatch(/generation\/worker changed after pane close/i);
+		expect(pool2.getByRole("scout")?.generation).toBe(fixture2.generation + 1);
+		expect(pool2.getByRole("scout")?.status).toBe("idle");
+	});
 });
 
 describe("appendEvent still works for private files", () => {

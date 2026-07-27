@@ -15,7 +15,7 @@ import {
 	createParentEpoch,
 	createStableParentId,
 } from "../delegation/herdr-factory.js";
-import { HerdrClient, HerdrCliError, isAgentNotFoundError } from "../herdr/client.js";
+import { HerdrClient, HerdrCliError, isAgentNotFoundError, isPaneNotFoundError } from "../herdr/client.js";
 import {
 	formatWorkerStatusLine,
 	PoolRegistry,
@@ -279,7 +279,15 @@ export function installMomoParent(pi: ExtensionAPI, options: InstallMomoParentOp
 						// Close pane once, then generation-fence paneClosed before agentGet so a
 						// transient confirmation failure can retry without re-closing.
 						if (record.paneId && !record.paneClosed) {
-							await herdrClient.closePane(record.paneId);
+							try {
+								await herdrClient.closePane(record.paneId);
+							} catch (closeError) {
+								// Structured missing pane ⇒ already closed. Other close
+								// errors retain the row for a later retry.
+								if (!isPaneNotFoundError(closeError)) {
+									throw closeError;
+								}
+							}
 							const afterClose = pool.getByRole(worker.role);
 							if (
 								!afterClose ||

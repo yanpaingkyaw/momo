@@ -1053,54 +1053,104 @@ class AssignmentProxy implements ChildSession {
 		if (plan.paneId) this.paneId = plan.paneId;
 		if (plan.agentName) this.agentName = plan.agentName;
 		this.throwIfCancelled();
-		await this.waitForWorkerReady();
-		this.throwIfCancelled();
-		await withRoleLockAsync(
-			this.runtime.pool.poolRoot,
-			this.role.name,
-			async () => {
-				this.throwIfCancelled();
-				const record = this.runtime.pool.getByRole(this.role.name);
-				if (
-					!record ||
-					record.generation !== plan.generation ||
-					record.workerId !== plan.workerId
-				) {
-					throw new Error(`Role ${this.role.name} worker superseded after ready`);
-				}
-				assertLiveWorkerCanonicalCwd(record, this.runtime.cwd, this.role.name);
-				if (!record.paneId || !record.agentName) {
-					throw new Error(`Role ${this.role.name} worker missing pane/agent after ready`);
-				}
-				this.paneId = record.paneId;
-				this.agentName = record.agentName;
-				this.physicalEnsured = true;
-				this.throwIfCancelled();
-				if (record.status === "idle") {
-					this.dispatchActiveLocked(task, record);
-					return;
-				}
-				if (record.status === "busy" || record.status === "blocked") {
+		try {
+			await this.waitForWorkerReady();
+			this.throwIfCancelled();
+			await withRoleLockAsync(
+				this.runtime.pool.poolRoot,
+				this.role.name,
+				async () => {
 					this.throwIfCancelled();
-					enqueueAssignment(this.runtime.pool.poolRoot, this.role.name, {
-						assignmentId: this.assignmentId,
-						workerId: this.workerId,
-						generation: record.generation,
-						parentEpoch: this.runtime.parentEpoch,
-						task,
-					});
-					this.heartbeatExpectedAt = this.runtime.now();
-					return;
-				}
-				if (record.status === "starting") {
-					throw new Error(`Role ${this.role.name} worker still starting after ready`);
-				}
-				throw new Error(
-					`Role ${this.role.name} worker not dispatchable after ready (${record.status})`,
-				);
-			},
-			{ now: this.runtime.now, sleep: this.runtime.sleep },
-		);
+					const record = this.runtime.pool.getByRole(this.role.name);
+					if (
+						!record ||
+						record.generation !== plan.generation ||
+						record.workerId !== plan.workerId
+					) {
+						throw new Error(`Role ${this.role.name} worker superseded after ready`);
+					}
+					assertLiveWorkerCanonicalCwd(record, this.runtime.cwd, this.role.name);
+					if (!record.paneId || !record.agentName) {
+						throw new Error(`Role ${this.role.name} worker missing pane/agent after ready`);
+					}
+					this.paneId = record.paneId;
+					this.agentName = record.agentName;
+					this.physicalEnsured = true;
+					this.throwIfCancelled();
+					if (record.status === "idle") {
+						this.dispatchActiveLocked(task, record);
+						return;
+					}
+					if (record.status === "busy" || record.status === "blocked") {
+						this.throwIfCancelled();
+						enqueueAssignment(this.runtime.pool.poolRoot, this.role.name, {
+							assignmentId: this.assignmentId,
+							workerId: this.workerId,
+							generation: record.generation,
+							parentEpoch: this.runtime.parentEpoch,
+							task,
+						});
+						this.heartbeatExpectedAt = this.runtime.now();
+						return;
+					}
+					if (record.status === "starting") {
+						throw new Error(`Role ${this.role.name} worker still starting after ready`);
+					}
+					throw new Error(
+						`Role ${this.role.name} worker not dispatchable after ready (${record.status})`,
+					);
+				},
+				{ now: this.runtime.now, sleep: this.runtime.sleep },
+			);
+		} catch (error) {
+			// Cancellation must not fence/overwrite a live in-flight provision.
+			if (!(this.cancelRequested || this.isCancelledError(error))) {
+				this.fenceStartingReservationOnJoinerFailure(plan.generation, plan.workerId);
+			}
+			throw error;
+		}
+	}
+
+	/**
+	 * Non-cancellation wait-ready failure: generation+worker fence the still-starting
+	 * reservation. Paneful → unhealthy (retain pane/agent for cleanup). Pane-less →
+	 * archive with monotonic tombstone so N+1 can reprovision. Never overwrite a newer
+	 * generation or a non-starting status.
+	 */
+	private fenceStartingReservationOnJoinerFailure(
+		generation: number,
+		workerId: string,
+	): void {
+		withRoleLock(this.runtime.pool.poolRoot, this.role.name, () => {
+			const record = this.runtime.pool.getByRole(this.role.name);
+			if (
+				!record ||
+				record.generation !== generation ||
+				record.workerId !== workerId ||
+				record.status !== "starting"
+			) {
+				return;
+			}
+			const nowIso = new Date(this.runtime.now()).toISOString();
+			if (record.paneId) {
+				this.runtime.pool.upsert({
+					...record,
+					status: "unhealthy",
+					generationTombstone: Math.max(record.generationTombstone, generation),
+					updatedAt: nowIso,
+				});
+				return;
+			}
+			this.runtime.pool.archiveRoleKeepingTombstone(this.role.name, nowIso);
+			const archived = this.runtime.pool.getByRole(this.role.name);
+			if (archived && archived.generationTombstone < generation) {
+				this.runtime.pool.upsert({
+					...archived,
+					generationTombstone: generation,
+					updatedAt: nowIso,
+				});
+			}
+		});
 	}
 
 	/**
@@ -1190,10 +1240,50 @@ class AssignmentProxy implements ChildSession {
 			});
 			paneId = split.paneId;
 			this.paneId = paneId;
+			const splitPaneId = split.paneId;
 			this.throwIfCancelled();
 
-			await this.runtime.client.renamePane(paneId, `Momo ${this.role.name}`);
-			await this.runtime.client.reportMetadata(paneId, {
+			// Persist paneId into the starting reservation immediately after split
+			// (before rename/start) so parent death leaves closable evidence.
+			const persisted = withRoleLock(this.runtime.pool.poolRoot, this.role.name, () => {
+				const record = this.runtime.pool.getByRole(this.role.name);
+				if (
+					!record ||
+					record.generation !== generation ||
+					record.workerId !== this.workerId ||
+					record.status !== "starting"
+				) {
+					return false;
+				}
+				this.runtime.pool.upsert({
+					...record,
+					paneId: splitPaneId,
+					agentName,
+					cwd: this.runtime.cwd,
+					generationTombstone: Math.max(record.generationTombstone, generation),
+					updatedAt: new Date(this.runtime.now()).toISOString(),
+				});
+				return true;
+			});
+			if (!persisted) {
+				// Stale/superseded split: close the orphan pane; do not mutate foreign gen.
+				let closePaneSucceeded = false;
+				try {
+					await this.runtime.client.closePane(splitPaneId);
+					closePaneSucceeded = true;
+				} catch {
+					closePaneSucceeded = false;
+				}
+				throw new ProvisioningFailure({
+					message: "Worker provision superseded after pane split",
+					agentName,
+					paneId: splitPaneId,
+					closePaneSucceeded,
+				});
+			}
+
+			await this.runtime.client.renamePane(splitPaneId, `Momo ${this.role.name}`);
+			await this.runtime.client.reportMetadata(splitPaneId, {
 				source: "momo:parent",
 				displayAgent: `Momo ${this.role.name}`,
 				title: `Momo ${this.role.name}`,
@@ -1219,7 +1309,7 @@ class AssignmentProxy implements ChildSession {
 
 			await this.runtime.client.agentStart({
 				name: agentName,
-				paneId,
+				paneId: splitPaneId,
 				kind: "pi",
 				timeoutMs: 60_000,
 				agentArgs,
@@ -1227,12 +1317,17 @@ class AssignmentProxy implements ChildSession {
 			this.throwIfCancelled();
 			const manifest: WorkerManifest = {
 				version: 2, poolKey: this.runtime.identity.poolKey, workerId: this.workerId,
-				generation, role: this.role.name, cwd: this.runtime.cwd, paneId, agentName,
+				generation, role: this.role.name, cwd: this.runtime.cwd, paneId: splitPaneId, agentName,
 				createdAt: new Date(this.runtime.now()).toISOString(),
 			};
 			atomicWriteJson(control.manifest, manifest);
-			return paneId;
+			return splitPaneId;
 		} catch (error) {
+			if (error instanceof ProvisioningFailure) {
+				// Superseded path already closed (or attempted close). Other
+				// ProvisioningFailures should not appear here yet.
+				throw error;
+			}
 			let closePaneSucceeded: boolean | undefined;
 			if (paneId) {
 				try {

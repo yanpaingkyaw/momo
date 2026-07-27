@@ -5,6 +5,8 @@ import {
 	HerdrCliError,
 	HerdrClient,
 	isAgentNotFoundError,
+	isPaneNotFoundError,
+	PANE_NOT_FOUND_CODE,
 	parseAgentStartResult,
 	parseHerdrJson,
 	parsePaneSplitResult,
@@ -68,6 +70,43 @@ describe("Herdr JSON validation", () => {
 		).toBe(false);
 		expect(isAgentNotFoundError(new Error("agent not found"))).toBe(false);
 		expect(isAgentNotFoundError(new Error("agent_not_found"))).toBe(false);
+	});
+
+	it("isPaneNotFoundError recognizes only structured pane-not-found codes", () => {
+		expect(
+			isPaneNotFoundError(
+				new HerdrCliError("herdr pane close", {
+					code: PANE_NOT_FOUND_CODE,
+					message: "no such pane",
+				}),
+			),
+		).toBe(true);
+		expect(
+			isPaneNotFoundError(
+				new HerdrCliError("herdr pane close", {
+					code: "not_found",
+					message: "missing",
+				}),
+			),
+		).toBe(true);
+		expect(
+			isPaneNotFoundError(
+				new HerdrCliError("herdr pane close", {
+					code: "timeout",
+					message: "pane close timed out",
+				}),
+			),
+		).toBe(false);
+		expect(isPaneNotFoundError(new Error("pane not found"))).toBe(false);
+		expect(isPaneNotFoundError(new Error("pane_not_found"))).toBe(false);
+		expect(
+			isPaneNotFoundError(
+				new HerdrCliError("herdr pane close", {
+					code: "busy",
+					message: "pane_not_found in message only",
+				}),
+			),
+		).toBe(false);
 	});
 
 	it("rejects agent.start {ok:true} mocks without real AgentInfo fields", () => {
