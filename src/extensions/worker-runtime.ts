@@ -63,6 +63,23 @@ const MUTATION_TOOLS = new Set(["bash", "edit", "write"]);
 /** @deprecated Context isolation now uses the latest user message. */
 export const ASSIGNMENT_BOUNDARY_TYPE = "momo-assignment-boundary";
 
+/** @internal test-only: barrier inside writeResultDurable while holding the role lock. */
+let writeResultDurableLockHook:
+	| ((phase: "before-write" | "after-write") => void)
+	| undefined;
+
+/** @internal test-only */
+export function __setWriteResultDurableLockHookForTest(
+	hook?: (phase: "before-write" | "after-write") => void,
+): void {
+	writeResultDurableLockHook = hook;
+}
+
+/** @internal test-only */
+export function __resetWriteResultDurableLockHookForTest(): void {
+	writeResultDurableLockHook = undefined;
+}
+
 export interface WorkerRuntimeOptions {
 	env?: NodeJS.ProcessEnv;
 	leaseManager?: WriterLeaseManager;
@@ -331,6 +348,7 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 		let uncertainWrite = partial.uncertainWrite === true;
 		let errorMessage = partial.errorMessage;
 
+		// Lease release is independent of the role lock; never touch a foreign lease.
 		if (assignment.leaseHeld && !uncertainWrite) {
 			try {
 				lease.release(cwd, leaseOwner, assignment.leaseToken);
@@ -368,29 +386,36 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 			payload.status = "failed";
 		}
 
-		let written = false;
-		for (let attempt = 0; attempt < 3; attempt += 1) {
-			try {
-				atomicWriteJson(assignment.paths.result, payload, MAX_IPC_JSON_BYTES);
-				written = true;
-				break;
-			} catch {
-				// retry
+		// Serialize terminal result publication with parent fencing under the role lock.
+		return withRoleLock(poolRoot, role.name, () => {
+			if (writeResultDurableLockHook) {
+				writeResultDurableLockHook("before-write");
 			}
-		}
-		if (!written) return false;
-		assignment.resultWritten = true;
+			let written = false;
+			for (let attempt = 0; attempt < 3; attempt += 1) {
+				try {
+					atomicWriteJson(assignment.paths.result, payload, MAX_IPC_JSON_BYTES);
+					written = true;
+					break;
+				} catch {
+					// retry
+				}
+			}
+			if (!written) return false;
+			assignment.resultWritten = true;
 
-		if (uncertainWrite) {
-			markRegistry("uncertain", {
-				activeAssignmentId: assignment.assignmentId,
-				uncertainWrite: true,
-			});
-			protocolUnhealthy = true;
+			if (uncertainWrite) {
+				markRegistryLocked("uncertain", {
+					activeAssignmentId: assignment.assignmentId,
+					uncertainWrite: true,
+				});
+				protocolUnhealthy = true;
+			}
+			if (writeResultDurableLockHook) {
+				writeResultDurableLockHook("after-write");
+			}
 			return true;
-		}
-
-		return true;
+		});
 	}
 
 	function resetForNextAssignment(): void {
@@ -816,6 +841,68 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 		claimNextOrIdle("after-finish", assignment.assignmentId);
 	}
 
+	/**
+	 * Exact-token lease release for cancellation windows (same invariant as
+	 * writeResultDurable). Only clears leaseHeld after definitive release and
+	 * !stillHeldBy. Never force-deletes a foreign lease. On failure keeps
+	 * leaseHeld/evidence for uncertain settlement (no FIFO advance).
+	 */
+	function releaseExactLeaseForCancel(assignment: ActiveAssignment): {
+		released: boolean;
+		errorMessage?: string;
+	} {
+		if (!assignment.leaseHeld) {
+			return { released: true };
+		}
+		try {
+			lease.release(cwd, leaseOwner, assignment.leaseToken);
+			if (lease.stillHeldBy(cwd, leaseOwner, assignment.leaseToken)) {
+				throw new Error("Writer lease still held by this worker after release");
+			}
+			assignment.leaseHeld = false;
+			return { released: true };
+		} catch (error) {
+			return {
+				released: false,
+				errorMessage: `Writer lease release failed: ${
+					error instanceof Error ? error.message : String(error)
+				}`,
+			};
+		}
+	}
+
+	/** Cancel before mutation/start: release exact lease or fail uncertain. */
+	async function finishCancelledBeforeWork(
+		assignment: ActiveAssignment,
+		cancelReason: string,
+	): Promise<void> {
+		disableMutationTools();
+		const release = releaseExactLeaseForCancel(assignment);
+		if (!release.released) {
+			await finishAssignment(
+				assignment,
+				{
+					status: "failed",
+					messages: assignment.assistantMessages,
+					errorMessage: `${cancelReason}; ${release.errorMessage}`,
+					uncertainWrite: true,
+				},
+				"failed",
+			);
+			return;
+		}
+		await finishAssignment(
+			assignment,
+			{
+				status: "aborted",
+				messages: assignment.assistantMessages,
+				errorMessage: cancelReason,
+				uncertainWrite: false,
+			},
+			"aborted",
+		);
+	}
+
 	function beginAssignment(assignmentId: string, parentEpoch?: string): ActiveAssignment {
 		const paths = assignmentSpoolPaths(poolRoot, role.name, assignmentId);
 		const assignment: ActiveAssignment = {
@@ -1051,6 +1138,13 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 						},
 					});
 					assignment.leaseHeld = true;
+					// Close cancel-vs-acquire race: cancel may land after shouldCancel
+					// cleared but before enableMutationTools.
+					const cancelAfterAcquire = cancelPending(assignment);
+					if (cancelAfterAcquire) {
+						await finishCancelledBeforeWork(assignment, cancelAfterAcquire);
+						return;
+					}
 					enableMutationTools(assignment);
 				} catch (error) {
 					if (error instanceof LeaseWaitCancelledError) {
@@ -1084,6 +1178,13 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 				} finally {
 					assignment.acquiringLease = false;
 				}
+			}
+
+			// Narrow cancel window before durable start / prompt.
+			const cancelBeforeStart = cancelPending(assignment);
+			if (cancelBeforeStart) {
+				await finishCancelledBeforeWork(assignment, cancelBeforeStart);
+				return;
 			}
 
 			emitAssignment(assignment, "started", `${role.name} started`);

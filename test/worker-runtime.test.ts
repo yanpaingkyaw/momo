@@ -1028,4 +1028,397 @@ describe("worker runtime (persistent pool)", () => {
 		expect(record.uncertainWrite).toBe(true);
 		expect(leases.peekOwner(cwd)?.ownerId).toBe(workerId);
 	});
+
+	it("cancel-after-shouldCancel-before-acquire-return: no started/prompt/lease; FIFO advances", async () => {
+		vi.useFakeTimers();
+		const cacheRoot = tempDir("momo-cancel-after-acq-");
+		const cwd = tempDir("momo-cancel-after-acq-cwd-");
+		const foreignCwd = tempDir("momo-cancel-after-acq-foreign-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const workerId = stableWorkerId(identity.poolKey, "implementer");
+		const control = workerControlPaths(pool.poolRoot, "implementer");
+		mkdirSync(control.root, { recursive: true, mode: 0o700 });
+		const assignmentA = "cancelafteracq001";
+		const assignmentB = "cancelafteracq002";
+		const pathsA = assignmentSpoolPaths(pool.poolRoot, "implementer", assignmentA);
+		const pathsB = assignmentSpoolPaths(pool.poolRoot, "implementer", assignmentB);
+		mkdirSync(pathsA.root, { recursive: true, mode: 0o700 });
+		mkdirSync(pathsB.root, { recursive: true, mode: 0o700 });
+		pool.upsert({
+			workerId,
+			generation: 1,
+			generationTombstone: 1,
+			role: "implementer",
+			paneId: "w1:p2",
+			agentName: "momo_implementer",
+			cwd,
+			status: "idle",
+			updatedAt: new Date().toISOString(),
+		});
+
+		const { createLeaseToken } = await import("../src/lease/writer-lease.js");
+		const leases = new WriterLeaseManager({ cacheRoot, now: () => 1_700_000_000_000 });
+		const foreignOwner = "foreign_owner_id";
+		leases.acquire(foreignCwd, foreignOwner, createLeaseToken());
+		const originalWait = leases.waitAcquire.bind(leases);
+		leases.waitAcquire = async (leaseCwd, ownerId, token, options) => {
+			const record = await originalWait(leaseCwd, ownerId, token, {
+				...options,
+				shouldCancel: async () => false,
+			});
+			atomicWriteJson(pathsA.cancel, {
+				version: 1,
+				runId: assignmentA,
+				workerId,
+				generation: 1,
+				reason: "parent_abort",
+				issuedAt: new Date().toISOString(),
+			});
+			return record;
+		};
+
+		const pi = createFakePi();
+		installMomoWorker(pi as unknown as ExtensionAPI, {
+			env: {
+				MOMO_WORKER: "1",
+				MOMO_ROLE: "implementer",
+				MOMO_IPC_DIR: control.root,
+				MOMO_CONTROL_DIR: control.root,
+				MOMO_WORKER_ID: workerId,
+				MOMO_WORKER_GENERATION: "1",
+				MOMO_POOL_KEY: identity.poolKey,
+				MOMO_POOL_ROOT: pool.poolRoot,
+				MOMO_RUN_ID: "g1",
+				MOMO_CWD: cwd,
+			},
+			poolRegistry: pool,
+			leaseManager: leases,
+			now: () => 1_700_000_000_000,
+			sleep: async () => {},
+		});
+		const ctx = {
+			hasUI: true,
+			isIdle: () => true,
+			abort: vi.fn(),
+			cwd,
+		} as unknown as ExtensionContext;
+		await pi.emit("session_start", {}, ctx);
+		atomicWriteJson(pathsA.command, {
+			version: 1,
+			type: "prompt",
+			task: "first",
+			issuedAt: new Date().toISOString(),
+			runId: assignmentA,
+			workerId,
+			generation: 1,
+			parentEpoch: "epoch1",
+		});
+		atomicWriteJson(control.active, {
+			version: 1,
+			assignmentId: assignmentA,
+			generation: 1,
+			parentEpoch: "epoch1",
+			dispatchedAt: new Date().toISOString(),
+		});
+		pool.upsert({
+			...pool.getByRole("implementer")!,
+			status: "busy",
+			activeAssignmentId: assignmentA,
+			activeParentEpoch: "epoch1",
+			updatedAt: new Date().toISOString(),
+		});
+		enqueueAssignment(pool.poolRoot, "implementer", {
+			assignmentId: assignmentB,
+			workerId,
+			generation: 1,
+			parentEpoch: "epoch1",
+			task: "successor",
+		});
+		await vi.advanceTimersByTimeAsync(200);
+
+		expect(pi.sendUserMessage).not.toHaveBeenCalledWith("first");
+		expect(existsSync(pathsA.started)).toBe(false);
+		const resultA = readJsonFile(pathsA.result) as { status: string };
+		expect(resultA.status).toBe("aborted");
+		// Exact lease for A was released; successor B may re-acquire the same cwd.
+		expect(leases.peekOwner(foreignCwd)?.ownerId).toBe(foreignOwner);
+		expect(pool.getByRole("implementer")?.activeAssignmentId).toBe(assignmentB);
+		expect(queueCount(pool.poolRoot, "implementer")).toBe(0);
+		expect(pi.sendUserMessage).toHaveBeenCalledWith("successor");
+		expect(existsSync(pathsB.started)).toBe(true);
+		void pathsB;
+	});
+
+	it("cancelAfterAcquire release failure => uncertain, lease retained, no successor", async () => {
+		vi.useFakeTimers();
+		const cacheRoot = tempDir("momo-cancel-acq-relfail-");
+		const cwd = tempDir("momo-cancel-acq-relfail-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const workerId = stableWorkerId(identity.poolKey, "implementer");
+		const control = workerControlPaths(pool.poolRoot, "implementer");
+		mkdirSync(control.root, { recursive: true, mode: 0o700 });
+		const assignmentA = "cancelrelfail0001";
+		const assignmentB = "cancelrelfail0002";
+		const pathsA = assignmentSpoolPaths(pool.poolRoot, "implementer", assignmentA);
+		const pathsB = assignmentSpoolPaths(pool.poolRoot, "implementer", assignmentB);
+		mkdirSync(pathsA.root, { recursive: true, mode: 0o700 });
+		mkdirSync(pathsB.root, { recursive: true, mode: 0o700 });
+		pool.upsert({
+			workerId,
+			generation: 1,
+			generationTombstone: 1,
+			role: "implementer",
+			paneId: "w1:p2",
+			agentName: "momo_implementer",
+			cwd,
+			status: "idle",
+			updatedAt: new Date().toISOString(),
+		});
+
+		const leases = new WriterLeaseManager({ cacheRoot, now: () => 1_700_000_000_000 });
+		const originalWait = leases.waitAcquire.bind(leases);
+		leases.waitAcquire = async (leaseCwd, ownerId, token, options) => {
+			const record = await originalWait(leaseCwd, ownerId, token, {
+				...options,
+				shouldCancel: async () => false,
+			});
+			atomicWriteJson(pathsA.cancel, {
+				version: 1,
+				runId: assignmentA,
+				workerId,
+				generation: 1,
+				reason: "parent_abort",
+				issuedAt: new Date().toISOString(),
+			});
+			return record;
+		};
+		leases.release = () => {
+			throw new Error("injected release failure");
+		};
+
+		const pi = createFakePi();
+		installMomoWorker(pi as unknown as ExtensionAPI, {
+			env: {
+				MOMO_WORKER: "1",
+				MOMO_ROLE: "implementer",
+				MOMO_IPC_DIR: control.root,
+				MOMO_CONTROL_DIR: control.root,
+				MOMO_WORKER_ID: workerId,
+				MOMO_WORKER_GENERATION: "1",
+				MOMO_POOL_KEY: identity.poolKey,
+				MOMO_POOL_ROOT: pool.poolRoot,
+				MOMO_RUN_ID: "g1",
+				MOMO_CWD: cwd,
+			},
+			poolRegistry: pool,
+			leaseManager: leases,
+			now: () => 1_700_000_000_000,
+			sleep: async () => {},
+		});
+		const ctx = {
+			hasUI: true,
+			isIdle: () => true,
+			abort: vi.fn(),
+			cwd,
+		} as unknown as ExtensionContext;
+		await pi.emit("session_start", {}, ctx);
+		atomicWriteJson(pathsA.command, {
+			version: 1,
+			type: "prompt",
+			task: "first",
+			issuedAt: new Date().toISOString(),
+			runId: assignmentA,
+			workerId,
+			generation: 1,
+			parentEpoch: "epoch1",
+		});
+		atomicWriteJson(control.active, {
+			version: 1,
+			assignmentId: assignmentA,
+			generation: 1,
+			parentEpoch: "epoch1",
+			dispatchedAt: new Date().toISOString(),
+		});
+		pool.upsert({
+			...pool.getByRole("implementer")!,
+			status: "busy",
+			activeAssignmentId: assignmentA,
+			activeParentEpoch: "epoch1",
+			updatedAt: new Date().toISOString(),
+		});
+		enqueueAssignment(pool.poolRoot, "implementer", {
+			assignmentId: assignmentB,
+			workerId,
+			generation: 1,
+			parentEpoch: "epoch1",
+			task: "successor",
+		});
+		await vi.advanceTimersByTimeAsync(200);
+
+		expect(pi.sendUserMessage).not.toHaveBeenCalled();
+		expect(existsSync(pathsA.started)).toBe(false);
+		expect(leases.isLocked(cwd)).toBe(true);
+		expect(leases.peekOwner(cwd)?.ownerId).toBe(workerId);
+		const resultA = readJsonFile(pathsA.result) as {
+			status: string;
+			uncertainWrite?: boolean;
+			errorMessage?: string;
+		};
+		expect(resultA.status).toBe("failed");
+		expect(resultA.uncertainWrite).toBe(true);
+		expect(resultA.errorMessage).toMatch(/release failed/i);
+		const record = pool.getByRole("implementer")!;
+		expect(record.status).toBe("uncertain");
+		expect(record.uncertainWrite).toBe(true);
+		expect(record.activeAssignmentId).toBe(assignmentA);
+		expect(queueCount(pool.poolRoot, "implementer")).toBe(1);
+		expect(existsSync(pathsB.started)).toBe(false);
+		await vi.advanceTimersByTimeAsync(200);
+		expect(pi.sendUserMessage).not.toHaveBeenCalledWith("successor");
+	});
+
+	it("cancelBeforeStart release failure => uncertain, lease retained, no prompt/start", async () => {
+		vi.useFakeTimers();
+		const cacheRoot = tempDir("momo-cancel-start-relfail-");
+		const cwd = tempDir("momo-cancel-start-relfail-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const workerId = stableWorkerId(identity.poolKey, "implementer");
+		const control = workerControlPaths(pool.poolRoot, "implementer");
+		mkdirSync(control.root, { recursive: true, mode: 0o700 });
+		const assignmentA = "cancelstartrelf001";
+		const assignmentB = "cancelstartrelf002";
+		const pathsA = assignmentSpoolPaths(pool.poolRoot, "implementer", assignmentA);
+		const pathsB = assignmentSpoolPaths(pool.poolRoot, "implementer", assignmentB);
+		mkdirSync(pathsA.root, { recursive: true, mode: 0o700 });
+		mkdirSync(pathsB.root, { recursive: true, mode: 0o700 });
+		pool.upsert({
+			workerId,
+			generation: 1,
+			generationTombstone: 1,
+			role: "implementer",
+			paneId: "w1:p2",
+			agentName: "momo_implementer",
+			cwd,
+			status: "idle",
+			updatedAt: new Date().toISOString(),
+		});
+
+		const leases = new WriterLeaseManager({ cacheRoot, now: () => 1_700_000_000_000 });
+		leases.release = () => {
+			throw new Error("injected release failure before start");
+		};
+
+		const pi = createFakePi();
+		const originalSetActiveTools = pi.setActiveTools.bind(pi);
+		pi.setActiveTools = ((tools: string[]) => {
+			originalSetActiveTools(tools);
+			if (tools.includes("bash") || tools.includes("edit") || tools.includes("write")) {
+				atomicWriteJson(pathsA.cancel, {
+					version: 1,
+					runId: assignmentA,
+					workerId,
+					generation: 1,
+					reason: "parent_abort",
+					issuedAt: new Date().toISOString(),
+				});
+			}
+		}) as typeof pi.setActiveTools;
+
+		installMomoWorker(pi as unknown as ExtensionAPI, {
+			env: {
+				MOMO_WORKER: "1",
+				MOMO_ROLE: "implementer",
+				MOMO_IPC_DIR: control.root,
+				MOMO_CONTROL_DIR: control.root,
+				MOMO_WORKER_ID: workerId,
+				MOMO_WORKER_GENERATION: "1",
+				MOMO_POOL_KEY: identity.poolKey,
+				MOMO_POOL_ROOT: pool.poolRoot,
+				MOMO_RUN_ID: "g1",
+				MOMO_CWD: cwd,
+			},
+			poolRegistry: pool,
+			leaseManager: leases,
+			now: () => 1_700_000_000_000,
+			sleep: async () => {},
+		});
+		const ctx = {
+			hasUI: true,
+			isIdle: () => true,
+			abort: vi.fn(),
+			cwd,
+		} as unknown as ExtensionContext;
+		await pi.emit("session_start", {}, ctx);
+		atomicWriteJson(pathsA.command, {
+			version: 1,
+			type: "prompt",
+			task: "first",
+			issuedAt: new Date().toISOString(),
+			runId: assignmentA,
+			workerId,
+			generation: 1,
+			parentEpoch: "epoch1",
+		});
+		atomicWriteJson(control.active, {
+			version: 1,
+			assignmentId: assignmentA,
+			generation: 1,
+			parentEpoch: "epoch1",
+			dispatchedAt: new Date().toISOString(),
+		});
+		pool.upsert({
+			...pool.getByRole("implementer")!,
+			status: "busy",
+			activeAssignmentId: assignmentA,
+			activeParentEpoch: "epoch1",
+			updatedAt: new Date().toISOString(),
+		});
+		enqueueAssignment(pool.poolRoot, "implementer", {
+			assignmentId: assignmentB,
+			workerId,
+			generation: 1,
+			parentEpoch: "epoch1",
+			task: "successor",
+		});
+		await vi.advanceTimersByTimeAsync(200);
+
+		expect(pi.sendUserMessage).not.toHaveBeenCalled();
+		expect(existsSync(pathsA.started)).toBe(false);
+		expect(leases.isLocked(cwd)).toBe(true);
+		expect(leases.peekOwner(cwd)?.ownerId).toBe(workerId);
+		const resultA = readJsonFile(pathsA.result) as {
+			status: string;
+			uncertainWrite?: boolean;
+			errorMessage?: string;
+		};
+		expect(resultA.status).toBe("failed");
+		expect(resultA.uncertainWrite).toBe(true);
+		expect(resultA.errorMessage).toMatch(/release failed/i);
+		const record = pool.getByRole("implementer")!;
+		expect(record.status).toBe("uncertain");
+		expect(record.uncertainWrite).toBe(true);
+		expect(record.activeAssignmentId).toBe(assignmentA);
+		expect(queueCount(pool.poolRoot, "implementer")).toBe(1);
+		expect(existsSync(pathsB.started)).toBe(false);
+		await vi.advanceTimersByTimeAsync(200);
+		expect(pi.sendUserMessage).not.toHaveBeenCalledWith("successor");
+	});
 });

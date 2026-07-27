@@ -70,10 +70,14 @@ const ipcValidate = {
 	tryReadIpcJson: tryReadIpcJsonImpl,
 };
 
+/** @internal test-only: runs inside stopAndSettleFailure lock after result recheck. */
+let stopAndSettleCommitHook: (() => void | Promise<void>) | undefined;
+
 /** @internal test-only: restore default IPC readers. */
 export function __resetIpcReadersForTest(): void {
 	ipcSpool.readEventsIncrementally = readEventsIncrementallyImpl;
 	ipcValidate.tryReadIpcJson = tryReadIpcJsonImpl;
+	stopAndSettleCommitHook = undefined;
 }
 
 /** @internal test-only: override IPC readers for race/fault injection. */
@@ -87,6 +91,13 @@ export function __setIpcReadersForTest(options: {
 	if (options.tryReadIpcJson) {
 		ipcValidate.tryReadIpcJson = options.tryReadIpcJson;
 	}
+}
+
+/** @internal test-only: barrier inside stopAndSettleFailure after result recheck, before mutation. */
+export function __setStopAndSettleCommitHookForTest(
+	hook?: () => void | Promise<void>,
+): void {
+	stopAndSettleCommitHook = hook;
 }
 import {
 	getHerdrPiExtensionPath,
@@ -528,6 +539,8 @@ class AssignmentProxy implements ChildSession {
 		this.stoppingAfterFailure = true;
 		this.stopPolling();
 		let activeFailure = false;
+		let adoptedResult: IpcResult | undefined;
+		let invalidResultMessage: string | undefined;
 		try {
 			// Assignment-specific cancel IPC only — never send terminal keys on a shared pane.
 			try {
@@ -542,79 +555,128 @@ class AssignmentProxy implements ChildSession {
 			} catch {
 				// continue
 			}
-			await withRoleLockAsync(this.runtime.pool.poolRoot, this.role.name, () => {
-				const record = this.runtime.pool.getByRole(this.role.name);
-				const isActive =
-					record?.generation === this.generation &&
-					record.workerId === this.workerId &&
-					record.activeAssignmentId === this.assignmentId;
-				if (isActive && record) {
-					activeFailure = true;
-					if (this.role.canWrite) {
-						const classified = this.classifyImplementerActiveFailure(record);
-						this.runtime.pool.upsert({
-							...record,
-							status: classified.status,
-							...(classified.uncertainWrite ? { uncertainWrite: true } : {}),
-							generationTombstone: Math.max(record.generationTombstone, this.generation),
-							updatedAt: new Date(this.runtime.now()).toISOString(),
-						});
-						activeFailure = classified.status === "uncertain";
-					} else {
-						this.runtime.pool.upsert({
-							...record,
-							status: "unhealthy",
-							generationTombstone: Math.max(record.generationTombstone, this.generation),
-							updatedAt: new Date(this.runtime.now()).toISOString(),
-						});
-						activeFailure = false;
+			await withRoleLockAsync(
+				this.runtime.pool.poolRoot,
+				this.role.name,
+				async () => {
+					// Commit-point recheck: durable result wins over failure fencing.
+					const resultRaw = ipcValidate.tryReadIpcJson(this.paths.result);
+					if (resultRaw) {
+						try {
+							adoptedResult = validateResult(
+								resultRaw,
+								assignmentIdentity(this.assignmentId, this.workerId),
+							);
+							return;
+						} catch (resultError) {
+							invalidResultMessage =
+								resultError instanceof IpcValidationError || resultError instanceof Error
+									? resultError.message
+									: String(resultError);
+							// Invalid result fails closed — continue to registry failure mutation.
+						}
 					}
-					return;
-				}
-				// Queued / non-active claiming: remove exact entry so it cannot later run.
-				cancelQueuedAssignment(
-					this.runtime.pool.poolRoot,
-					this.role.name,
-					this.assignmentId,
-				);
-				const claiming = listClaiming(this.runtime.pool.poolRoot, this.role.name).find(
-					(entry) => entry.assignmentId === this.assignmentId,
-				);
-				if (
-					claiming &&
-					record?.activeAssignmentId !== claiming.assignmentId
-				) {
-					commitClaim(this.runtime.pool.poolRoot, this.role.name, claiming);
-				}
-				// Durable failed result for waiting proxies / cleanup observers.
-				try {
-					const paths = ensureAssignmentSpool(
+
+					if (stopAndSettleCommitHook) {
+						await stopAndSettleCommitHook();
+						// Worker may have published result while we yielded under the lock
+						// only if the hook released/reordered — recheck again after barrier.
+						const racedRaw = ipcValidate.tryReadIpcJson(this.paths.result);
+						if (racedRaw) {
+							try {
+								adoptedResult = validateResult(
+									racedRaw,
+									assignmentIdentity(this.assignmentId, this.workerId),
+								);
+								return;
+							} catch (resultError) {
+								invalidResultMessage =
+									resultError instanceof IpcValidationError ||
+									resultError instanceof Error
+										? resultError.message
+										: String(resultError);
+							}
+						}
+					}
+
+					const record = this.runtime.pool.getByRole(this.role.name);
+					const isActive =
+						record?.generation === this.generation &&
+						record.workerId === this.workerId &&
+						record.activeAssignmentId === this.assignmentId;
+					if (isActive && record) {
+						activeFailure = true;
+						if (this.role.canWrite) {
+							const classified = this.classifyImplementerActiveFailure(record);
+							this.runtime.pool.upsert({
+								...record,
+								status: classified.status,
+								...(classified.uncertainWrite ? { uncertainWrite: true } : {}),
+								generationTombstone: Math.max(record.generationTombstone, this.generation),
+								updatedAt: new Date(this.runtime.now()).toISOString(),
+							});
+							activeFailure = classified.status === "uncertain";
+						} else {
+							this.runtime.pool.upsert({
+								...record,
+								status: "unhealthy",
+								generationTombstone: Math.max(record.generationTombstone, this.generation),
+								updatedAt: new Date(this.runtime.now()).toISOString(),
+							});
+							activeFailure = false;
+						}
+						return;
+					}
+					// Queued / non-active claiming: remove exact entry so it cannot later run.
+					cancelQueuedAssignment(
 						this.runtime.pool.poolRoot,
 						this.role.name,
 						this.assignmentId,
 					);
-					if (!ipcValidate.tryReadIpcJson(paths.result)) {
-						atomicWriteJson(paths.result, {
-							version: 1,
-							runId: this.assignmentId,
-							workerId: this.workerId,
-							status: "failed",
-							messages: this.messagesInternal,
-							errorMessage: message.slice(0, 1024),
-							finishedAt: new Date(this.runtime.now()).toISOString(),
-						});
+					const claiming = listClaiming(this.runtime.pool.poolRoot, this.role.name).find(
+						(entry) => entry.assignmentId === this.assignmentId,
+					);
+					if (
+						claiming &&
+						record?.activeAssignmentId !== claiming.assignmentId
+					) {
+						commitClaim(this.runtime.pool.poolRoot, this.role.name, claiming);
 					}
-				} catch {
-					// settle in-memory regardless
-				}
-			}, { now: this.runtime.now, sleep: this.runtime.sleep });
+					// Durable failed result for waiting proxies / cleanup observers.
+					try {
+						const paths = ensureAssignmentSpool(
+							this.runtime.pool.poolRoot,
+							this.role.name,
+							this.assignmentId,
+						);
+						if (!ipcValidate.tryReadIpcJson(paths.result)) {
+							atomicWriteJson(paths.result, {
+								version: 1,
+								runId: this.assignmentId,
+								workerId: this.workerId,
+								status: "failed",
+								messages: this.messagesInternal,
+								errorMessage: (invalidResultMessage ?? message).slice(0, 1024),
+								finishedAt: new Date(this.runtime.now()).toISOString(),
+							});
+						}
+					} catch {
+						// settle in-memory regardless
+					}
+				},
+				{ now: this.runtime.now, sleep: this.runtime.sleep },
+			);
+			if (adoptedResult) {
+				this.settle(adoptedResult);
+				return;
+			}
 			this.settle({
 				version: 1,
 				runId: this.assignmentId,
 				workerId: this.workerId,
 				status: "failed",
 				messages: this.messagesInternal,
-				errorMessage: message,
+				errorMessage: invalidResultMessage ?? message,
 				...(activeFailure ? { uncertainWrite: true } : {}),
 				finishedAt: new Date(this.runtime.now()).toISOString(),
 			});
