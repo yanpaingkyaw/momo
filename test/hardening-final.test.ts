@@ -15,7 +15,11 @@ import { WriterLeaseManager, createLeaseToken } from "../src/lease/writer-lease.
 import { createHerdrChildSessionFactory, createStableParentId } from "../src/delegation/herdr-factory.js";
 import { HerdrClient, parseAgentGetResult, AGENT_PANE_BUSY_CODE } from "../src/herdr/client.js";
 import { PaneRegistry, RegistryCorruptionError } from "../src/herdr/registry.js";
-import { PoolRegistry } from "../src/herdr/pool-registry.js";
+import {
+	isArchivalTombstone,
+	PoolRegistry,
+	selectClosablePoolWorkers,
+} from "../src/herdr/pool-registry.js";
 import { resolvePoolIdentity } from "../src/herdr/pool-identity.js";
 import { beginClaimHead, enqueueAssignment, listClaiming, listQueue } from "../src/herdr/role-queue.js";
 import { atomicWriteJson } from "../src/ipc/spool.js";
@@ -295,20 +299,126 @@ describe("force cleanup lease ownership", () => {
 });
 
 describe("factory rollback", () => {
-	it("closes pane and removes registry when agent start fails after split", async () => {
+	async function setupProvision(options: {
+		label: string;
+		runCommand: (
+			file: string,
+			args: readonly string[],
+		) => Promise<{ code: number; stdout: string; stderr: string }>;
+		readyTimeoutMs?: number;
+		pool?: PoolRegistry;
+		cwd?: string;
+		cacheRoot?: string;
+	}) {
 		installFakeHerdrExtension();
-		const cacheRoot = tempDir("momo-roll-cache-");
-		const cwd = tempDir("momo-roll-cwd-");
+		const cacheRoot = options.cacheRoot ?? tempDir(`momo-${options.label}-cache-`);
+		const cwd = options.cwd ?? tempDir(`momo-${options.label}-cwd-`);
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "test-ws",
+			socketPath: "test-sock",
+		});
+		const pool = options.pool ?? new PoolRegistry(identity.poolKey, cacheRoot);
+		const factory = createHerdrChildSessionFactory({
+			cwd,
+			parentPaneId: "w1:p1",
+			parentId: `parent-${options.label}`,
+			client: new HerdrClient({ runCommand: options.runCommand }),
+			poolRegistry: pool,
+			cacheRoot: pool.cacheRoot,
+			canonicalRoot: cwd,
+			workspaceId: "test-ws",
+			socketPath: "test-sock",
+			readyTimeoutMs: options.readyTimeoutMs ?? 500,
+			pollIntervalMs: 20,
+			sleep: async (ms) => new Promise((r) => setTimeout(r, ms)),
+		});
+		const session = await factory({ cwd, role: getRole("scout") });
+		return { session, pool, cwd, identity, cacheRoot };
+	}
+
+	function splitOk(paneId = "w1:p9") {
+		return {
+			code: 0,
+			stdout: JSON.stringify({ id: "s", result: { pane: { pane_id: paneId } } }),
+			stderr: "",
+		};
+	}
+
+	function agentStartOk(paneId: string, name: string) {
+		return {
+			code: 0,
+			stdout: JSON.stringify({
+				id: "s",
+				result: {
+					pane_id: paneId,
+					name,
+					agent: "pi",
+					interactive_ready: true,
+				},
+			}),
+			stderr: "",
+		};
+	}
+
+	it("rename failure after split retains pane identity + paneClosed when close succeeds", async () => {
 		const closed: string[] = [];
-		const client = new HerdrClient({
+		const { session, pool } = await setupProvision({
+			label: "rename-fail",
 			runCommand: async (_file, args) => {
-				if (args[0] === "pane" && args[1] === "split") {
-					return {
-						code: 0,
-						stdout: JSON.stringify({ id: "s", result: { pane: { pane_id: "w1:p9" } } }),
-						stderr: "",
-					};
+				if (args[0] === "pane" && args[1] === "split") return splitOk("w1:p9");
+				if (args[0] === "pane" && args[1] === "rename") {
+					return { code: 1, stdout: "", stderr: "rename failed" };
 				}
+				if (args[0] === "pane" && args[1] === "close") {
+					closed.push(String(args[2]));
+					return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+				}
+				return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+			},
+		});
+		await expect(session.prompt("start")).rejects.toThrow(/rename failed/i);
+		expect(closed).toEqual(["w1:p9"]);
+		const record = pool.getByRole("scout")!;
+		expect(record.status).toBe("unhealthy");
+		expect(record.paneId).toBe("w1:p9");
+		expect(record.agentName).toBeTruthy();
+		expect(record.paneClosed).toBe(true);
+		expect(isArchivalTombstone(record)).toBe(false);
+		expect(selectClosablePoolWorkers([record]).closable).toHaveLength(1);
+	});
+
+	it("metadata failure after split retains pane identity when close succeeds", async () => {
+		const closed: string[] = [];
+		const { session, pool } = await setupProvision({
+			label: "meta-fail",
+			runCommand: async (_file, args) => {
+				if (args[0] === "pane" && args[1] === "split") return splitOk("w1:p9");
+				if (args[0] === "pane" && args[1] === "report-metadata") {
+					return { code: 1, stdout: "", stderr: "metadata failed" };
+				}
+				if (args[0] === "pane" && args[1] === "close") {
+					closed.push(String(args[2]));
+					return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+				}
+				return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+			},
+		});
+		await expect(session.prompt("start")).rejects.toThrow(/metadata failed|report-metadata/i);
+		expect(closed).toEqual(["w1:p9"]);
+		const record = pool.getByRole("scout")!;
+		expect(record.paneId).toBe("w1:p9");
+		expect(record.paneClosed).toBe(true);
+		expect(record.status).toBe("unhealthy");
+	});
+
+	it("agent-start failure after split retains paneId/agentName/paneClosed on successful close", async () => {
+		const closed: string[] = [];
+		const { session, pool } = await setupProvision({
+			label: "agent-start-fail",
+			runCommand: async (_file, args) => {
+				if (args[0] === "pane" && args[1] === "split") return splitOk("w1:p9");
 				if (args[0] === "agent" && args[1] === "start") {
 					return {
 						code: 1,
@@ -320,89 +430,260 @@ describe("factory rollback", () => {
 					};
 				}
 				if (args[0] === "pane" && args[1] === "close") {
-					closed.push(args[2] ?? "");
+					closed.push(String(args[2]));
 					return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
 				}
 				return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
 			},
 		});
-		const identity = resolvePoolIdentity({ cwd, canonicalRoot: cwd, workspaceId: "test-ws", socketPath: "test-sock" });
-		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
-		const factory = createHerdrChildSessionFactory({
-			cwd,
-			parentPaneId: "w1:p1",
-			parentId: "parent-roll",
-			client,
-			poolRegistry: pool,
-			cacheRoot,
-			canonicalRoot: cwd,
-			workspaceId: "test-ws",
-			socketPath: "test-sock",
-			readyTimeoutMs: 500,
-			sleep: async (ms) => new Promise((r) => setTimeout(r, ms)),
-		});
-		const session = await factory({ cwd, role: getRole("scout") });
 		await expect(session.prompt("start")).rejects.toThrow(/start failed/);
 		expect(closed).toEqual(["w1:p9"]);
-		const record = pool.getByRole("scout");
-		expect(record?.status).toBe("unhealthy");
-		expect(record?.generationTombstone).toBeGreaterThanOrEqual(1);
+		const record = pool.getByRole("scout")!;
+		expect(record.status).toBe("unhealthy");
+		expect(record.paneId).toBe("w1:p9");
+		expect(record.agentName).toMatch(/momo_/);
+		expect(record.paneClosed).toBe(true);
+		expect(record.generationTombstone).toBeGreaterThanOrEqual(1);
 	});
 
-	it("marks failed when close fails after readiness timeout", async () => {
-		installFakeHerdrExtension();
-		const cacheRoot = tempDir("momo-ready-cache-");
-		const cwd = tempDir("momo-ready-cwd-");
-		const client = new HerdrClient({
+	it("manifest write failure after agent-start retains closed-pane identity", async () => {
+		const closed: string[] = [];
+		const { session, pool } = await setupProvision({
+			label: "manifest-fail",
 			runCommand: async (_file, args) => {
-				if (args[0] === "pane" && args[1] === "split") {
-					return {
-						code: 0,
-						stdout: JSON.stringify({ id: "s", result: { pane: { pane_id: "w1:p8" } } }),
-						stderr: "",
-					};
+				if (args[0] === "pane" && args[1] === "split") return splitOk("w1:p9");
+				if (args[0] === "agent" && args[1] === "start") {
+					const { workerControlPaths } = await import("../src/herdr/assignment-spool.js");
+					const control = workerControlPaths(pool.poolRoot, "scout");
+					mkdirSync(control.manifest, { recursive: true, mode: 0o700 });
+					return agentStartOk("w1:p9", String(args[2]));
 				}
+				if (args[0] === "pane" && args[1] === "close") {
+					closed.push(String(args[2]));
+					return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+				}
+				return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+			},
+		});
+		await expect(session.prompt("start")).rejects.toThrow();
+		expect(closed).toEqual(["w1:p9"]);
+		const record = pool.getByRole("scout")!;
+		expect(record.status).toBe("unhealthy");
+		expect(record.paneId).toBe("w1:p9");
+		expect(record.paneClosed).toBe(true);
+	});
+
+	it("close failure after provision error keeps paneClosed:false for cleanup retry", async () => {
+		const closed: string[] = [];
+		const { session, pool } = await setupProvision({
+			label: "close-fail",
+			runCommand: async (_file, args) => {
+				if (args[0] === "pane" && args[1] === "split") return splitOk("w1:p9");
 				if (args[0] === "agent" && args[1] === "start") {
 					return {
-						code: 0,
+						code: 1,
 						stdout: JSON.stringify({
 							id: "s",
-							result: {
-								pane_id: "w1:p8",
-								name: args[2],
-								agent: "pi",
-								interactive_ready: true,
-							},
+							error: { code: "boom", message: "start failed" },
 						}),
 						stderr: "",
 					};
 				}
 				if (args[0] === "pane" && args[1] === "close") {
+					closed.push(String(args[2]));
 					return { code: 1, stdout: "", stderr: "busy" };
 				}
 				return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
 			},
 		});
-		const identity = resolvePoolIdentity({ cwd, canonicalRoot: cwd, workspaceId: "test-ws", socketPath: "test-sock" });
-		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
-		const factory = createHerdrChildSessionFactory({
+		await expect(session.prompt("start")).rejects.toThrow(/start failed/);
+		expect(closed).toEqual(["w1:p9"]);
+		const record = pool.getByRole("scout")!;
+		expect(record.status).toBe("unhealthy");
+		expect(record.paneId).toBe("w1:p9");
+		expect(record.agentName).toBeTruthy();
+		expect(record.paneClosed).toBe(false);
+		expect(selectClosablePoolWorkers([record]).closable).toHaveLength(1);
+	});
+
+	it("confirmed-close unhealthy is cleanable without re-closing when agent is gone", async () => {
+		installFakeHerdrExtension();
+		const cacheRoot = tempDir("momo-confirmed-close-cache-");
+		const cwd = tempDir("momo-confirmed-close-cwd-");
+		const identity = resolvePoolIdentity({
 			cwd,
-			parentPaneId: "w1:p1",
-			parentId: "parent-ready",
-			client,
-			poolRegistry: pool,
-			cacheRoot,
 			canonicalRoot: cwd,
 			workspaceId: "test-ws",
 			socketPath: "test-sock",
-			readyTimeoutMs: 80,
-			pollIntervalMs: 20,
-			now: () => Date.now(),
-			sleep: async (ms) => new Promise((r) => setTimeout(r, ms)),
 		});
-		const session = await factory({ cwd, role: getRole("scout") });
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const { stableWorkerId } = await import("../src/herdr/pool-identity.js");
+		pool.upsert({
+			workerId: stableWorkerId(identity.poolKey, "scout"),
+			generation: 1,
+			generationTombstone: 1,
+			role: "scout",
+			paneId: "w1:p9",
+			agentName: "momo_scout_agent",
+			cwd: identity.canonicalRoot,
+			status: "unhealthy",
+			paneClosed: true,
+			updatedAt: new Date().toISOString(),
+		});
+		const closed: string[] = [];
+		const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
+		const pi = {
+			handlers: new Map<string, Function[]>(),
+			commands,
+			registerTool: vi.fn(),
+			setActiveTools: vi.fn(),
+			sendUserMessage: vi.fn(),
+			sendMessage: vi.fn(),
+			registerCommand: vi.fn(
+				(name: string, def: { handler: (args: string, ctx: unknown) => Promise<void> }) => {
+					commands.set(name, def);
+				},
+			),
+			on() {},
+		};
+		installMomoParent(pi as unknown as ExtensionAPI, {
+			cwd: identity.canonicalRoot,
+			env: {
+				MOMO_PARENT: "1",
+				MOMO_PARENT_ID: "parent-confirmed-close",
+				HERDR_ENV: "1",
+				HERDR_PANE_ID: "w1:p1",
+				HERDR_WORKSPACE_ID: "test-ws",
+				HERDR_SOCKET_PATH: "test-sock",
+			},
+			client: new HerdrClient({
+				runCommand: async (_file, args) => {
+					if (args[0] === "pane" && args[1] === "close") {
+						closed.push(String(args[2]));
+						return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+					}
+					if (args[0] === "agent" && args[1] === "get") {
+						return {
+							code: 1,
+							stdout: JSON.stringify({
+								id: "g",
+								error: { code: "agent_not_found", message: "gone" },
+							}),
+							stderr: "",
+						};
+					}
+					return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+				},
+			}),
+			poolRegistry: pool,
+		});
+		await commands.get("momo-cleanup")!.handler("", {
+			ui: { notify: () => undefined },
+		} as never);
+		expect(closed).toEqual([]);
+		expect(isArchivalTombstone(pool.getByRole("scout")!)).toBe(true);
+	});
+
+	it("no-pane provision failure archives reservation so N+1 can reprovision", async () => {
+		const cwd = tempDir("momo-nopane-cwd-");
+		const cacheRoot = tempDir("momo-nopane-cache-");
+		const { session, pool } = await setupProvision({
+			label: "nopane",
+			cwd,
+			cacheRoot,
+			runCommand: async (_file, args) => {
+				if (args[0] === "pane" && args[1] === "split") {
+					return { code: 1, stdout: "", stderr: "split failed" };
+				}
+				return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+			},
+		});
+		await expect(session.prompt("start")).rejects.toThrow(/split failed/i);
+		const archived = pool.getByRole("scout")!;
+		expect(isArchivalTombstone(archived)).toBe(true);
+		expect(archived.generationTombstone).toBeGreaterThanOrEqual(1);
+		expect(archived.paneId).toBeUndefined();
+		const tombstone = archived.generationTombstone;
+
+		let provisionedGen: string | undefined;
+		const { session: next } = await setupProvision({
+			label: "nopane-n1",
+			cwd,
+			cacheRoot,
+			pool,
+			runCommand: async (_file, args) => {
+				if (args[0] === "pane" && args[1] === "split") {
+					const envArgs = args.filter((_a, i) => args[i - 1] === "--env");
+					provisionedGen = envArgs
+						.find((v) => v.startsWith("MOMO_WORKER_GENERATION="))
+						?.slice("MOMO_WORKER_GENERATION=".length);
+					const controlDir =
+						envArgs.find((v) => v.startsWith("MOMO_CONTROL_DIR="))?.slice(17) ??
+						envArgs.find((v) => v.startsWith("MOMO_IPC_DIR="))?.slice(12) ??
+						"";
+					const wid = envArgs.find((v) => v.startsWith("MOMO_WORKER_ID="))?.slice(15) ?? "";
+					const runId = envArgs.find((v) => v.startsWith("MOMO_RUN_ID="))?.slice(12) ?? "";
+					atomicWriteJson(path.join(controlDir, "ready.json"), {
+						version: 1,
+						runId,
+						workerId: wid,
+						readyAt: new Date().toISOString(),
+					});
+					atomicWriteJson(path.join(controlDir, "heartbeat.json"), {
+						version: 1,
+						runId,
+						workerId: wid,
+						at: new Date().toISOString(),
+						seq: 1,
+					});
+					return splitOk("w1:p2");
+				}
+				if (args[0] === "agent" && args[1] === "start") {
+					return agentStartOk("w1:p2", String(args[2]));
+				}
+				return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+			},
+		});
+		const proxy = next as unknown as {
+			assignmentId: string;
+			workerId: string;
+			paths: { result: string };
+		};
+		const promptPromise = next.prompt("again").then(() => next.agent!.waitForIdle());
+		await new Promise((r) => setTimeout(r, 80));
+		atomicWriteJson(proxy.paths.result, {
+			version: 1,
+			runId: proxy.assignmentId,
+			workerId: proxy.workerId,
+			status: "completed",
+			messages: [{ role: "assistant", content: [{ type: "text", text: "ok" }] }],
+			finishedAt: new Date().toISOString(),
+		});
+		await promptPromise;
+		expect(Number(provisionedGen)).toBe(tombstone + 1);
+		expect(pool.getByRole("scout")?.generation).toBe(tombstone + 1);
+		expect(pool.getByRole("scout")?.paneId).toBe("w1:p2");
+	});
+
+	it("ready-timeout after finalized pane keeps pane/agent identity", async () => {
+		const { session, pool } = await setupProvision({
+			label: "ready-timeout",
+			readyTimeoutMs: 80,
+			runCommand: async (_file, args) => {
+				if (args[0] === "pane" && args[1] === "split") return splitOk("w1:p8");
+				if (args[0] === "agent" && args[1] === "start") {
+					return agentStartOk("w1:p8", String(args[2]));
+				}
+				return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+			},
+		});
 		await expect(session.prompt("start")).rejects.toThrow(/did not become ready/);
-		expect(pool.list()[0]?.status).toBe("unhealthy");
+		const record = pool.getByRole("scout")!;
+		expect(record.status).toBe("unhealthy");
+		expect(record.paneId).toBe("w1:p8");
+		expect(record.agentName).toBeTruthy();
+		expect(record.paneClosed).not.toBe(true);
+		expect(isArchivalTombstone(record)).toBe(false);
 	});
 });
 

@@ -355,4 +355,78 @@ describe("delegation runner", () => {
 		expect(result.status).toBe("completed");
 		expect(current.disposals).toBe(1);
 	});
+
+	it("prefers uncertainWrite over signal.aborted for implementer cancel", async () => {
+		const controller = new AbortController();
+		const runner = createDelegationRunner({
+			cwd: "/repo",
+			roles: ROLE_LIST,
+			createChildSession: async () => ({
+				get messages() {
+					return [];
+				},
+				agent: {
+					waitForIdle: async () => {
+						throw Object.assign(new Error("Worker cancel unresolved after cancel IPC"), {
+							uncertainWrite: true,
+							stopReason: "error",
+						});
+					},
+				},
+				subscribe: () => () => {},
+				async prompt() {
+					controller.abort();
+				},
+				async abort() {},
+				dispose() {},
+			}),
+		});
+
+		const result = await runner.run(
+			{ mode: "single", agent: "implementer", task: "edit a file" },
+			{ signal: controller.signal },
+		);
+
+		expect(result.status).toBe("failed");
+		expect(result.results).toHaveLength(1);
+		expect(result.results[0]?.status).toBe("failed");
+		expect(result.results[0]?.error?.message).toMatch(/^Uncertain write:/);
+		expect(result.results[0]?.error?.stopReason).toBe("error");
+	});
+
+	it("keeps clean acknowledged abort as aborted when signal fires", async () => {
+		const controller = new AbortController();
+		const runner = createDelegationRunner({
+			cwd: "/repo",
+			roles: ROLE_LIST,
+			createChildSession: async () => ({
+				get messages() {
+					return [];
+				},
+				agent: {
+					waitForIdle: async () => {
+						throw Object.assign(new Error("Worker aborted"), {
+							stopReason: "aborted",
+						});
+					},
+				},
+				subscribe: () => () => {},
+				async prompt() {
+					controller.abort();
+				},
+				async abort() {},
+				dispose() {},
+			}),
+		});
+
+		const result = await runner.run(
+			{ mode: "single", agent: "scout", task: "inspect" },
+			{ signal: controller.signal },
+		);
+
+		expect(result.status).toBe("aborted");
+		expect(result.results[0]?.status).toBe("aborted");
+		expect(result.results[0]?.error?.message).toBe("Delegation aborted");
+		expect(result.results[0]?.error?.stopReason).toBe("aborted");
+	});
 });

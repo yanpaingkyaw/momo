@@ -94,6 +94,36 @@ import type {
 	DelegationProgress,
 } from "./runner.js";
 
+/**
+ * Failure during physical pane provisioning (split → agent start → manifest).
+ * Carries enough identity for generation-fenced reservation rollback:
+ * - no paneId: reservation may be archived (tombstone retained)
+ * - paneId + closePaneSucceeded false: unhealthy keeps pane for /momo-cleanup retry
+ * - paneId + closePaneSucceeded true: unhealthy keeps paneId with paneClosed so cleanup
+ *   can confirm agent stop without re-closing
+ */
+export class ProvisioningFailure extends Error {
+	readonly paneId?: string;
+	readonly agentName: string;
+	readonly closePaneSucceeded?: boolean;
+
+	constructor(options: {
+		message: string;
+		agentName: string;
+		paneId?: string;
+		closePaneSucceeded?: boolean;
+		cause?: unknown;
+	}) {
+		super(options.message, options.cause !== undefined ? { cause: options.cause } : undefined);
+		this.name = "ProvisioningFailure";
+		this.agentName = options.agentName;
+		if (options.paneId !== undefined) this.paneId = options.paneId;
+		if (options.closePaneSucceeded !== undefined) {
+			this.closePaneSucceeded = options.closePaneSucceeded;
+		}
+	}
+}
+
 export interface HerdrFactoryOptions {
 	cwd: string;
 	parentPaneId: string;
@@ -604,16 +634,63 @@ class AssignmentProxy implements ChildSession {
 					() => {
 						const record = this.runtime.pool.getByRole(this.role.name);
 						if (
-							record?.generation === plan.generation &&
-							record.workerId === this.workerId
+							record?.generation !== plan.generation ||
+							record.workerId !== this.workerId
 						) {
+							return;
+						}
+						const nowIso = new Date(this.runtime.now()).toISOString();
+						const provisionFail =
+							error instanceof ProvisioningFailure ? error : undefined;
+						const paneId = provisionFail?.paneId ?? record.paneId;
+						const agentName =
+							provisionFail?.agentName ?? record.agentName ?? plan.agentName;
+
+						// Never leave a pane-less unhealthy live reservation — archive so
+						// generation N+1 can provision while retaining the monotonic tombstone.
+						if (!paneId) {
+							this.runtime.pool.archiveRoleKeepingTombstone(this.role.name, nowIso);
+							const archived = this.runtime.pool.getByRole(this.role.name);
+							if (
+								archived &&
+								archived.generationTombstone < plan.generation
+							) {
+								this.runtime.pool.upsert({
+									...archived,
+									generationTombstone: plan.generation,
+									updatedAt: nowIso,
+								});
+							}
+							return;
+						}
+
+						if (provisionFail?.paneId) {
+							const closeSucceeded = provisionFail.closePaneSucceeded === true;
 							this.runtime.pool.upsert({
 								...record,
+								paneId,
+								agentName,
 								status: "unhealthy",
-								generationTombstone: Math.max(record.generationTombstone, plan.generation),
-								updatedAt: new Date(this.runtime.now()).toISOString(),
+								paneClosed: closeSucceeded,
+								generationTombstone: Math.max(
+									record.generationTombstone,
+									plan.generation,
+								),
+								updatedAt: nowIso,
 							});
+							return;
 						}
+
+						// Ready-timeout / post-finalization: keep pane/agent identity.
+						this.runtime.pool.upsert({
+							...record,
+							status: "unhealthy",
+							generationTombstone: Math.max(
+								record.generationTombstone,
+								plan.generation,
+							),
+							updatedAt: nowIso,
+						});
 					},
 					{ now: this.runtime.now, sleep: this.runtime.sleep },
 				);
@@ -800,14 +877,23 @@ class AssignmentProxy implements ChildSession {
 			atomicWriteJson(control.manifest, manifest);
 			return paneId;
 		} catch (error) {
+			let closePaneSucceeded: boolean | undefined;
 			if (paneId) {
 				try {
 					await this.runtime.client.closePane(paneId);
+					closePaneSucceeded = true;
 				} catch {
-					// Reservation rollback is generation-fenced by the caller.
+					closePaneSucceeded = false;
 				}
 			}
-			throw error;
+			const message = error instanceof Error ? error.message : String(error);
+			throw new ProvisioningFailure({
+				message,
+				agentName,
+				...(paneId !== undefined ? { paneId } : {}),
+				...(closePaneSucceeded !== undefined ? { closePaneSucceeded } : {}),
+				cause: error,
+			});
 		}
 	}
 

@@ -499,10 +499,13 @@ export function createDelegationRunner(options: DelegationRunnerOptions): Delega
 				error !== null &&
 				"uncertainWrite" in error &&
 				(error as { uncertainWrite?: unknown }).uncertainWrite === true;
+			// Uncertain implementer writes outrank parent abort: never report a generic
+			// aborted TaskResult when the child surfaced uncertainWrite:true.
+			const status = uncertain ? "failed" : aborted ? "aborted" : "failed";
 			const messages = session?.messages ?? [];
 			const preserved = extractLastAssistantText(messages) ?? "";
 			const failure = lastAssistantFailure(messages);
-			emit(aborted ? "aborted" : "failed", `${task.agent} ${aborted ? "aborted" : "failed"}`);
+			emit(status, `${task.agent} ${status}`);
 			const stopReason =
 				typeof error === "object" &&
 				error !== null &&
@@ -513,14 +516,14 @@ export function createDelegationRunner(options: DelegationRunnerOptions): Delega
 			return {
 				agent: task.agent,
 				task: task.task,
-				status: aborted ? "aborted" : "failed",
+				status,
 				...taskOutput(preserved),
 				usage: session ? summarizeUsage(messages) : emptyUsage(),
 				error: {
-					message: aborted
-						? "Delegation aborted"
-						: uncertain
-							? `Uncertain write: ${errorMessage(error)}`
+					message: uncertain
+						? `Uncertain write: ${errorMessage(error)}`
+						: aborted
+							? "Delegation aborted"
 							: errorMessage(error),
 					...(stopReason === undefined ? {} : { stopReason }),
 				},
