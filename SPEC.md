@@ -16,7 +16,7 @@ Implementation-status summary (does not weaken normative requirements below):
 - Known implementation gaps versus some presentation/redaction expectations
   are called out inline as **Implementation status** notes.
 - Spec 1.1.0 §32 Herdr target is an **implementation candidate** (fail-closed
-  preflight, execve Pi parent wrapper, pane-per-worker backend, IPC, writer
+  preflight, execve Pi parent wrapper, persistent role-pane pool, IPC, writer
   lease with wait/serialize never-steal, retention/cleanup, result-aware
   relaunch reconciliation, in-process fallback/override). It is **not**
   shipped/live-compatible until §32.11 passes.
@@ -613,12 +613,15 @@ For each task, the runner must:
 9. Extract final text, usage, stop reason, and error information.
 10. Unsubscribe and dispose the child in a `finally` block.
 
-Children must never be reused across tasks. This guarantees isolated context
-and avoids one specialist's instructions contaminating another specialist.
+For the in-process backend, child sessions must never be reused across tasks.
+This guarantees isolated context and avoids one specialist's instructions
+contaminating another specialist. The Herdr backend is the explicit exception:
+it reuses the persistent role worker while resetting model-visible context per
+assignment as specified in §32.3.
 
-**Implementation status:** Child workers are Pi `AgentSession` instances created
-in the parent Node process. Lifecycle dispose/abort applies to those sessions;
-Momo does not spawn specialist OS child processes.
+**Implementation status:** Outside Herdr, child workers are Pi `AgentSession`
+instances created in the parent Node process and lifecycle dispose/abort applies
+to those sessions. In Herdr mode, §32's persistent pane-worker lifecycle applies.
 
 ## 16. Progress Streaming
 
@@ -1133,7 +1136,7 @@ still incomplete; do not advertise production/live Herdr readiness until it
 passes. When Herdr mode is not active (or `MOMO_BACKEND=inprocess`), Momo
 continues to use the baseline in-process specialist backend.
 
-Architecture companion: `Architecture.md` §13–§14 (ADR-009 through ADR-014).
+Architecture companion: `Architecture.md` §13–§14 (ADR-009 through ADR-015).
 
 ### 32.1 Mode selection
 
@@ -1160,18 +1163,29 @@ Momo must select a specialist backend as follows:
 5. Specialist pane creation must use no-focus allocation so the parent pane
    remains the user's controllable foreground agent whenever practical.
 
-### 32.3 Pane-per-worker execution
+### 32.3 Persistent role-pane pool
 
 For each accepted `scout`, `planner`, `implementer`, or `reviewer` task while
 the Herdr pane-worker backend is active, Momo must:
 
-1. Create one **new** Herdr pane for that task.
-2. Allocate that pane when the task is accepted/queued, not only when it becomes
-   active.
-3. Launch a **full Pi TUI** worker in that pane, constrained to the task role.
-4. Expose detailed live specialist activity in that pane for human observation.
+1. Logically preallocate an assignment proxy (runner `prepareAllChildren` may
+   still allocate proxies for parallel/chain). Prepared chain tails that never
+   prompt must not enqueue or create panes.
+2. Create or reuse exactly **one persistent Herdr pane per role** per pool key
+   (canonical git root/cwd + Herdr workspace + socket/server identity; excludes
+   parent pane id).
+3. Create the physical pane **lazily** when the assignment prompt executes, not
+   at prepare time.
+4. When the role worker is busy, enqueue the assignment on a cross-parent FIFO
+   queue with **no overflow panes**.
+5. Launch/reuse a **full Pi TUI** worker constrained to the task role.
+6. Reset model-visible context each assignment (Pi `context` event; latest
+   assignment user message onward) without calling `ctx.newSession`.
+7. Block interactive/RPC input on persistent workers even while idle.
 
 Momo must not keep Herdr-mode specialists as invisible in-process-only sessions.
+Momo must not create a new pane per task when a compatible same-role pool worker
+already exists.
 
 ### 32.4 Concurrency and writer lease
 
@@ -1234,15 +1248,24 @@ cannot add tools or widen permissions.
 5. Writer lease release semantics must be deterministic and tested for success,
    abort, crash, and uncertain-write paths.
 
-### 32.9 Pane retention and cleanup
+### 32.9 Pane retention, cleanup, adoption, and legacy migration
 
-1. Panes for completed, failed, and aborted specialist tasks must be retained
-   until explicit cleanup.
-2. Momo must not auto-close those panes on completion as part of this target.
-3. Momo must provide an explicit cleanup path (command and/or documented
-   operator procedure) for retained specialist panes.
-4. Parent shutdown must still track pane IDs and must not leave unmanaged
-   worker processes running, even when panes remain for inspection.
+1. Persistent role panes must remain until explicit cleanup.
+2. Momo must not auto-close role panes on assignment completion.
+3. `/momo-workers` must show role, state, current assignment, and queued count.
+4. `/momo-cleanup` must close `idle`/`unhealthy` (clear control ephemerals, retain
+   monotonic generation tombstone), refuse `busy`/`blocked`, and for `--force`
+   uncertain must verify exact lease owner **before** close (refuse missing/
+   mismatched; never treat `no_lease` as safe).
+5. Parent relaunch may adopt a pool worker only when registry + v2 manifest +
+   heartbeat freshness + Herdr identity match. Momo must not adopt arbitrary or
+   legacy v1 workers.
+6. One-time migration must close terminal/ready legacy pane-per-task duplicates
+   safely; active/uncertain legacy panes must fail clearly for operator cleanup.
+7. Parent shutdown must cancel only assignments owned by the current parent
+   epoch and must not leave unmanaged worker processes running.
+8. Ready timeout / start failure must generation-fence rollback to
+   unhealthy/closable (no stale generation reuse).
 
 ### 32.10 Fallback summary
 
@@ -1250,7 +1273,7 @@ cannot add tools or widen permissions.
 |---|---|
 | Herdr not detected | In-process |
 | Explicit in-process override | In-process |
-| Herdr detected and compatible | Pane-per-worker |
+| Herdr detected and compatible | Persistent role-pane pool |
 | Herdr detected but incompatible | Fail closed (error) |
 
 ### 32.11 Manual / live Herdr acceptance matrix

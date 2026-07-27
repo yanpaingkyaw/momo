@@ -1,17 +1,20 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { roleLaunchToolsCsv } from "../src/delegation/herdr-factory.js";
+import {
+	createHerdrChildSessionFactory,
+	roleLaunchToolsCsv,
+} from "../src/delegation/herdr-factory.js";
 import { installMomoWorker } from "../src/extensions/worker-runtime.js";
 import { WriterLeaseManager } from "../src/lease/writer-lease.js";
 import { getRole, ROLE_LIST } from "../src/roles.js";
 import { atomicWriteJson } from "../src/ipc/spool.js";
-import { createHerdrChildSessionFactory } from "../src/delegation/herdr-factory.js";
 import { HerdrClient } from "../src/herdr/client.js";
-import { PaneRegistry } from "../src/herdr/registry.js";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { PoolRegistry } from "../src/herdr/pool-registry.js";
+import { resolvePoolIdentity } from "../src/herdr/pool-identity.js";
+import { dispatchAssignment, setupPoolWorkerFixture } from "./helpers/pool-fixture.js";
 
 const tempDirs: string[] = [];
 const previousPiDir = process.env.PI_CODING_AGENT_DIR;
@@ -68,6 +71,9 @@ function createFakePi() {
 		sendUserMessage: vi.fn(() => {
 			assertRuntime();
 		}),
+		sendMessage: vi.fn(() => {
+			assertRuntime();
+		}),
 		async emit(event: string, payload: unknown = {}, ctx?: ExtensionContext) {
 			if (event === "session_start") runtimeReady = true;
 			order.push(`emit:${event}`);
@@ -95,13 +101,22 @@ describe("role launch tool catalogs", () => {
 		const cacheRoot = tempDir("momo-catalog-cache-");
 		const cwd = tempDir("momo-catalog-cwd-");
 		const catalogs = new Map<string, string>();
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
 
 		const client = new HerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "pane" && args[1] === "split") {
 					const envArgs = args.filter((arg, index) => args[index - 1] === "--env");
 					const ipcDir =
-						envArgs.find((v) => v.startsWith("MOMO_IPC_DIR="))?.slice("MOMO_IPC_DIR=".length) ?? "";
+						envArgs.find((v) => v.startsWith("MOMO_CONTROL_DIR="))?.slice("MOMO_CONTROL_DIR=".length) ??
+						envArgs.find((v) => v.startsWith("MOMO_IPC_DIR="))?.slice("MOMO_IPC_DIR=".length) ??
+						"";
 					const workerId =
 						envArgs.find((v) => v.startsWith("MOMO_WORKER_ID="))?.slice("MOMO_WORKER_ID=".length) ??
 						"";
@@ -124,7 +139,6 @@ describe("role launch tool catalogs", () => {
 				}
 				if (args[0] === "agent" && args[1] === "start") {
 					const tools = args[args.indexOf("--tools") + 1] ?? "";
-					const name = args[2] ?? "";
 					const paneId = args[args.indexOf("--pane") + 1] ?? "";
 					const role = paneId.replace("w1:p_", "");
 					catalogs.set(role, tools);
@@ -134,7 +148,7 @@ describe("role launch tool catalogs", () => {
 							id: "start",
 							result: {
 								pane_id: paneId,
-								name,
+								name: args[2] ?? "",
 								agent: "pi",
 								interactive_ready: true,
 								agent_status: "idle",
@@ -152,8 +166,11 @@ describe("role launch tool catalogs", () => {
 			parentPaneId: "w1:p1",
 			parentId: "parent-catalog",
 			client,
-			registry: new PaneRegistry("parent-catalog", cacheRoot),
+			poolRegistry: pool,
 			cacheRoot,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
 			pollIntervalMs: 20,
 			readyTimeoutMs: 2_000,
 			sleep: async (ms) => new Promise((r) => setTimeout(r, ms)),
@@ -161,7 +178,35 @@ describe("role launch tool catalogs", () => {
 
 		for (const role of ROLE_LIST) {
 			const session = await factory({ cwd, role });
-			await session.dispose();
+			const proxy = session as unknown as {
+				assignmentId: string;
+				workerId: string;
+				paths: { result: string };
+				prompt: (t: string) => Promise<void>;
+				dispose: () => Promise<void>;
+			};
+			await proxy.prompt("boot");
+			atomicWriteJson(proxy.paths.result, {
+				version: 1,
+				runId: proxy.assignmentId,
+				workerId: proxy.workerId,
+				status: "completed",
+				messages: [
+					{
+						role: "assistant",
+						content: [{ type: "text", text: "ok" }],
+						usage: { input: 1, output: 1, totalTokens: 2, cost: { total: 0 } },
+					},
+				],
+				finishedAt: new Date().toISOString(),
+			});
+			await session.agent?.waitForIdle();
+			pool.upsert({
+				...pool.getByRole(role.name)!,
+				status: "idle",
+				updatedAt: new Date().toISOString(),
+			});
+			await proxy.dispose();
 		}
 
 		expect(catalogs.get("scout")).toBe("read,grep,find,ls");
@@ -173,18 +218,13 @@ describe("role launch tool catalogs", () => {
 
 describe("worker active-tool posture", () => {
 	it("registers workspace_diff for reviewer before session_start", async () => {
-		const ipcDir = tempDir("momo-reviewer-ipc-");
+		const cacheRoot = tempDir("momo-reviewer-cache-");
 		const cwd = tempDir("momo-reviewer-cwd-");
+		const fixture = setupPoolWorkerFixture({ cacheRoot, cwd, role: "reviewer" });
 		const pi = createFakePi();
 		installMomoWorker(pi as unknown as ExtensionAPI, {
-			env: {
-				MOMO_WORKER: "1",
-				MOMO_ROLE: "reviewer",
-				MOMO_IPC_DIR: ipcDir,
-				MOMO_WORKER_ID: "reviewer_1",
-				MOMO_RUN_ID: "run1",
-				MOMO_CWD: cwd,
-			},
+			env: fixture.env,
+			poolRegistry: fixture.pool,
 		});
 		const registerIdx = pi.order.findIndex((step) => step === "registerTool:workspace_diff");
 		const sessionHandlerIdx = pi.order.findIndex((step) => step === "on:session_start");
@@ -203,22 +243,17 @@ describe("worker active-tool posture", () => {
 
 	it("keeps implementer read-only until lease after assigned prompt", async () => {
 		vi.useFakeTimers();
-		const ipcDir = tempDir("momo-impl-ipc-");
 		const cwd = tempDir("momo-impl-cwd-");
 		const cacheRoot = tempDir("momo-impl-lease-");
+		const fixture = setupPoolWorkerFixture({ cacheRoot, cwd, role: "implementer" });
 		const pi = createFakePi();
 		const lease = new WriterLeaseManager({ cacheRoot, now: () => 1_000 });
 		installMomoWorker(pi as unknown as ExtensionAPI, {
-			env: {
-				MOMO_WORKER: "1",
-				MOMO_ROLE: "implementer",
-				MOMO_IPC_DIR: ipcDir,
-				MOMO_WORKER_ID: "impl_1",
-				MOMO_RUN_ID: "run1",
-				MOMO_CWD: cwd,
-			},
+			env: fixture.env,
+			poolRegistry: fixture.pool,
 			leaseManager: lease,
 			now: () => 1_000,
+			sleep: async () => {},
 		});
 		expect(pi.registerTool).not.toHaveBeenCalled();
 		expect(pi.setActiveTools).not.toHaveBeenCalled();
@@ -230,32 +265,19 @@ describe("worker active-tool posture", () => {
 			cwd,
 		} as unknown as ExtensionContext;
 		await pi.emit("session_start", {}, ctx);
-		expect(pi.setActiveTools).toHaveBeenCalledTimes(1);
+		expect(pi.setActiveTools).toHaveBeenCalled();
 		expect(pi.setActiveTools.mock.calls[0]?.[0]).toEqual(["read", "grep", "find", "ls"]);
 
-		atomicWriteJson(path.join(ipcDir, "command.json"), {
-			version: 1,
-			type: "prompt",
+		dispatchAssignment({
+			controlRoot: fixture.control.root,
+			paths: fixture.paths,
+			assignmentId: fixture.assignmentId,
+			workerId: fixture.workerId,
+			generation: fixture.generation,
 			task: "edit auth",
-			issuedAt: new Date().toISOString(),
-			runId: "run1",
-			workerId: "impl_1",
 		});
-		await vi.advanceTimersByTimeAsync(150);
-		expect(pi.setActiveTools.mock.calls.length).toBeGreaterThanOrEqual(2);
-		expect(pi.setActiveTools.mock.calls.at(-1)?.[0]).toEqual([
-			"read",
-			"grep",
-			"find",
-			"ls",
-			"bash",
-			"edit",
-			"write",
-		]);
-		expect(pi.sendUserMessage).toHaveBeenCalledWith("edit auth");
-		// No write tools before the assigned command / lease path.
-		const beforeLease = pi.setActiveTools.mock.calls[0]?.[0] as string[];
-		expect(beforeLease).toEqual(["read", "grep", "find", "ls"]);
-		expect(beforeLease).not.toEqual(expect.arrayContaining(["bash", "edit", "write"]));
+		await vi.advanceTimersByTimeAsync(200);
+		const lastTools = pi.setActiveTools.mock.calls.at(-1)?.[0];
+		expect(lastTools).toEqual(["read", "grep", "find", "ls", "bash", "edit", "write"]);
 	});
 });

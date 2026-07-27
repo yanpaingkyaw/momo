@@ -59,6 +59,8 @@ export type IpcCommand =
 			issuedAt: string;
 			runId: string;
 			workerId: string;
+			generation?: number;
+			parentEpoch?: string;
 	  }
 	| {
 			version: number;
@@ -67,6 +69,8 @@ export type IpcCommand =
 			issuedAt: string;
 			runId: string;
 			workerId: string;
+			generation?: number;
+			parentEpoch?: string;
 	  };
 
 export interface IpcCancel {
@@ -75,6 +79,7 @@ export interface IpcCancel {
 	workerId: string;
 	reason: string;
 	issuedAt: string;
+	generation?: number;
 }
 
 export interface IpcHeartbeat {
@@ -108,6 +113,28 @@ export interface IpcResult {
 	errorMessage?: string;
 	uncertainWrite?: boolean;
 	finishedAt: string;
+}
+
+/** Control-plane active pointer for the role worker. */
+export interface IpcActivePointer {
+	version: 1;
+	assignmentId: string;
+	generation: number;
+	parentEpoch: string;
+	dispatchedAt: string;
+}
+
+/**
+ * Assignment-local durable start marker. Written immediately before
+ * sendUserMessage so crash recovery can refuse replay.
+ */
+export interface IpcStarted {
+	version: 1;
+	runId: string;
+	workerId: string;
+	generation: number;
+	parentEpoch: string;
+	startedAt: string;
 }
 
 export interface WorkerSpoolPaths {

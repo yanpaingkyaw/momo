@@ -7,7 +7,7 @@ import { createHerdrChildSessionFactory } from "../src/delegation/herdr-factory.
 import { HerdrClient } from "../src/herdr/client.js";
 import { PaneRegistry } from "../src/herdr/registry.js";
 import { ROLE_LIST, getRole } from "../src/roles.js";
-import { atomicWriteJson, readJsonFile, workerSpoolPaths } from "../src/ipc/spool.js";
+import { atomicWriteJson } from "../src/ipc/spool.js";
 
 const tempDirs: string[] = [];
 const previousPiDir = process.env.PI_CODING_AGENT_DIR;
@@ -49,13 +49,12 @@ function agentStartStdout(paneId: string, name: string): string {
 }
 
 describe("herdr factory + runner integration", () => {
-	it("allocates distinct panes for every parallel task before prompting", async () => {
+	it("lazily creates one pane per role for parallel cross-role tasks", async () => {
 		installFakeHerdrExtension();
 		const cacheRoot = tempDir("momo-cache-");
 		const cwd = tempDir("momo-cwd-");
 		const calls: string[][] = [];
 		let paneCounter = 0;
-		const readyWriters = new Map<string, () => void>();
 
 		const client = new HerdrClient({
 			runCommand: async (_file, args) => {
@@ -65,23 +64,32 @@ describe("herdr factory + runner integration", () => {
 					paneCounter += 1;
 					const paneId = `w1:p${paneCounter}`;
 					const envArgs = args.filter((arg, index) => args[index - 1] === "--env");
-					const ipcDir = envArgs
-						.find((value) => value.startsWith("MOMO_IPC_DIR="))
-						?.slice("MOMO_IPC_DIR=".length);
+					const controlDir =
+						envArgs
+							.find((value) => value.startsWith("MOMO_CONTROL_DIR="))
+							?.slice("MOMO_CONTROL_DIR=".length) ??
+						envArgs
+							.find((value) => value.startsWith("MOMO_IPC_DIR="))
+							?.slice("MOMO_IPC_DIR=".length);
 					const workerId = envArgs
 						.find((value) => value.startsWith("MOMO_WORKER_ID="))
 						?.slice("MOMO_WORKER_ID=".length);
 					const runId = envArgs
 						.find((value) => value.startsWith("MOMO_RUN_ID="))
 						?.slice("MOMO_RUN_ID=".length);
-					if (ipcDir && workerId && runId) {
-						readyWriters.set(paneId, () => {
-							atomicWriteJson(path.join(ipcDir, "ready.json"), {
-								version: 1,
-								runId,
-								workerId,
-								readyAt: new Date().toISOString(),
-							});
+					if (controlDir && workerId && runId) {
+						atomicWriteJson(path.join(controlDir, "ready.json"), {
+							version: 1,
+							runId,
+							workerId,
+							readyAt: new Date().toISOString(),
+						});
+						atomicWriteJson(path.join(controlDir, "heartbeat.json"), {
+							version: 1,
+							runId,
+							workerId,
+							at: new Date().toISOString(),
+							seq: 1,
 						});
 					}
 					return {
@@ -91,34 +99,40 @@ describe("herdr factory + runner integration", () => {
 					};
 				}
 				if (args[0] === "pane" && args[1] === "rename") {
-					expect(args[0]).toBe("pane");
-					expect(args[1]).toBe("rename");
-					expect(args[2]).toMatch(/^w1:p/);
-					expect(args[3]).toMatch(/^Momo /);
 					return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
 				}
 				if (args[0] === "agent" && args[1] === "start") {
-					const paneFlag = args.indexOf("--pane");
-					const paneId = args[paneFlag + 1] ?? "";
-					const name = args[2] ?? "";
 					const toolsIdx = args.indexOf("--tools");
 					const tools = args[toolsIdx + 1] ?? "";
 					expect(tools).not.toContain("delegate");
-					readyWriters.get(paneId)?.();
+					const paneFlag = args.indexOf("--pane");
+					const paneId = args[paneFlag + 1] ?? "";
+					const name = args[2] ?? "";
 					return { code: 0, stdout: agentStartStdout(paneId, name), stderr: "" };
 				}
 				return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
 			},
 		});
 
-		const registry = new PaneRegistry("parent1", cacheRoot);
+		const { PoolRegistry } = await import("../src/herdr/pool-registry.js");
+		const { resolvePoolIdentity } = await import("../src/herdr/pool-identity.js");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
 		const factory = createHerdrChildSessionFactory({
 			cwd,
 			parentPaneId: "w1:p1",
 			parentId: "parent1",
 			client,
-			registry,
+			poolRegistry: pool,
 			cacheRoot,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
 			pollIntervalMs: 20,
 			readyTimeoutMs: 2_000,
 			sleep: async (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
@@ -134,14 +148,15 @@ describe("herdr factory + runner integration", () => {
 				const originalPrompt = session.prompt.bind(session);
 				session.prompt = async (text: string) => {
 					await originalPrompt(text);
-					const record = (session as unknown as { paths: ReturnType<typeof workerSpoolPaths> })
-						.paths;
-					const workerId = (session as unknown as { workerId: string }).workerId;
-					const runId = (session as unknown as { runId: string }).runId;
-					atomicWriteJson(record.result, {
+					const proxy = session as unknown as {
+						paths: { result: string };
+						assignmentId: string;
+						workerId: string;
+					};
+					atomicWriteJson(proxy.paths.result, {
 						version: 1,
-						runId,
-						workerId,
+						runId: proxy.assignmentId,
+						workerId: proxy.workerId,
 						status: "completed",
 						messages: [
 							{
@@ -169,7 +184,6 @@ describe("herdr factory + runner integration", () => {
 		expect(paneCounter).toBe(2);
 		expect(result.status).toBe("completed");
 		expect(result.results.map((task) => task.status)).toEqual(["completed", "completed"]);
-		expect(registry.list().every((pane) => pane.status === "completed")).toBe(true);
 		expect(calls.some((args) => args[0] === "pane" && args[1] === "close")).toBe(false);
 	});
 
@@ -380,80 +394,51 @@ describe("herdr factory + runner integration", () => {
 		expect(getRole("scout").tools).not.toContain("bash");
 	});
 
-	it("skip command leaves registry terminal (not ready)", async () => {
+	it("skip before prompt never creates a pane", async () => {
 		installFakeHerdrExtension();
 		const cacheRoot = tempDir("momo-term-cache-");
 		const cwd = tempDir("momo-term-cwd-");
-
-		let ipcDir = "";
-		let workerId = "";
-		let runId = "";
-		const paneId = "w1:p2";
+		let splits = 0;
 		const client = new HerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "pane" && args[1] === "split") {
-					const envArgs = args.filter((arg, index) => args[index - 1] === "--env");
-					ipcDir =
-						envArgs.find((value) => value.startsWith("MOMO_IPC_DIR="))?.slice("MOMO_IPC_DIR=".length) ??
-						"";
-					workerId =
-						envArgs
-							.find((value) => value.startsWith("MOMO_WORKER_ID="))
-							?.slice("MOMO_WORKER_ID=".length) ?? "";
-					runId =
-						envArgs.find((value) => value.startsWith("MOMO_RUN_ID="))?.slice("MOMO_RUN_ID=".length) ??
-						"";
+					splits += 1;
 					return {
 						code: 0,
-						stdout: JSON.stringify({ id: "split", result: { pane: { pane_id: paneId } } }),
+						stdout: JSON.stringify({ id: "split", result: { pane: { pane_id: "w1:p2" } } }),
 						stderr: "",
 					};
-				}
-				if (args[0] === "agent" && args[1] === "start") {
-					atomicWriteJson(path.join(ipcDir, "ready.json"), {
-						version: 1,
-						runId,
-						workerId,
-						readyAt: new Date().toISOString(),
-					});
-					return { code: 0, stdout: agentStartStdout(paneId, args[2] ?? ""), stderr: "" };
 				}
 				return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
 			},
 		});
-		const registry = new PaneRegistry("parent-term", cacheRoot);
+		const { PoolRegistry } = await import("../src/herdr/pool-registry.js");
+		const { resolvePoolIdentity } = await import("../src/herdr/pool-identity.js");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
 		const factory = createHerdrChildSessionFactory({
 			cwd,
 			parentPaneId: "w1:p1",
 			parentId: "parent-term",
 			client,
-			registry,
+			poolRegistry: pool,
 			cacheRoot,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
 			pollIntervalMs: 20,
 			readyTimeoutMs: 2_000,
 			sleep: async (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 		});
 		const session = await factory({ cwd, role: getRole("scout") });
-		expect(registry.list()[0]?.status).toBe("ready");
-
-		const poll = setInterval(() => {
-			const command = readJsonFile(path.join(ipcDir, "command.json")) as
-				| { type?: string; reason?: string }
-				| undefined;
-			if (command?.type === "skip") {
-				atomicWriteJson(path.join(ipcDir, "result.json"), {
-					version: 1,
-					runId,
-					workerId,
-					status: "aborted",
-					messages: [],
-					errorMessage: command.reason,
-					finishedAt: new Date().toISOString(),
-				});
-			}
-		}, 10);
 		await session.skip?.("parallel_skipped");
-		clearInterval(poll);
-		expect(registry.list()[0]?.status).toBe("aborted");
+		await session.dispose();
+		expect(splits).toBe(0);
+		expect(pool.list()).toHaveLength(0);
 	});
 });

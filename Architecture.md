@@ -2,7 +2,7 @@
 
 Status: Package `momo-orchestrator@0.2.0` is an **implementation candidate** for baseline in-process orchestration plus the approved Herdr pane-worker target (mocked tests; live Herdr acceptance still operator-run and incomplete)
 Document type: Durable architecture description (baseline current behavior, approved target, and candidate module map)
-Last updated: 2026-07-26
+Last updated: 2026-07-27
 
 Labels used below:
 
@@ -302,11 +302,16 @@ Expect variability: detection may still show Pi rather than Momo, and `agent pro
 | Thin wrapper / launch | `src/cli.ts`, `src/launch.ts` |
 | Backend selection | `src/herdr/env.ts` |
 | Herdr CLI adapter | `src/herdr/client.ts` |
-| Pane registry | `src/herdr/registry.ts` |
-| IPC spool | `src/ipc/spool.ts` |
+| Pool identity | `src/herdr/pool-identity.ts` |
+| Pool registry | `src/herdr/pool-registry.ts` |
+| Role FIFO queue | `src/herdr/role-queue.ts` |
+| Assignment / control spools | `src/herdr/assignment-spool.ts` |
+| Legacy v1 migration | `src/herdr/legacy-migration.ts` |
+| Legacy pane registry (migration only) | `src/herdr/registry.ts` |
+| IPC spool primitives | `src/ipc/spool.ts` |
 | Writer lease | `src/lease/writer-lease.ts` |
-| Remote ChildSession factory | `src/delegation/herdr-factory.ts` |
-| Runner pre-allocation | `src/delegation/runner.ts` |
+| Assignment-proxy ChildSession factory | `src/delegation/herdr-factory.ts` |
+| Runner logical pre-allocation | `src/delegation/runner.ts` |
 | Parent Pi extension | `src/extensions/parent.ts` → `dist/extensions/parent.js` |
 | Worker Pi extension | `src/extensions/worker.ts` → `dist/extensions/worker.js` |
 | In-process runtime (non-Herdr) | `src/runtime.ts` |
@@ -314,7 +319,7 @@ Expect variability: detection may still show Pi rather than Momo, and `agent pro
 ### 13.1 Goals of the target
 
 1. Parent Momo is friendly and controllable in a Herdr terminal.
-2. Every accepted specialist task (`scout`, `planner`, `implementer`, `reviewer`) runs as a **full Pi TUI** in a **newly created Herdr pane**, with detailed live activity visible there.
+2. Every accepted specialist task (`scout`, `planner`, `implementer`, `reviewer`) runs as a **full Pi TUI** in a **persistent Momo-managed role pane** (exactly one pane per role per pool key), with detailed live activity visible there.
 3. Parent↔worker coordination uses **private versioned IPC** as the authoritative progress/result channel (**never** TTY scraping).
 4. Outside Herdr, preserve today’s in-process specialists (with explicit override).
 5. When Herdr is detected but incompatible, **fail closed**.
@@ -331,9 +336,9 @@ flowchart LR
   Delegate --> Backend{"Herdr mode?"}
   Backend -->|no / override inprocess| InProc["In-process child sessions<br/>current behavior"]
   Backend -->|yes| HerdrCLI["Herdr CLI argv+JSON<br/>no shell"]
-  HerdrCLI --> Pane["New pane per accepted task"]
-  Pane --> WorkerPi["Full Pi TUI worker<br/>role-constrained"]
-  Delegate --> IPC["Versioned IPC files<br/>progress + result"]
+  HerdrCLI --> Pane["Persistent role pane pool<br/>1 pane per role per poolKey"]
+  Pane --> WorkerPi["Full Pi TUI worker<br/>role-constrained, multi-assignment"]
+  Delegate --> IPC["Versioned IPC files<br/>assignment spools + control"]
   WorkerPi --> IPC
 ```
 
@@ -348,46 +353,58 @@ flowchart LR
 | Extension | Ship/load a **Momo parent Pi extension** for identity, lifecycle cooperation, and Herdr-facing display |
 | Controllability | Keep parent as pane foreground; specialist panes created with **no focus steal** |
 
-### 13.4 Specialist pane-per-worker backend
+### 13.4 Specialist persistent role-pane pool
 
 For each accepted specialist task under Herdr mode:
 
-1. **Immediately allocate** a new Herdr pane when the task is accepted/queued (do not delay pane creation until the worker becomes active).
-2. Launch a **full Pi TUI** worker in that pane, role-constrained to the assigned role.
-3. Show detailed live activity in that pane’s terminal (human-visible Pi UI).
-4. Enforce concurrency:
-   - at most **four active read-only** workers (`scout` / `planner` / `reviewer`);
-   - at most **one cross-process implementer** at a time (writer lease).
-5. Queued tasks may already own panes while waiting for an active slot; inactive queued workers must not bypass concurrency or the writer lease.
+1. **Logically preallocate** an assignment proxy when the runner prepares children (parallel/chain). Prepared chain tails that never prompt **must not** enqueue or create panes.
+2. **Lazily create** the physical role pane only when `prompt()` executes and no compatible idle/busy pool worker exists for that role.
+3. **Reuse** only Momo-managed compatible panes: exactly **one persistent pane per role** per `poolKey`.
+4. `poolKey` = hash(canonical git root or cwd + `HERDR_WORKSPACE_ID` + Herdr socket/server identity). **Excludes** parent pane id so multiple parents in the same workspace share the pool.
+5. Busy same-role tasks enter a cross-parent filesystem **FIFO** queue (no overflow panes). Cross-role work may run in parallel (subject to the writer lease for implementers).
+6. Model-visible context resets each assignment via the Pi `context` event (latest assignment user message onward). Transcript/pane persists. **Do not** call `ctx.newSession`.
+7. Registry states: `starting` / `idle` / `busy` / `blocked` / `unhealthy` / `uncertain`. Task failure → idle (or next queued). Protocol/process failure → unhealthy. Ambiguous implementer → uncertain (no reuse).
+8. Interactive/RPC input is **always blocked** on persistent workers (including idle).
 
 ### 13.5 IPC (authoritative)
 
-- Private, **versioned** parent↔worker IPC directory/files for task input, heartbeats, progress events, and final result.
+- Private, **versioned** parent↔worker IPC for task input, heartbeats, progress events, and final result.
+- **Control plane** (per role worker): manifest / ready / heartbeat / active pointer under the pool role `worker/` directory.
+- **Assignment plane** (per job): command / cancel / events / result / assignment heartbeat under a canonical path derived from `poolRoot/roles/{role}/assignments/{assignmentId}/` (never trust a stored arbitrary path).
 - IPC is the **only** authoritative channel for orchestration decisions and `TaskResult` ingestion.
 - **Must not** scrape pane TTY/`herdr pane read` to decide completion or extract results.
-- Pane TTY exists for human observation and debugging only.
 
 ### 13.6 Trust boundaries (unchanged policy, new surfaces)
 
 - Exact role tool allowlists from `src/roles.ts`; workers **must not** receive `delegate`.
 - Parent remains read-only plus `delegate` in the orchestration session.
 - Herdr CLI invocations use **argv arrays without a shell**; stdout/stderr JSON **must be validated** before use.
-- Cross-process **writer lease** replaces reliance on in-process `writerTail` alone when Herdr workers run.
+- Cross-process **writer lease** is acquired/released **per implementer assignment** (fresh lease token each job).
 
 ### 13.7 Cancellation, heartbeat, crash, uncertain write
 
 | Event | Approved rule |
 |---|---|
-| Cancel | Parent signals worker; stops scheduling; waits bounded time; marks aborted/skipped; retains panes until explicit cleanup |
-| Heartbeat | Worker renews IPC heartbeat while alive; stale heartbeat ⇒ treat as crashed/unresponsive |
+| Cancel queued | Remove exact FIFO entry; **must not** interrupt the active assignment |
+| Cancel active | Assignment cancel IPC only (never terminal keys on shared panes) |
+| Heartbeat | Control-plane heartbeat while worker alive; stale ⇒ crashed/unresponsive |
 | Crash / missing result | Task fails or aborts; do not invent success from TTY |
-| Implementer uncertain write | If writer lease was held and worker ends without a clean terminal result after possible mutation, surface **uncertain-write** risk to the parent/user; do not claim verified success |
-| Lease release | Implementer lease releases only on clean completion, explicit abort handling, or supervised recovery rules defined in `SPEC.md` §32 |
-| Cross-parent implementer wait | Second implementer **waits/retries** (cancellation-aware, default up to one hour) for the writer lease; never steals; stays read-only with waiting progress until acquire |
+| Implementer uncertain write | Ambiguous mutation ⇒ `uncertain`; **no reuse** until supervised cleanup |
+| Lease release | Per assignment; release before clean result publish |
+| Cross-parent implementer wait | Second implementer **waits/retries** for the writer lease; never steals |
+| Parent shutdown | Cancel IPC only for assignments with **exact** `activeParentEpoch ===` current parent epoch; never terminal keys; never another parent's task |
 
-### 13.8 Pane retention
+### 13.8 Pane retention and cleanup
 
-Completed, failed, and aborted specialist panes are **retained until explicit cleanup** (user or Momo cleanup command/flow). Automatic close-on-success is **not** part of the approved target.
+Persistent role panes remain until explicit cleanup:
+
+| `/momo-cleanup` | Behavior |
+|---|---|
+| Default | Close `idle` / `unhealthy` |
+| Refuses | `busy` / `blocked` / `starting` |
+| `--force` | Also closes `uncertain` **only** when writer lease ownerId equals registry workerId (UI confirm) |
+
+`/momo-workers` shows role, state, current assignment, and queued count.
 
 ### 13.9 Fallback and fail-closed
 
@@ -396,15 +413,15 @@ Completed, failed, and aborted specialist panes are **retained until explicit cl
 | Not inside Herdr | In-process specialist backend (current behavior) |
 | Explicit override to in-process | Allowed even inside Herdr (operator escape hatch) |
 | Herdr detected but incompatible/unusable | **Fail closed** — delegation errors; do not silently degrade |
-| Herdr mode active and healthy | Pane-per-worker backend required for accepted specialist tasks |
+| Herdr mode active and healthy | Persistent role-pane pool required for accepted specialist tasks |
 
-### 13.10 Platform and version alignment
+### 13.10 Platform, adoption, and legacy migration
 
 - Initial support target: **macOS and Linux** only.
-- Required versions for this candidate: **Pi** `0.82.1` (`@earendil-works/pi-coding-agent` / PATH `pi`) and **Herdr CLI** `0.7.5` (protocol `17`).
-- In Herdr mode, `MOMO_PI_BINARY` is rejected unless it realpath-equals PATH `pi` (no resolve-and-discard).
-- Windows and remote-only topologies remain out of scope.
-- **Operator evidence (macOS, partial):** canonical parent prompt; scout E2E; four role panes opened; implementer exact ok-newline in a disposable fixture; reviewer `workspace_diff`; hardened active planner cancellation (aborted retained pane); retention/cleanup. **Still pending live:** queued-task cancellation, full cross-parent lease contention, crash recovery, Linux. Do **not** claim full `SPEC.md` §32.11.
+- Required versions for this candidate: **Pi** `0.82.1` and **Herdr CLI** `0.7.5` (protocol `17`).
+- Parent relaunch **adopts** a pool worker only when registry + v2 manifest + heartbeat + Herdr identity match. **Never** adopt arbitrary or legacy v1 workers.
+- One-time migration closes terminal/ready legacy pane-per-task duplicates safely; active/uncertain legacy panes fail clearly for manual cleanup.
+- **Operator evidence (macOS, partial):** earlier pane-per-task smoke remains historical. Automated unit/integration tests cover lock token-safe release and fail-closed stale locks (no automatic takeover), per-role registry, durable FIFO claim/recovery, sequential same-pane assignments, result-publish failure (no queue advance), cancel→aborted, stale-heartbeat adoption refusal, generation tombstone, and lease-first uncertain cleanup refusal. Live Herdr re-smoke of reuse/FIFO/context isolation is still required. Do **not** claim full `SPEC.md` §32.11.
 
 ### 13.11 Delivery governance (not product behavior)
 
@@ -414,7 +431,7 @@ Development of this target proceeds in a **separate Git worktree / feature branc
 
 | Event | Guaranteed behavior | Limitation |
 |---|---|---|
-| Parent `session_shutdown` | Writes cancel IPC for active registered workers; best-effort ctrl+c; does **not** close retained terminal panes | Hard kill / SIGKILL of the parent may skip this path |
+| Parent `session_shutdown` | Writes cancel IPC only when `activeParentEpoch` exactly matches this parent epoch; does **not** send terminal keys; does **not** close retained panes | Hard kill / SIGKILL of the parent may skip this path |
 | Parent relaunch (`session_start`) | Stable `parentId` (hash of Herdr pane + workspace + real cwd) rediscovers registry; privately validates `result.json` for active records (identity-checked); maps completed/aborted/failed/uncertain; idle/done/unknown without result → failed or uncertain; `working`/`blocked` without result stays active; corrupt result is terminal with notify (not startup crash) | Cannot resume in-flight tool calls; registry JSON corruption fails closed with an actionable error |
 | Worker OS death without IPC result | Heartbeat stale / missing result ⇒ failed or uncertain-write (implementer) | No invent-success from TTY |
 
@@ -431,33 +448,33 @@ Shipped modules are listed in **§13.0** (not the obsolete “not yet created”
 - **Decision:** `momo` is a thin wrapper that execs a canonical Pi foreground parent; a Momo parent Pi extension sets display name **Momo** while Herdr kind remains **`pi`**. Upstream `momo` kind is deferred.
 - **Consequences:** Controllability depends on Pi remaining pane foreground; branding is display/metadata-level until Herdr adds a native kind.
 
-### ADR-010 — Pane-per-worker Herdr backend
+### ADR-010 — Persistent role-pane pool (replaces pane-per-task)
 
-- **Status:** Accepted (**implemented** in `0.2.0`; live Herdr acceptance incomplete)
-- **Context:** In-process children hide specialist activity from Herdr and the user.
-- **Decision:** Under Herdr mode, each accepted specialist task gets a newly created pane running a full Pi TUI worker; allocate panes when queued; cap four active read-only workers and one implementer.
-- **Consequences:** Higher process/pane churn; layout management and cleanup UX become first-class; in-process path remains for non-Herdr.
+- **Status:** Accepted (**implemented** in `0.2.0` candidate; live Herdr acceptance incomplete)
+- **Context:** Pane-per-task allocation created duplicate implementer/reviewer panes for repeated work.
+- **Decision:** Under Herdr mode, keep exactly one persistent Momo-managed pane per role per `poolKey` (canonical repo + Herdr workspace + socket). Runner still logically preallocates; factory returns assignment proxies; physical panes are lazy on prompt; busy same-role work FIFO-queues without overflow panes.
+- **Consequences:** Shared cross-parent pool requires transaction locks and adoption identity checks; legacy v1 panes must be migrated/closed, never adopted.
 
 ### ADR-011 — Structured versioned IPC
 
 - **Status:** Accepted (**implemented** in `0.2.0`; live Herdr acceptance incomplete)
 - **Context:** TTY scraping is brittle and unsafe for orchestration truth.
-- **Decision:** Private versioned IPC is authoritative for progress and results; never scrape TTY for completion or output extraction.
+- **Decision:** Private versioned IPC is authoritative for progress and results; control-plane heartbeat/manifest separate from per-assignment spools; never scrape TTY for completion or output extraction.
 - **Consequences:** Workers must speak IPC correctly; human pane output can diverge visually without affecting orchestration correctness.
 
 ### ADR-012 — Cross-process writer lease
 
 - **Status:** Accepted (**implemented** in `0.2.0`; live Herdr acceptance incomplete)
 - **Context:** In-process `writerTail` cannot serialize implementers across OS processes/panes.
-- **Decision:** Introduce a cross-process writer lease for implementers, composed with existing validation (no parallel implementers).
-- **Consequences:** Requires crash/uncertain-write rules; lease path must be documented and tested.
+- **Decision:** Cross-process writer lease for implementers, acquired/released per assignment with a fresh token; composed with existing validation (no parallel implementers).
+- **Consequences:** Requires crash/uncertain-write rules; uncertain workers are not reused.
 
-### ADR-013 — Retain specialist panes until explicit cleanup
+### ADR-013 — Persistent panes until explicit cleanup
 
 - **Status:** Accepted (**implemented** in `0.2.0`; live Herdr acceptance incomplete)
-- **Context:** Users need to inspect completed/failed/aborted specialist TUIs after the parent synthesizes results.
-- **Decision:** Retain those panes until explicit cleanup; do not auto-close on completion.
-- **Consequences:** Pane accumulation risk; cleanup command/UX required; delivery docs must explain retention.
+- **Context:** Users need to inspect specialist TUIs; duplicate pane-per-task retention caused layout sprawl.
+- **Decision:** Keep one persistent pane per role; cleanup closes idle/unhealthy; refuses busy/blocked; force-uncertain only for exact lease owner.
+- **Consequences:** `/momo-workers` and `/momo-cleanup` are first-class; migration closes legacy duplicates.
 
 ### ADR-014 — In-process fallback and Herdr fail-closed
 
@@ -465,3 +482,10 @@ Shipped modules are listed in **§13.0** (not the obsolete “not yet created”
 - **Context:** Operators need a non-Herdr path and must not get silent degradation when Herdr is broken.
 - **Decision:** Default in-process outside Herdr; allow explicit in-process override; if Herdr is detected but incompatible, fail closed.
 - **Consequences:** Clearer errors inside broken Herdr sessions; override must be explicit and documented.
+
+### ADR-015 — Assignment context isolation without newSession
+
+- **Status:** Accepted (**implemented** in `0.2.0` candidate; live Herdr acceptance incomplete)
+- **Context:** Persistent workers retain transcript history across jobs.
+- **Decision:** Reset model-visible context each assignment via the Pi `context` event by slicing from the **latest user message** onward (empty if none). Do **not** use `ctx.newSession` or fragile custom transcript markers. Block interactive/RPC input; only extension-sourced assignment prompts continue.
+- **Consequences:** Human-visible transcript can show prior assignments while the model only sees the current job.

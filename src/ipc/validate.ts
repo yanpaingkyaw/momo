@@ -5,6 +5,7 @@ import { IpcValidationError } from "./errors.js";
 import {
 	IPC_VERSION,
 	MAX_IPC_JSON_BYTES,
+	type IpcActivePointer,
 	type IpcCancel,
 	type IpcCommand,
 	type IpcEvent,
@@ -13,6 +14,7 @@ import {
 	type IpcManifest,
 	type IpcReady,
 	type IpcResult,
+	type IpcStarted,
 } from "./spool.js";
 
 export { IpcValidationError } from "./errors.js";
@@ -154,7 +156,15 @@ export function validateReady(
 	};
 }
 
-export function validateCommand(value: unknown, expected: { runId: string; workerId: string }): IpcCommand {
+export function validateCommand(
+	value: unknown,
+	expected: {
+		runId: string;
+		workerId: string;
+		generation?: number;
+		parentEpoch?: string;
+	},
+): IpcCommand {
 	const record = asRecord(value, "command");
 	requireVersion(record, "command");
 	const runId = requireString(record, "runId", "command", 64);
@@ -162,20 +172,136 @@ export function validateCommand(value: unknown, expected: { runId: string; worke
 	if (runId !== expected.runId || workerId !== expected.workerId) {
 		throw new IpcValidationError("command identity mismatch");
 	}
+	const rawGeneration = record.generation;
+	const generation = typeof rawGeneration === "number" ? rawGeneration : undefined;
+	if (
+		rawGeneration !== undefined &&
+		(generation === undefined ||
+			!Number.isInteger(generation) ||
+			generation < 1 ||
+			(expected.generation !== undefined && generation !== expected.generation))
+	) {
+		throw new IpcValidationError("command generation mismatch");
+	}
+	if (expected.generation !== undefined && generation !== expected.generation) {
+		throw new IpcValidationError("command generation mismatch");
+	}
 	const type = requireString(record, "type", "command", 32);
 	if (type !== "prompt" && type !== "skip" && type !== "cancel") {
 		throw new IpcValidationError("command.type invalid");
 	}
 	const issuedAt = requireString(record, "issuedAt", "command", 64);
+
+	// Persistent generation-aware commands require parentEpoch. Legacy commands
+	// without generation keep optional epoch compatibility.
+	const generationAware = expected.generation !== undefined || generation !== undefined;
+	let parentEpoch: string | undefined;
+	if (generationAware) {
+		parentEpoch = requireString(record, "parentEpoch", "command", 64);
+		if (expected.parentEpoch !== undefined && parentEpoch !== expected.parentEpoch) {
+			throw new IpcValidationError("command parentEpoch mismatch");
+		}
+	} else {
+		parentEpoch = optionalBoundedString(record, "parentEpoch", "command", 64);
+	}
+
+	const epochFields = {
+		...(generation !== undefined ? { generation } : {}),
+		...(parentEpoch !== undefined ? { parentEpoch } : {}),
+	};
+
 	if (type === "prompt") {
 		const task = requireString(record, "task", "command", MAX_TASK_CHARS);
-		return { version: IPC_VERSION, type, task, issuedAt, runId, workerId };
+		return { version: IPC_VERSION, type, task, issuedAt, runId, workerId, ...epochFields };
 	}
 	const reason = requireString(record, "reason", "command", 1024);
-	return { version: IPC_VERSION, type, reason, issuedAt, runId, workerId };
+	return { version: IPC_VERSION, type, reason, issuedAt, runId, workerId, ...epochFields };
 }
 
-export function validateCancel(value: unknown, expected: { runId: string; workerId: string }): IpcCancel {
+/**
+ * Strict active.json validator. Rejects null/array/primitive/malformed shapes.
+ * Exact generation match when expected.generation is provided.
+ */
+export function validateActivePointer(
+	value: unknown,
+	expected?: { generation?: number; assignmentId?: string },
+): IpcActivePointer {
+	if (value === null || typeof value !== "object" || Array.isArray(value)) {
+		throw new IpcValidationError("active pointer must be a non-null object");
+	}
+	const record = value as Record<string, unknown>;
+	if (record.version !== 1) {
+		throw new IpcValidationError("active.version must be 1");
+	}
+	const assignmentId = requireString(record, "assignmentId", "active", 64);
+	if (expected?.assignmentId !== undefined && assignmentId !== expected.assignmentId) {
+		throw new IpcValidationError("active.assignmentId mismatch");
+	}
+	const generation = record.generation;
+	if (typeof generation !== "number" || !Number.isInteger(generation) || generation < 1) {
+		throw new IpcValidationError("active.generation invalid");
+	}
+	if (expected?.generation !== undefined && generation !== expected.generation) {
+		throw new IpcValidationError("active.generation mismatch");
+	}
+	const parentEpoch = requireString(record, "parentEpoch", "active", 64);
+	const dispatchedAt = requireString(record, "dispatchedAt", "active", 64);
+	return {
+		version: 1,
+		assignmentId,
+		generation,
+		parentEpoch,
+		dispatchedAt,
+	};
+}
+
+/**
+ * Strict assignment-local started.json validator (at-most-once prompt fence).
+ */
+export function validateStarted(
+	value: unknown,
+	expected: {
+		runId: string;
+		workerId: string;
+		generation: number;
+		parentEpoch: string;
+	},
+): IpcStarted {
+	if (value === null || typeof value !== "object" || Array.isArray(value)) {
+		throw new IpcValidationError("started marker must be a non-null object");
+	}
+	const record = value as Record<string, unknown>;
+	if (record.version !== 1) {
+		throw new IpcValidationError("started.version must be 1");
+	}
+	const runId = requireString(record, "runId", "started", 64);
+	const workerId = requireString(record, "workerId", "started", 64);
+	if (runId !== expected.runId || workerId !== expected.workerId) {
+		throw new IpcValidationError("started identity mismatch");
+	}
+	const generation = record.generation;
+	if (typeof generation !== "number" || !Number.isInteger(generation) || generation < 1) {
+		throw new IpcValidationError("started.generation invalid");
+	}
+	if (generation !== expected.generation) {
+		throw new IpcValidationError("started.generation mismatch");
+	}
+	const parentEpoch = requireString(record, "parentEpoch", "started", 64);
+	if (parentEpoch !== expected.parentEpoch) {
+		throw new IpcValidationError("started.parentEpoch mismatch");
+	}
+	const startedAt = requireString(record, "startedAt", "started", 64);
+	return {
+		version: 1,
+		runId,
+		workerId,
+		generation,
+		parentEpoch,
+		startedAt,
+	};
+}
+
+export function validateCancel(value: unknown, expected: { runId: string; workerId: string; generation?: number }): IpcCancel {
 	const record = asRecord(value, "cancel");
 	requireVersion(record, "cancel");
 	const runId = requireString(record, "runId", "cancel", 64);
@@ -183,12 +309,18 @@ export function validateCancel(value: unknown, expected: { runId: string; worker
 	if (runId !== expected.runId || workerId !== expected.workerId) {
 		throw new IpcValidationError("cancel identity mismatch");
 	}
+	const rawGeneration = record.generation;
+	const generation = typeof rawGeneration === "number" ? rawGeneration : undefined;
+	if (rawGeneration !== undefined && (generation === undefined || !Number.isInteger(generation) || generation < 1 || (expected.generation !== undefined && generation !== expected.generation))) {
+		throw new IpcValidationError("cancel generation mismatch");
+	}
 	return {
 		version: IPC_VERSION,
 		runId,
 		workerId,
 		reason: requireString(record, "reason", "cancel", 1024),
 		issuedAt: requireString(record, "issuedAt", "cancel", 64),
+		...(generation !== undefined ? { generation } : {}),
 	};
 }
 

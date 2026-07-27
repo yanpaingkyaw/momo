@@ -79,18 +79,23 @@ herdr integration install pi
 
 ## Herdr specialists
 
-When the Herdr backend is active, every accepted specialist task:
+When the Herdr backend is active, accepted specialist tasks use a **persistent
+role-pane pool**:
 
-1. Allocates a new Herdr pane immediately (including queued parallel/chain tasks)
-2. Starts canonical Pi full TUI with the Momo worker extension
-3. Streams live activity in that pane
-4. Returns authoritative progress/results over private versioned file IPC (never TTY scraping)
+1. Runner logically preallocates assignment proxies (chain tails that never
+   prompt create no panes)
+2. Physical pane/agent starts lazily on first `prompt()` for that role
+3. Exactly one Momo-managed pane per role per pool key (canonical repo + Herdr
+   workspace + socket); busy same-role work FIFO-queues with no overflow panes
+4. Model-visible context resets each assignment; transcript/pane persists
+5. Progress/results use private versioned IPC (control heartbeat separate from
+   assignment spools; never TTY scraping)
 
-Concurrency: at most four active read-only workers; one cross-process implementer
-via a writer lease under `~/.cache/momo/leases/` (outside the git tree). A second
-implementer **waits** (cancellation-aware, bounded) for that lease — it never steals.
+Concurrency: cross-role workers may run in parallel; same-role work serializes
+on the shared pane; one cross-process implementer via a writer lease under
+`~/.cache/momo/leases/` (reacquired per assignment).
 
-Completed/failed/aborted panes are retained until explicit cleanup:
+Cleanup:
 
 ```text
 /momo-workers
@@ -98,21 +103,41 @@ Completed/failed/aborted panes are retained until explicit cleanup:
 /momo-cleanup --force   # supervised: UI confirm, then force-release only if lock owner matches
 ```
 
+### Migrating away from duplicate pane-per-task panes
+
+If you still have old `Momo implementer` / `Momo reviewer` panes from the
+pane-per-task candidate:
+
+1. Finish or abort any **active** legacy workers you still need.
+2. Restart Momo parent in the same Herdr workspace — startup migrates terminal/
+   ready legacy registry records by closing those panes (never adopts them into
+   the pool). Active/uncertain legacy panes are refused and require manual close.
+3. Confirm pool workers only appear after a real `prompt()` (lazy physical create);
+   `/momo-workers` should show at most one row per role.
+4. For uncertain pool workers, `/momo-cleanup --force` verifies the **exact**
+   writer-lease owner first and refuses missing/mismatched leases (does **not**
+   treat `no_lease` as safe). Idle/unhealthy cleanup clears control ephemerals
+   but retains the monotonic generation tombstone.
+5. After cleanup/recreate, generations must advance (no stale g1 reuse).
+
 ### Operator evidence (macOS, partial — not §32.11)
 
-Recorded against this candidate:
+Recorded against the earlier pane-per-task candidate; pool correction needs
+re-smoke for reuse/FIFO/context isolation:
 
 - Canonical parent prompt under Herdr
-- Scout E2E
-- Four role panes opened
-- Implementer exact `ok` newline write in a disposable fixture
-- Reviewer `workspace_diff`
-- Active planner cancellation via parent interrupt, with an aborted retained pane
-- Retention / cleanup
+- Scout E2E / role panes / implementer write / reviewer diff / cancel / cleanup
 
-**Explicitly still pending live:** queued-task cancellation, full cross-parent
-lease contention, crash recovery, Linux. Process death without `session_shutdown`
-cannot guarantee cancel IPC.
+**Automated coverage (credential-free):** sequential same-pane assignments + queued
+claim, lock token-safe release / fail-closed stale locks (no automatic takeover),
+durable claim recovery, result-write failure
+stops queue, cancel→aborted, stale heartbeat adoption refusal, generation
+tombstone, lease-first uncertain cleanup refusal. See `npm test`.
+
+**Explicitly still pending live:** pool reuse across repeated implementer/reviewer
+tasks under real Herdr, queued-task cancellation without active interrupt in a
+live pane, cross-parent queue contention on a real socket, Linux. Process death
+without `session_shutdown` cannot guarantee cancel IPC.
 
 ## Roles
 

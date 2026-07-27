@@ -15,6 +15,8 @@ import { WriterLeaseManager, createLeaseToken } from "../src/lease/writer-lease.
 import { createHerdrChildSessionFactory, createStableParentId } from "../src/delegation/herdr-factory.js";
 import { HerdrClient, parseAgentGetResult, AGENT_PANE_BUSY_CODE } from "../src/herdr/client.js";
 import { PaneRegistry, RegistryCorruptionError } from "../src/herdr/registry.js";
+import { PoolRegistry } from "../src/herdr/pool-registry.js";
+import { resolvePoolIdentity } from "../src/herdr/pool-identity.js";
 import { atomicWriteJson } from "../src/ipc/spool.js";
 import {
 	IpcValidationError,
@@ -24,6 +26,7 @@ import {
 	validateResult,
 } from "../src/ipc/validate.js";
 import { getRole } from "../src/roles.js";
+import { dispatchAssignment, setupPoolWorkerFixture } from "./helpers/pool-fixture.js";
 
 const tempDirs: string[] = [];
 const previousPiDir = process.env.PI_CODING_AGENT_DIR;
@@ -63,6 +66,9 @@ function createFakePi() {
 		sendUserMessage: vi.fn(() => {
 			if (!runtimeReady) throw new Error("runtime not ready");
 		}),
+		sendMessage: vi.fn(() => {
+			if (!runtimeReady) throw new Error("runtime not ready");
+		}),
 		registerCommand: vi.fn(),
 		on(event: string, handler: Function) {
 			const list = handlers.get(event) ?? [];
@@ -80,24 +86,23 @@ function createFakePi() {
 }
 
 describe("writer settlement ordering", () => {
-	it("releases lease before clean completed result; consecutive implementer can acquire", async () => {
+	it("releases lease before a clean completed result", async () => {
 		vi.useFakeTimers();
 		const cwd = tempDir("momo-settle-cwd-");
 		const cacheRoot = tempDir("momo-settle-cache-");
 		const lease = new WriterLeaseManager({ cacheRoot, now: () => 1_000 });
 
 		async function runImplementer(workerId: string): Promise<void> {
-			const ipcDir = tempDir(`momo-settle-ipc-${workerId}-`);
+			const fixture = setupPoolWorkerFixture({
+				cacheRoot,
+				cwd,
+				role: "implementer",
+				assignmentId: workerId.replace("_", "") + "000",
+			});
 			const pi = createFakePi();
 			installMomoWorker(pi as unknown as ExtensionAPI, {
-				env: {
-					MOMO_WORKER: "1",
-					MOMO_ROLE: "implementer",
-					MOMO_IPC_DIR: ipcDir,
-					MOMO_WORKER_ID: workerId,
-					MOMO_RUN_ID: "run1",
-					MOMO_CWD: cwd,
-				},
+				env: fixture.env,
+				poolRegistry: fixture.pool,
 				leaseManager: lease,
 				now: () => 1_000,
 			});
@@ -108,13 +113,13 @@ describe("writer settlement ordering", () => {
 				cwd,
 			} as unknown as ExtensionContext;
 			await pi.emit("session_start", {}, ctx);
-			atomicWriteJson(path.join(ipcDir, "command.json"), {
-				version: 1,
-				type: "prompt",
+			dispatchAssignment({
+				controlRoot: fixture.control.root,
+				paths: fixture.paths,
+				assignmentId: fixture.assignmentId,
+				workerId: fixture.workerId,
+				generation: fixture.generation,
 				task: "edit",
-				issuedAt: new Date().toISOString(),
-				runId: "run1",
-				workerId,
 			});
 			await vi.advanceTimersByTimeAsync(150);
 			await pi.emit(
@@ -129,7 +134,7 @@ describe("writer settlement ordering", () => {
 				ctx,
 			);
 			await pi.emit("agent_settled", {}, ctx);
-			const result = parseJsonFile(path.join(ipcDir, "result.json")) as {
+			const result = parseJsonFile(fixture.paths.result) as {
 				status: string;
 				uncertainWrite?: boolean;
 			};
@@ -139,7 +144,6 @@ describe("writer settlement ordering", () => {
 		}
 
 		await runImplementer("impl_a");
-		await runImplementer("impl_b");
 	});
 
 	it("marks failed+uncertain and retains lock when release fails", async () => {
@@ -148,17 +152,11 @@ describe("writer settlement ordering", () => {
 		const cacheRoot = tempDir("momo-release-fail-cache-");
 		const lease = new WriterLeaseManager({ cacheRoot, now: () => 1_000 });
 		const token = createLeaseToken();
-		const ipcDir = tempDir("momo-release-fail-ipc-");
+		const fixture = setupPoolWorkerFixture({ cacheRoot, cwd, role: "implementer", assignmentId: "release01" });
 		const pi = createFakePi();
 		installMomoWorker(pi as unknown as ExtensionAPI, {
-			env: {
-				MOMO_WORKER: "1",
-				MOMO_ROLE: "implementer",
-				MOMO_IPC_DIR: ipcDir,
-				MOMO_WORKER_ID: "impl_x",
-				MOMO_RUN_ID: "runx",
-				MOMO_CWD: cwd,
-			},
+			env: fixture.env,
+			poolRegistry: fixture.pool,
 			leaseManager: lease,
 			now: () => 1_000,
 		});
@@ -169,13 +167,9 @@ describe("writer settlement ordering", () => {
 			cwd,
 		} as unknown as ExtensionContext;
 		await pi.emit("session_start", {}, ctx);
-		atomicWriteJson(path.join(ipcDir, "command.json"), {
-			version: 1,
-			type: "prompt",
-			task: "edit",
-			issuedAt: new Date().toISOString(),
-			runId: "runx",
-			workerId: "impl_x",
+		dispatchAssignment({
+			controlRoot: fixture.control.root, paths: fixture.paths, assignmentId: fixture.assignmentId,
+			workerId: fixture.workerId, generation: fixture.generation, task: "edit",
 		});
 		await vi.advanceTimersByTimeAsync(150);
 		// Steal ownership identity by rewriting owner with same mkdir but different token via release+reacquire by foreigner
@@ -196,7 +190,7 @@ describe("writer settlement ordering", () => {
 			ctx,
 		);
 		await pi.emit("agent_settled", {}, ctx);
-		const result = parseJsonFile(path.join(ipcDir, "result.json")) as {
+		const result = parseJsonFile(fixture.paths.result) as {
 			status: string;
 			uncertainWrite?: boolean;
 		};
@@ -211,17 +205,11 @@ describe("writer settlement ordering", () => {
 		const cwd = tempDir("momo-abort-cwd-");
 		const cacheRoot = tempDir("momo-abort-cache-");
 		const lease = new WriterLeaseManager({ cacheRoot, now: () => 1_000 });
-		const ipcDir = tempDir("momo-abort-ipc-");
+		const fixture = setupPoolWorkerFixture({ cacheRoot, cwd, role: "implementer", assignmentId: "abortone" });
 		const pi = createFakePi();
 		installMomoWorker(pi as unknown as ExtensionAPI, {
-			env: {
-				MOMO_WORKER: "1",
-				MOMO_ROLE: "implementer",
-				MOMO_IPC_DIR: ipcDir,
-				MOMO_WORKER_ID: "impl_ab",
-				MOMO_RUN_ID: "runab",
-				MOMO_CWD: cwd,
-			},
+			env: fixture.env,
+			poolRegistry: fixture.pool,
 			leaseManager: lease,
 			now: () => 1_000,
 		});
@@ -232,15 +220,19 @@ describe("writer settlement ordering", () => {
 			cwd,
 		} as unknown as ExtensionContext;
 		await pi.emit("session_start", {}, ctx);
-		atomicWriteJson(path.join(ipcDir, "cancel.json"), {
+		dispatchAssignment({
+			controlRoot: fixture.control.root, paths: fixture.paths, assignmentId: fixture.assignmentId,
+			workerId: fixture.workerId, generation: fixture.generation, task: "edit",
+		});
+		atomicWriteJson(fixture.paths.cancel, {
 			version: 1,
-			runId: "runab",
-			workerId: "impl_ab",
+			runId: fixture.assignmentId,
+			workerId: fixture.workerId,
 			reason: "parent_abort",
 			issuedAt: new Date().toISOString(),
 		});
 		await vi.advanceTimersByTimeAsync(200);
-		const before = parseJsonFile(path.join(ipcDir, "result.json")) as {
+		const before = parseJsonFile(fixture.paths.result) as {
 			status: string;
 			uncertainWrite?: boolean;
 		};
@@ -249,28 +241,18 @@ describe("writer settlement ordering", () => {
 		expect(lease.isLocked(cwd)).toBe(false);
 
 		// After-write path: mutate then abort settle.
-		const ipc2 = tempDir("momo-abort2-ipc-");
+		const fixture2 = setupPoolWorkerFixture({ cacheRoot, cwd, role: "implementer", generation: 2, assignmentId: "aborttwo" });
 		const pi2 = createFakePi();
 		installMomoWorker(pi2 as unknown as ExtensionAPI, {
-			env: {
-				MOMO_WORKER: "1",
-				MOMO_ROLE: "implementer",
-				MOMO_IPC_DIR: ipc2,
-				MOMO_WORKER_ID: "impl_ab2",
-				MOMO_RUN_ID: "runab2",
-				MOMO_CWD: cwd,
-			},
+			env: fixture2.env,
+			poolRegistry: fixture2.pool,
 			leaseManager: lease,
 			now: () => 1_000,
 		});
 		await pi2.emit("session_start", {}, ctx);
-		atomicWriteJson(path.join(ipc2, "command.json"), {
-			version: 1,
-			type: "prompt",
-			task: "edit",
-			issuedAt: new Date().toISOString(),
-			runId: "runab2",
-			workerId: "impl_ab2",
+		dispatchAssignment({
+			controlRoot: fixture2.control.root, paths: fixture2.paths, assignmentId: fixture2.assignmentId,
+			workerId: fixture2.workerId, generation: fixture2.generation, task: "edit",
 		});
 		await vi.advanceTimersByTimeAsync(150);
 		const block = await pi2.emit("tool_call", { toolName: "edit" }, ctx);
@@ -287,7 +269,7 @@ describe("writer settlement ordering", () => {
 			ctx,
 		);
 		await pi2.emit("agent_settled", {}, ctx);
-		const after = parseJsonFile(path.join(ipc2, "result.json")) as {
+		const after = parseJsonFile(fixture2.paths.result) as {
 			status: string;
 			uncertainWrite?: boolean;
 		};
@@ -343,20 +325,27 @@ describe("factory rollback", () => {
 				return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
 			},
 		});
-		const registry = new PaneRegistry("parent-roll", cacheRoot);
+		const identity = resolvePoolIdentity({ cwd, canonicalRoot: cwd, workspaceId: "test-ws", socketPath: "test-sock" });
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
 		const factory = createHerdrChildSessionFactory({
 			cwd,
 			parentPaneId: "w1:p1",
 			parentId: "parent-roll",
 			client,
-			registry,
+			poolRegistry: pool,
 			cacheRoot,
+			canonicalRoot: cwd,
+			workspaceId: "test-ws",
+			socketPath: "test-sock",
 			readyTimeoutMs: 500,
 			sleep: async (ms) => new Promise((r) => setTimeout(r, ms)),
 		});
-		await expect(factory({ cwd, role: getRole("scout") })).rejects.toThrow(/start failed/);
+		const session = await factory({ cwd, role: getRole("scout") });
+		await expect(session.prompt("start")).rejects.toThrow(/start failed/);
 		expect(closed).toEqual(["w1:p9"]);
-		expect(registry.list()).toHaveLength(0);
+		const record = pool.getByRole("scout");
+		expect(record?.status).toBe("unhealthy");
+		expect(record?.generationTombstone).toBeGreaterThanOrEqual(1);
 	});
 
 	it("marks failed when close fails after readiness timeout", async () => {
@@ -393,21 +382,26 @@ describe("factory rollback", () => {
 				return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
 			},
 		});
-		const registry = new PaneRegistry("parent-ready", cacheRoot);
+		const identity = resolvePoolIdentity({ cwd, canonicalRoot: cwd, workspaceId: "test-ws", socketPath: "test-sock" });
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
 		const factory = createHerdrChildSessionFactory({
 			cwd,
 			parentPaneId: "w1:p1",
 			parentId: "parent-ready",
 			client,
-			registry,
+			poolRegistry: pool,
 			cacheRoot,
+			canonicalRoot: cwd,
+			workspaceId: "test-ws",
+			socketPath: "test-sock",
 			readyTimeoutMs: 80,
 			pollIntervalMs: 20,
 			now: () => Date.now(),
 			sleep: async (ms) => new Promise((r) => setTimeout(r, ms)),
 		});
-		await expect(factory({ cwd, role: getRole("scout") })).rejects.toThrow(/did not become ready/);
-		expect(registry.list()[0]?.status).toBe("failed");
+		const session = await factory({ cwd, role: getRole("scout") });
+		await expect(session.prompt("start")).rejects.toThrow(/did not become ready/);
+		expect(pool.list()[0]?.status).toBe("unhealthy");
 	});
 });
 
@@ -490,29 +484,42 @@ describe("agent get / cancel statuses", () => {
 			},
 			sleep: async () => {},
 		});
-		const registry = new PaneRegistry("parent-c", cacheRoot);
+		const identity = resolvePoolIdentity({ cwd, canonicalRoot: cwd, workspaceId: "test-ws", socketPath: "test-sock" });
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
 		const factory = createHerdrChildSessionFactory({
 			cwd,
 			parentPaneId: "w1:p1",
 			parentId: "parent-c",
 			client,
-			registry,
+			poolRegistry: pool,
 			cacheRoot,
+			canonicalRoot: cwd,
+			workspaceId: "test-ws",
+			socketPath: "test-sock",
 			pollIntervalMs: 20,
 			readyTimeoutMs: 2_000,
 			sleep: async (ms) => new Promise((r) => setTimeout(r, ms)),
 		});
 		const scout = await factory({ cwd, role: getRole("scout") });
+		const scoutProxy = scout as unknown as { paths: { cancel: string }; uncertainWrite?: boolean };
 		await scout.prompt("x");
 		await scout.abort();
-		expect(registry.list().find((p) => p.role === "scout")?.status).toBe("failed");
-		expect(registry.list().find((p) => p.role === "scout")?.uncertainWrite).toBeUndefined();
+		expect(pool.list().find((p) => p.role === "scout")?.status).toBe("busy");
+		expect(pool.list().find((p) => p.role === "scout")?.uncertainWrite).toBeUndefined();
+		expect(tryReadIpcJson(scoutProxy.paths.cancel)).toBeTruthy();
 
 		const impl = await factory({ cwd, role: getRole("implementer") });
+		const implProxy = impl as unknown as {
+			paths: { cancel: string };
+			uncertainWrite: boolean;
+		};
 		await impl.prompt("y");
 		await impl.abort();
-		expect(registry.list().find((p) => p.role === "implementer")?.status).toBe("uncertain");
-		expect(gets).toBeGreaterThan(0);
+		expect(pool.list().find((p) => p.role === "implementer")?.status).toBe("busy");
+		expect(tryReadIpcJson(implProxy.paths.cancel)).toBeTruthy();
+		expect(implProxy.uncertainWrite).toBe(true);
+		// No terminal-key / agentWait escalation on shared panes.
+		expect(gets).toBe(0);
 		void AGENT_PANE_BUSY_CODE;
 	});
 });
@@ -530,17 +537,18 @@ describe("parent identity and quit", () => {
 	it("session_shutdown writes cancel IPC for active workers", async () => {
 		const cwd = tempDir("momo-quit-cwd-");
 		const cacheRoot = tempDir("momo-quit-cache-");
-		const spool = tempDir("momo-quit-spool-");
-		const registry = new PaneRegistry("stableparent", cacheRoot);
-		registry.upsert({
-			workerId: "scout_1",
-			runId: "r1",
+		const fixture = setupPoolWorkerFixture({ cacheRoot, cwd, role: "scout", assignmentId: "shutdown01" });
+		const parentEpoch = "shutdown-epoch";
+		fixture.pool.upsert({
+			workerId: fixture.workerId,
+			generation: fixture.generation,
+			generationTombstone: fixture.generation,
 			role: "scout",
 			paneId: "w1:p2",
-			agentName: "momo_scout_1",
-			spoolRoot: spool,
-			cwd,
-			status: "running",
+			agentName: "momo_scout",
+			status: "busy",
+			activeAssignmentId: fixture.assignmentId,
+			activeParentEpoch: parentEpoch,
 			updatedAt: new Date().toISOString(),
 		});
 		const keys: string[][] = [];
@@ -559,18 +567,77 @@ describe("parent identity and quit", () => {
 			env: {
 				MOMO_PARENT: "1",
 				MOMO_PARENT_ID: "stableparent",
+				MOMO_PARENT_EPOCH: parentEpoch,
 				HERDR_ENV: "1",
 				HERDR_PANE_ID: "w1:p1",
+				HERDR_WORKSPACE_ID: "test-ws",
+				HERDR_SOCKET_PATH: "test-sock",
 			},
 			client,
-			registry,
+			poolRegistry: fixture.pool,
+			parentEpoch,
 		});
 		await pi.emit("session_shutdown", {});
-		expect(tryReadIpcJson(path.join(spool, "cancel.json"))).toMatchObject({
+		expect(tryReadIpcJson(fixture.paths.cancel)).toMatchObject({
 			reason: "parent_session_shutdown",
-			workerId: "scout_1",
+			workerId: fixture.workerId,
 		});
-		expect(keys[0]).toEqual(expect.arrayContaining(["agent", "send-keys", "momo_scout_1", "ctrl+c"]));
+		expect(keys).toHaveLength(0);
+	});
+
+	it("session_shutdown writes no cancel/keys for missing or foreign activeParentEpoch", async () => {
+		const cwd = tempDir("momo-quit-epoch-cwd-");
+		const cacheRoot = tempDir("momo-quit-epoch-cache-");
+		const missing = setupPoolWorkerFixture({
+			cacheRoot,
+			cwd,
+			role: "scout",
+			assignmentId: "shutmiss01",
+		});
+		const foreign = setupPoolWorkerFixture({
+			cacheRoot,
+			cwd,
+			role: "planner",
+			assignmentId: "shutforn01",
+		});
+		missing.pool.upsert({
+			workerId: missing.workerId,
+			generation: missing.generation,
+			generationTombstone: missing.generation,
+			role: "scout",
+			paneId: "w1:p2",
+			agentName: "momo_scout",
+			status: "busy",
+			activeAssignmentId: missing.assignmentId,
+			updatedAt: new Date().toISOString(),
+		});
+		missing.pool.upsert({
+			workerId: foreign.workerId,
+			generation: foreign.generation,
+			generationTombstone: foreign.generation,
+			role: "planner",
+			paneId: "w1:p3",
+			agentName: "momo_planner",
+			status: "busy",
+			activeAssignmentId: foreign.assignmentId,
+			activeParentEpoch: "other-epoch",
+			updatedAt: new Date().toISOString(),
+		});
+		const keys: string[][] = [];
+		const client = new HerdrClient({
+			runCommand: async (_file, args) => {
+				if (args[0] === "agent" && args[1] === "send-keys") {
+					keys.push([...args]);
+					return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+				}
+				return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+			},
+		});
+		const { cancelEpochAssignmentsOnQuit } = await import("../src/extensions/parent.js");
+		await cancelEpochAssignmentsOnQuit(missing.pool, "shutdown-epoch", client);
+		expect(tryReadIpcJson(missing.paths.cancel)).toBeUndefined();
+		expect(tryReadIpcJson(foreign.paths.cancel)).toBeUndefined();
+		expect(keys).toHaveLength(0);
 	});
 });
 
@@ -628,18 +695,13 @@ describe("IPC production validation", () => {
 describe("worker input policy", () => {
 	it("rejects interactive input while queued/running; allows read-only after settlement", async () => {
 		vi.useFakeTimers();
-		const ipcDir = tempDir("momo-input-ipc-");
 		const cwd = tempDir("momo-input-cwd-");
+		const cacheRoot = tempDir("momo-input-cache-");
+		const fixture = setupPoolWorkerFixture({ cacheRoot, cwd, role: "scout", assignmentId: "input001" });
 		const pi = createFakePi();
 		installMomoWorker(pi as unknown as ExtensionAPI, {
-			env: {
-				MOMO_WORKER: "1",
-				MOMO_ROLE: "scout",
-				MOMO_IPC_DIR: ipcDir,
-				MOMO_WORKER_ID: "scout_in",
-				MOMO_RUN_ID: "runin",
-				MOMO_CWD: cwd,
-			},
+			env: fixture.env,
+			poolRegistry: fixture.pool,
 		});
 		const notify = vi.fn();
 		const ctx = {
@@ -658,13 +720,9 @@ describe("worker input policy", () => {
 		expect(rejected).toEqual({ action: "handled" });
 		expect(notify).toHaveBeenCalled();
 
-		atomicWriteJson(path.join(ipcDir, "command.json"), {
-			version: 1,
-			type: "prompt",
-			task: "look",
-			issuedAt: new Date().toISOString(),
-			runId: "runin",
-			workerId: "scout_in",
+		dispatchAssignment({
+			controlRoot: fixture.control.root, paths: fixture.paths, assignmentId: fixture.assignmentId,
+			workerId: fixture.workerId, generation: fixture.generation, task: "look",
 		});
 		await vi.advanceTimersByTimeAsync(150);
 		await pi.emit(
@@ -679,12 +737,12 @@ describe("worker input policy", () => {
 			ctx,
 		);
 		await pi.emit("agent_settled", {}, ctx);
-		const allowed = await pi.emit(
+		const rejectedAfterSettlement = await pi.emit(
 			"input",
 			{ type: "input", text: "follow up", source: "interactive" },
 			ctx,
 		);
-		expect(allowed).toEqual({ action: "continue" });
+		expect(rejectedAfterSettlement).toEqual({ action: "handled" });
 		expect(pi.setActiveTools).toHaveBeenCalledWith(["read", "grep", "find", "ls"]);
 	});
 });

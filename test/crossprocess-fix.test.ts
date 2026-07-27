@@ -14,6 +14,8 @@ import { installMomoParent, reconcileRegistry } from "../src/extensions/parent.j
 import { installMomoWorker } from "../src/extensions/worker-runtime.js";
 import { HerdrClient } from "../src/herdr/client.js";
 import { PaneRegistry, selectClosablePanes } from "../src/herdr/registry.js";
+import { PoolRegistry } from "../src/herdr/pool-registry.js";
+import { resolvePoolIdentity } from "../src/herdr/pool-identity.js";
 import {
 	appendEvent,
 	atomicWriteJson,
@@ -29,6 +31,7 @@ import {
 } from "../src/lease/writer-lease.js";
 import { createHerdrChildSessionFactory } from "../src/delegation/herdr-factory.js";
 import { getRole } from "../src/roles.js";
+import { dispatchAssignment, setupPoolWorkerFixture } from "./helpers/pool-fixture.js";
 
 const tempDirs: string[] = [];
 const previousPiDir = process.env.PI_CODING_AGENT_DIR;
@@ -66,6 +69,7 @@ function createFakePi() {
 		registerTool: vi.fn(),
 		setActiveTools: vi.fn(),
 		sendUserMessage: vi.fn(),
+		sendMessage: vi.fn(),
 		registerCommand: vi.fn(
 			(name: string, def: { handler: (args: string, ctx: unknown) => Promise<void> }) => {
 				commands.set(name, def);
@@ -214,6 +218,15 @@ describe("parent reconciliation from result.json", () => {
 		const cwd = tempDir("momo-relaunch-cwd-");
 		const cacheRoot = tempDir("momo-relaunch-cache-");
 		const spool = tempDir("momo-relaunch-spool-");
+		const fixture = setupPoolWorkerFixture({ cacheRoot, cwd, role: "planner", assignmentId: "relaunch01" });
+		const parentEpoch = "relaunch-epoch";
+		fixture.pool.upsert({
+			...fixture.pool.getByRole("planner")!,
+			status: "busy",
+			activeAssignmentId: fixture.assignmentId,
+			activeParentEpoch: parentEpoch,
+			updatedAt: new Date().toISOString(),
+		});
 		const registry = new PaneRegistry("stable-relaunch", cacheRoot);
 		registry.upsert({
 			workerId: "planner_1",
@@ -239,20 +252,26 @@ describe("parent reconciliation from result.json", () => {
 			env: {
 				MOMO_PARENT: "1",
 				MOMO_PARENT_ID: "stable-relaunch",
+				MOMO_PARENT_EPOCH: parentEpoch,
 				HERDR_ENV: "1",
 				HERDR_PANE_ID: "w1:p1",
+				HERDR_WORKSPACE_ID: "test-ws",
+				HERDR_SOCKET_PATH: "test-sock",
 			},
 			client,
 			registry,
+			poolRegistry: fixture.pool,
+			parentEpoch,
 		});
 		await pi.emit("session_shutdown", {});
-		expect(tryReadIpcJson(path.join(spool, "cancel.json"))).toBeTruthy();
+		expect(tryReadIpcJson(fixture.paths.cancel)).toBeTruthy();
 
 		atomicWriteJson(path.join(spool, "result.json"), baseResult({
 			workerId: "planner_1",
 			status: "aborted",
 			stopReason: "aborted",
 		}));
+		await reconcileRegistry(registry, client, {});
 
 		const notifies: string[] = [];
 		await pi.emit("session_start", {}, {
@@ -293,7 +312,7 @@ describe("NDJSON fail-closed", () => {
 		installFakeHerdrExtension();
 		const cacheRoot = tempDir("momo-evt-cache-");
 		const cwd = tempDir("momo-evt-cwd-");
-		let ipcDir = "";
+		let controlDir = "";
 		let workerId = "";
 		let runId = "";
 		const calls: string[][] = [];
@@ -302,8 +321,8 @@ describe("NDJSON fail-closed", () => {
 				calls.push([...args]);
 				if (args[0] === "pane" && args[1] === "split") {
 					const envArgs = args.filter((a, i) => args[i - 1] === "--env");
-					ipcDir =
-						envArgs.find((v) => v.startsWith("MOMO_IPC_DIR="))?.slice("MOMO_IPC_DIR=".length) ??
+					controlDir =
+						envArgs.find((v) => v.startsWith("MOMO_CONTROL_DIR="))?.slice("MOMO_CONTROL_DIR=".length) ??
 						"";
 					workerId =
 						envArgs
@@ -312,7 +331,7 @@ describe("NDJSON fail-closed", () => {
 					runId =
 						envArgs.find((v) => v.startsWith("MOMO_RUN_ID="))?.slice("MOMO_RUN_ID=".length) ??
 						"";
-					atomicWriteJson(path.join(ipcDir, "ready.json"), {
+					atomicWriteJson(path.join(controlDir, "ready.json"), {
 						version: 1,
 						runId,
 						workerId,
@@ -342,34 +361,39 @@ describe("NDJSON fail-closed", () => {
 				return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
 			},
 		});
-		const registry = new PaneRegistry("parent-evt", cacheRoot);
+		const identity = resolvePoolIdentity({ cwd, canonicalRoot: cwd, workspaceId: "test-ws", socketPath: "test-sock" });
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
 		const factory = createHerdrChildSessionFactory({
 			cwd,
 			parentPaneId: "w1:p1",
 			parentId: "parent-evt",
 			client,
-			registry,
+			poolRegistry: pool,
 			cacheRoot,
+			canonicalRoot: cwd,
+			workspaceId: "test-ws",
+			socketPath: "test-sock",
 			pollIntervalMs: 20,
 			readyTimeoutMs: 2_000,
 			sleep: async (ms) => new Promise((r) => setTimeout(r, ms)),
 		});
 		const session = await factory({ cwd, role: getRole("scout") });
-		writeFileSync(path.join(ipcDir, "events.ndjson"), "{broken\n", { mode: 0o600 });
+		const proxy = session as unknown as { paths: { events: string; result: string; cancel: string }; assignmentId: string; workerId: string };
 		await session.prompt("x");
+		writeFileSync(proxy.paths.events, "{broken\n", { mode: 0o600 });
 		// Valid result must not override prior event corruption settlement.
-		atomicWriteJson(path.join(ipcDir, "result.json"), baseResult({ workerId, runId }));
+		atomicWriteJson(proxy.paths.result, baseResult({ workerId: proxy.workerId, runId: proxy.assignmentId }));
 		await expect(session.agent!.waitForIdle()).rejects.toThrow(/Malformed|event/i);
-		expect(registry.list()[0]?.status).toBe("failed");
-		expect(tryReadIpcJson(path.join(ipcDir, "cancel.json"))).toBeTruthy();
-		expect(calls.some((args) => args[0] === "agent" && args[1] === "send-keys")).toBe(true);
+		expect(pool.list()[0]?.status).toBe("unhealthy");
+		expect(tryReadIpcJson(proxy.paths.cancel)).toBeTruthy();
+		expect(calls.some((args) => args[0] === "agent" && args[1] === "send-keys")).toBe(false);
 	});
 
 	it("supervises and stops a worker before a result-timeout returns", async () => {
 		installFakeHerdrExtension();
 		const cacheRoot = tempDir("momo-timeout-cache-");
 		const cwd = tempDir("momo-timeout-cwd-");
-		let ipcDir = "";
+		let controlDir = "";
 		let workerId = "";
 		let runId = "";
 		const calls: string[][] = [];
@@ -378,10 +402,10 @@ describe("NDJSON fail-closed", () => {
 				calls.push([...args]);
 				if (args[0] === "pane" && args[1] === "split") {
 					const envArgs = args.filter((_a, i) => args[i - 1] === "--env");
-					ipcDir = envArgs.find((v) => v.startsWith("MOMO_IPC_DIR="))?.slice(13) ?? "";
+					controlDir = envArgs.find((v) => v.startsWith("MOMO_CONTROL_DIR="))?.slice("MOMO_CONTROL_DIR=".length) ?? "";
 					workerId = envArgs.find((v) => v.startsWith("MOMO_WORKER_ID="))?.slice(15) ?? "";
 					runId = envArgs.find((v) => v.startsWith("MOMO_RUN_ID="))?.slice(12) ?? "";
-					atomicWriteJson(path.join(ipcDir, "ready.json"), {
+					atomicWriteJson(path.join(controlDir, "ready.json"), {
 						version: 1, runId, workerId, readyAt: new Date().toISOString(),
 					});
 					return { code: 0, stdout: JSON.stringify({ id: "s", result: { pane: { pane_id: "w1:p8" } } }), stderr: "" };
@@ -395,16 +419,20 @@ describe("NDJSON fail-closed", () => {
 				return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
 			},
 		});
+		const identity = resolvePoolIdentity({ cwd, canonicalRoot: cwd, workspaceId: "test-ws", socketPath: "test-sock" });
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
 		const factory = createHerdrChildSessionFactory({
 			cwd, parentPaneId: "w1:p1", parentId: "parent-timeout", client,
-			cacheRoot, pollIntervalMs: 10, readyTimeoutMs: 1_000, resultTimeoutMs: 40,
+			poolRegistry: pool, cacheRoot, canonicalRoot: cwd, workspaceId: "test-ws", socketPath: "test-sock",
+			pollIntervalMs: 10, readyTimeoutMs: 1_000, resultTimeoutMs: 40,
 			sleep: async (ms) => new Promise((r) => setTimeout(r, ms)),
 		});
 		const session = await factory({ cwd, role: getRole("implementer") });
+		const proxy = session as unknown as { paths: { cancel: string } };
 		await session.prompt("wait then edit");
 		await expect(session.agent!.waitForIdle()).rejects.toMatchObject({ uncertainWrite: true });
-		expect(tryReadIpcJson(path.join(ipcDir, "cancel.json"))).toBeTruthy();
-		expect(calls.some((args) => args[0] === "agent" && args[1] === "send-keys")).toBe(true);
+		expect(tryReadIpcJson(proxy.paths.cancel)).toBeTruthy();
+		expect(calls.some((args) => args[0] === "agent" && args[1] === "send-keys")).toBe(false);
 		expect((session as unknown as { uncertainWrite: boolean }).uncertainWrite).toBe(true);
 	});
 });
@@ -415,17 +443,11 @@ describe("lease release race with foreign acquirer", () => {
 		const cwd = tempDir("momo-race-cwd-");
 		const cacheRoot = tempDir("momo-race-cache-");
 		const lease = new WriterLeaseManager({ cacheRoot, now: () => 1_000 });
-		const ipcDir = tempDir("momo-race-ipc-");
+		const fixture = setupPoolWorkerFixture({ cacheRoot, cwd, role: "implementer", assignmentId: "race0001" });
 		const pi = createFakePi();
 		installMomoWorker(pi as unknown as ExtensionAPI, {
-			env: {
-				MOMO_WORKER: "1",
-				MOMO_ROLE: "implementer",
-				MOMO_IPC_DIR: ipcDir,
-				MOMO_WORKER_ID: "impl_first",
-				MOMO_RUN_ID: "run1",
-				MOMO_CWD: cwd,
-			},
+			env: fixture.env,
+			poolRegistry: fixture.pool,
 			leaseManager: lease,
 			now: () => 1_000,
 			sleep: async () => {},
@@ -438,13 +460,9 @@ describe("lease release race with foreign acquirer", () => {
 			cwd,
 		} as unknown as ExtensionContext;
 		await pi.emit("session_start", {}, ctx);
-		atomicWriteJson(path.join(ipcDir, "command.json"), {
-			version: 1,
-			type: "prompt",
-			task: "edit",
-			issuedAt: new Date().toISOString(),
-			runId: "run1",
-			workerId: "impl_first",
+		dispatchAssignment({
+			controlRoot: fixture.control.root, paths: fixture.paths, assignmentId: fixture.assignmentId,
+			workerId: fixture.workerId, generation: fixture.generation, task: "edit",
 		});
 		await vi.advanceTimersByTimeAsync(150);
 
@@ -467,7 +485,7 @@ describe("lease release race with foreign acquirer", () => {
 			ctx,
 		);
 		await pi.emit("agent_settled", {}, ctx);
-		const result = parseJsonFile(path.join(ipcDir, "result.json")) as {
+		const result = parseJsonFile(fixture.paths.result) as {
 			status: string;
 			uncertainWrite?: boolean;
 		};
@@ -543,18 +561,18 @@ describe("cross-parent implementer wait/serialize", () => {
 		const lease = new WriterLeaseManager({ cacheRoot });
 		const holderToken = createLeaseToken();
 		lease.acquire(cwd, "holder", holderToken);
-		const ipcDir = tempDir("momo-wsuccess-ipc-");
+		const fixture = setupPoolWorkerFixture({ cacheRoot, cwd, role: "implementer", assignmentId: "success01" });
 		const pi = createFakePi();
 		installMomoWorker(pi as unknown as ExtensionAPI, {
-			env: { MOMO_WORKER: "1", MOMO_ROLE: "implementer", MOMO_IPC_DIR: ipcDir,
-				MOMO_WORKER_ID: "impl_success", MOMO_RUN_ID: "runs", MOMO_CWD: cwd },
+			env: fixture.env,
+			poolRegistry: fixture.pool,
 			leaseManager: lease, leaseWaitMs: 2_000,
 		});
 		const ctx = { hasUI: true, isIdle: () => true, abort: vi.fn(), cwd } as unknown as ExtensionContext;
 		await pi.emit("session_start", {}, ctx);
-		atomicWriteJson(path.join(ipcDir, "command.json"), {
-			version: 1, type: "prompt", task: "edit", issuedAt: new Date().toISOString(),
-			runId: "runs", workerId: "impl_success",
+		dispatchAssignment({
+			controlRoot: fixture.control.root, paths: fixture.paths, assignmentId: fixture.assignmentId,
+			workerId: fixture.workerId, generation: fixture.generation, task: "edit",
 		});
 		await new Promise((r) => setTimeout(r, 150));
 		const before = (pi.setActiveTools as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0] as string[];
@@ -566,7 +584,7 @@ describe("cross-parent implementer wait/serialize", () => {
 		expect(after).toContain("bash");
 		await pi.emit("message_end", { message: { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" } }, ctx);
 		await pi.emit("agent_settled", {}, ctx);
-		expect((parseJsonFile(path.join(ipcDir, "result.json")) as { status: string }).status).toBe("completed");
+		expect((parseJsonFile(fixture.paths.result) as { status: string }).status).toBe("completed");
 		expect(lease.isLocked(cwd)).toBe(false);
 	});
 
@@ -587,26 +605,20 @@ describe("cross-parent implementer wait/serialize", () => {
 		const holderToken = createLeaseToken();
 		lease.acquire(cwd, "holder", holderToken);
 
-		const ipcDir = tempDir("momo-wwait-ipc-");
+		const fixture = setupPoolWorkerFixture({ cacheRoot, cwd, role: "implementer", assignmentId: "waiting01" });
 		const pi = createFakePi();
 		installMomoWorker(pi as unknown as ExtensionAPI, {
-			env: {
-				MOMO_WORKER: "1",
-				MOMO_ROLE: "implementer",
-				MOMO_IPC_DIR: ipcDir,
-				MOMO_WORKER_ID: "impl_wait",
-				MOMO_RUN_ID: "runw",
-				MOMO_CWD: cwd,
-			},
+			env: fixture.env,
+			poolRegistry: fixture.pool,
 			leaseManager: lease,
 			now: () => now,
 			sleep: async (ms) => {
 				await new Promise((r) => setImmediate(r));
 				if (allowCancel) {
-					atomicWriteJson(path.join(ipcDir, "cancel.json"), {
+					atomicWriteJson(fixture.paths.cancel, {
 						version: 1,
-						runId: "runw",
-						workerId: "impl_wait",
+						runId: fixture.assignmentId,
+						workerId: fixture.workerId,
 						reason: "parent_abort",
 						issuedAt: new Date().toISOString(),
 					});
@@ -622,13 +634,9 @@ describe("cross-parent implementer wait/serialize", () => {
 			cwd,
 		} as unknown as ExtensionContext;
 		await pi.emit("session_start", {}, ctx);
-		atomicWriteJson(path.join(ipcDir, "command.json"), {
-			version: 1,
-			type: "prompt",
-			task: "edit",
-			issuedAt: new Date().toISOString(),
-			runId: "runw",
-			workerId: "impl_wait",
+		dispatchAssignment({
+			controlRoot: fixture.control.root, paths: fixture.paths, assignmentId: fixture.assignmentId,
+			workerId: fixture.workerId, generation: fixture.generation, task: "edit",
 		});
 
 		await new Promise((r) => setTimeout(r, 120));
@@ -639,7 +647,7 @@ describe("cross-parent implementer wait/serialize", () => {
 			| string[]
 			| undefined;
 		expect(lastTools?.includes("bash")).toBeFalsy();
-		const result = parseJsonFile(path.join(ipcDir, "result.json")) as {
+		const result = parseJsonFile(fixture.paths.result) as {
 			status: string;
 			uncertainWrite?: boolean;
 		};
@@ -652,17 +660,22 @@ describe("cross-parent implementer wait/serialize", () => {
 describe("worker cancellation IPC fail-closed", () => {
 	it("settles failed instead of ignoring corrupt cancellation IPC", async () => {
 		const cwd = tempDir("momo-badcancel-cwd-");
-		const ipcDir = tempDir("momo-badcancel-ipc-");
+		const cacheRoot = tempDir("momo-badcancel-cache-");
+		const fixture = setupPoolWorkerFixture({ cacheRoot, cwd, role: "scout", assignmentId: "badcan01" });
 		const pi = createFakePi();
 		installMomoWorker(pi as unknown as ExtensionAPI, {
-			env: { MOMO_WORKER: "1", MOMO_ROLE: "scout", MOMO_IPC_DIR: ipcDir,
-				MOMO_WORKER_ID: "scout_badcancel", MOMO_RUN_ID: "runbad", MOMO_CWD: cwd },
+			env: fixture.env,
+			poolRegistry: fixture.pool,
 		});
 		const ctx = { hasUI: true, isIdle: () => true, abort: vi.fn(), cwd } as unknown as ExtensionContext;
 		await pi.emit("session_start", {}, ctx);
-		atomicWriteJson(path.join(ipcDir, "cancel.json"), { version: 1, bad: true });
+		dispatchAssignment({
+			controlRoot: fixture.control.root, paths: fixture.paths, assignmentId: fixture.assignmentId,
+			workerId: fixture.workerId, generation: fixture.generation, task: "look",
+		});
+		atomicWriteJson(fixture.paths.cancel, { version: 1, bad: true });
 		await new Promise((r) => setTimeout(r, 180));
-		const result = parseJsonFile(path.join(ipcDir, "result.json")) as { status: string; errorMessage?: string };
+		const result = parseJsonFile(fixture.paths.result) as { status: string; errorMessage?: string };
 		expect(result.status).toBe("failed");
 		expect(result.errorMessage).toMatch(/cancel/i);
 		expect(pi.sendUserMessage).not.toHaveBeenCalled();
@@ -673,15 +686,15 @@ describe("force cleanup recovery retention", () => {
 	it("retains registry with paneClosed/recoveryRequired when lease release fails", async () => {
 		const cwd = tempDir("momo-force-cwd-");
 		const cacheRoot = tempDir("momo-force-cache-");
-		const registry = new PaneRegistry("parent-force", cacheRoot);
-		registry.upsert({
-			workerId: "impl_u",
-			runId: "r1",
+		const fixture = setupPoolWorkerFixture({ cacheRoot, cwd, role: "implementer" });
+		const pool = fixture.pool;
+		pool.upsert({
+			workerId: fixture.workerId,
+			generation: fixture.generation,
+			generationTombstone: fixture.generation,
 			role: "implementer",
 			paneId: "w1:p9",
-			agentName: "momo_impl_u",
-			spoolRoot: tempDir("momo-force-spool-"),
-			cwd,
+			agentName: "momo_implementer",
 			status: "uncertain",
 			uncertainWrite: true,
 			updatedAt: new Date().toISOString(),
@@ -698,6 +711,8 @@ describe("force cleanup recovery retention", () => {
 				MOMO_PARENT_ID: "parent-force",
 				HERDR_ENV: "1",
 				HERDR_PANE_ID: "w1:p1",
+				HERDR_WORKSPACE_ID: "test-ws",
+				HERDR_SOCKET_PATH: "test-sock",
 			},
 			client: new HerdrClient({
 				runCommand: async (_file, args) => {
@@ -708,12 +723,12 @@ describe("force cleanup recovery retention", () => {
 					return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
 				},
 			}),
-			registry,
+			poolRegistry: pool,
 			leaseManager: leases,
 		});
 		const command = pi.commands.get("momo-cleanup");
 		expect(command).toBeTruthy();
-		expect(selectClosablePanes(registry.list(), { force: true }).closable).toHaveLength(1);
+		expect(pool.list()).toHaveLength(1);
 		// Pi command handlers receive the args string after the command name.
 		await command!.handler("--force", {
 			ui: {
@@ -721,18 +736,14 @@ describe("force cleanup recovery retention", () => {
 				notify: (m: string) => notifies.push(m),
 			},
 		} as never);
+		// Lease-first: refuse before close when owner is missing/mismatched.
 		expect(notifies.join("\n"), `notifies=${JSON.stringify(notifies)}`).toMatch(
-			/lease not released|registry retained|recoveryRequired/i,
+			/refused uncertain|lease owner unavailable|mismatched/i,
 		);
-		expect(closed, `closed=${JSON.stringify(closed)}; notifies=${JSON.stringify(notifies)}`).toEqual([
-			"w1:p9",
-		]);
-		const retained = registry.list()[0];
-		expect(retained?.paneClosed).toBe(true);
-		expect(retained?.recoveryRequired).toBe(true);
+		expect(closed).toEqual([]);
+		const retained = pool.getByRole("implementer");
 		expect(retained?.status).toBe("uncertain");
-		const again = selectClosablePanes(registry.list(), { force: true });
-		expect(again.closable).toHaveLength(0);
+		expect(retained?.paneClosed).not.toBe(true);
 	});
 });
 
