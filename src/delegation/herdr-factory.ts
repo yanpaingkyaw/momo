@@ -37,6 +37,7 @@ import {
 	withRoleLock,
 	withRoleLockAsync,
 } from "../herdr/role-queue.js";
+import { completeCleanAssignmentLocked } from "../herdr/terminal-transition.js";
 import {
 	atomicWriteJson,
 	DEFAULT_HEARTBEAT_STALE_MS,
@@ -345,17 +346,92 @@ class AssignmentProxy implements ChildSession {
 	}
 
 	/**
+	 * Finalize a validated durable result under the role lock, then settle.
+	 * Clean completed/failed/aborted advances FIFO/idle via
+	 * completeCleanAssignmentLocked. Uncertain results and existing
+	 * unhealthy/uncertain registry fences retain evidence (no advance).
+	 * Must run under the role lock.
+	 */
+	private finalizeAuthoritativeResultLocked(result: IpcResult): void {
+		if (this.settled) return;
+		const record = this.runtime.pool.getByRole(this.role.name);
+		const owns =
+			!!record &&
+			record.generation === this.generation &&
+			record.workerId === this.workerId;
+
+		if (owns && (record.status === "unhealthy" || record.status === "uncertain")) {
+			// Protocol/parent fence wins: settle in-memory only.
+			this.settle(result);
+			return;
+		}
+
+		if (result.uncertainWrite === true) {
+			if (
+				owns &&
+				record.activeAssignmentId === this.assignmentId &&
+				(record.status === "busy" || record.status === "blocked")
+			) {
+				this.runtime.pool.upsert({
+					...record,
+					status: "uncertain",
+					uncertainWrite: true,
+					activeAssignmentId: this.assignmentId,
+					...(record.activeParentEpoch !== undefined
+						? { activeParentEpoch: record.activeParentEpoch }
+						: {}),
+					generationTombstone: Math.max(record.generationTombstone, this.generation),
+					updatedAt: new Date(this.runtime.now()).toISOString(),
+				});
+			}
+			this.settle(result);
+			return;
+		}
+
+		// Clean durable result: advance A→B / idle under lock before settle so
+		// worker death after result-before-claim still drains FIFO.
+		if (owns && record.activeAssignmentId === this.assignmentId) {
+			completeCleanAssignmentLocked({
+				pool: this.runtime.pool,
+				role: this.role.name,
+				workerId: this.workerId,
+				generation: this.generation,
+				finishedAssignmentId: this.assignmentId,
+				now: this.runtime.now,
+			});
+		}
+		this.settle(result);
+	}
+
+	/**
 	 * Authoritative result.json settle helper shared by the initial poll read,
 	 * event-parse race recovery, and heartbeat pre-failure checks.
+	 * Acquires the role lock. Prefer trySettleAuthoritativeResultLocked when
+	 * already holding the lock (e.g. stopAndSettleFailure commit path).
 	 * @returns true when a valid matching result was settled
 	 * @returns false when no result is present
 	 * @throws when result.json exists but fails validation (fail closed)
 	 */
 	private trySettleAuthoritativeResult(): boolean {
 		if (this.settled) return true;
+		return withRoleLock(
+			this.runtime.pool.poolRoot,
+			this.role.name,
+			() => this.trySettleAuthoritativeResultLocked(),
+			{ now: this.runtime.now, sleep: this.runtime.sleep },
+		);
+	}
+
+	/** Must run under the role lock. */
+	private trySettleAuthoritativeResultLocked(): boolean {
+		if (this.settled) return true;
 		const resultRaw = ipcValidate.tryReadIpcJson(this.paths.result);
 		if (!resultRaw) return false;
-		this.settle(validateResult(resultRaw, assignmentIdentity(this.assignmentId, this.workerId)));
+		const result = validateResult(
+			resultRaw,
+			assignmentIdentity(this.assignmentId, this.workerId),
+		);
+		this.finalizeAuthoritativeResultLocked(result);
 		return true;
 	}
 
@@ -539,7 +615,6 @@ class AssignmentProxy implements ChildSession {
 		this.stoppingAfterFailure = true;
 		this.stopPolling();
 		let activeFailure = false;
-		let adoptedResult: IpcResult | undefined;
 		let invalidResultMessage: string | undefined;
 		try {
 			// Assignment-specific cancel IPC only — never send terminal keys on a shared pane.
@@ -560,42 +635,31 @@ class AssignmentProxy implements ChildSession {
 				this.role.name,
 				async () => {
 					// Commit-point recheck: durable result wins over failure fencing.
-					const resultRaw = ipcValidate.tryReadIpcJson(this.paths.result);
-					if (resultRaw) {
-						try {
-							adoptedResult = validateResult(
-								resultRaw,
-								assignmentIdentity(this.assignmentId, this.workerId),
-							);
+					// Finalize under this lock (no reentrant withRoleLock).
+					try {
+						if (this.trySettleAuthoritativeResultLocked()) {
 							return;
+						}
+					} catch (resultError) {
+						invalidResultMessage =
+							resultError instanceof IpcValidationError || resultError instanceof Error
+								? resultError.message
+								: String(resultError);
+						// Invalid result fails closed — continue to registry failure mutation.
+					}
+
+					if (stopAndSettleCommitHook) {
+						await stopAndSettleCommitHook();
+						// Worker may have published result while we yielded — recheck.
+						try {
+							if (this.trySettleAuthoritativeResultLocked()) {
+								return;
+							}
 						} catch (resultError) {
 							invalidResultMessage =
 								resultError instanceof IpcValidationError || resultError instanceof Error
 									? resultError.message
 									: String(resultError);
-							// Invalid result fails closed — continue to registry failure mutation.
-						}
-					}
-
-					if (stopAndSettleCommitHook) {
-						await stopAndSettleCommitHook();
-						// Worker may have published result while we yielded under the lock
-						// only if the hook released/reordered — recheck again after barrier.
-						const racedRaw = ipcValidate.tryReadIpcJson(this.paths.result);
-						if (racedRaw) {
-							try {
-								adoptedResult = validateResult(
-									racedRaw,
-									assignmentIdentity(this.assignmentId, this.workerId),
-								);
-								return;
-							} catch (resultError) {
-								invalidResultMessage =
-									resultError instanceof IpcValidationError ||
-									resultError instanceof Error
-										? resultError.message
-										: String(resultError);
-							}
 						}
 					}
 
@@ -666,10 +730,7 @@ class AssignmentProxy implements ChildSession {
 				},
 				{ now: this.runtime.now, sleep: this.runtime.sleep },
 			);
-			if (adoptedResult) {
-				this.settle(adoptedResult);
-				return;
-			}
+			if (this.settled) return;
 			this.settle({
 				version: 1,
 				runId: this.assignmentId,

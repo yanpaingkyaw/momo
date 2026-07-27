@@ -3552,6 +3552,190 @@ describe("at-most-once startup reconcile", () => {
 		expect(pi.sendUserMessage).not.toHaveBeenCalled();
 		expect(pool.getByRole("scout")?.status).toMatch(/unhealthy|uncertain/);
 	});
+
+	it("same-generation restart: unhealthy preserves fence, queue, no prompt/rewrite", async () => {
+		vi.useFakeTimers();
+		const cacheRoot = tempDir("momo-restart-unhealthy-");
+		const cwd = tempDir("momo-restart-unhealthy-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const { pi, ctx, workerId, control } = installRole({
+			pool,
+			identity,
+			role: "scout",
+			cwd,
+		});
+		const assignmentA = "restartunhealthy01";
+		const assignmentB = "restartunhealthy02";
+		const pathsA = assignmentSpoolPaths(pool.poolRoot, "scout", assignmentA);
+		mkdirSync(pathsA.root, { recursive: true, mode: 0o700 });
+		pool.upsert({
+			workerId,
+			generation: 1,
+			generationTombstone: 1,
+			role: "scout",
+			paneId: "w1:p1",
+			agentName: "momo_scout",
+			cwd: identity.canonicalRoot,
+			status: "unhealthy",
+			activeAssignmentId: assignmentA,
+			activeParentEpoch: "e1",
+			updatedAt: new Date().toISOString(),
+		});
+		atomicWriteJson(pathsA.command, {
+			version: 1,
+			type: "prompt",
+			task: "stale-a",
+			issuedAt: new Date().toISOString(),
+			runId: assignmentA,
+			workerId,
+			generation: 1,
+			parentEpoch: "e1",
+		});
+		// Missing active pointer — must still preserve unhealthy, not idle/drain.
+		enqueueAssignment(pool.poolRoot, "scout", {
+			assignmentId: assignmentB,
+			workerId,
+			generation: 1,
+			parentEpoch: "e1",
+			task: "successor",
+		});
+		const before = structuredClone(pool.getByRole("scout")!);
+		await pi.emit("session_start", {}, ctx);
+		await vi.advanceTimersByTimeAsync(200);
+		expect(pi.sendUserMessage).not.toHaveBeenCalled();
+		const after = pool.getByRole("scout")!;
+		expect(after.status).toBe("unhealthy");
+		expect(after.activeAssignmentId).toBe(assignmentA);
+		expect(after.generation).toBe(before.generation);
+		expect(after.workerId).toBe(before.workerId);
+		expect(queueCount(pool.poolRoot, "scout")).toBe(1);
+		expect(existsSync(control.active)).toBe(false);
+	});
+
+	it("same-generation restart: uncertain with lease/evidence preserved, no prompt", async () => {
+		vi.useFakeTimers();
+		const cacheRoot = tempDir("momo-restart-uncertain-");
+		const cwd = tempDir("momo-restart-uncertain-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const { WriterLeaseManager, createLeaseToken } = await import("../src/lease/writer-lease.js");
+		const leases = new WriterLeaseManager({ cacheRoot, now: () => 1_700_000_000_000 });
+		const { pi, ctx, workerId, control } = installRole({
+			pool,
+			identity,
+			role: "implementer",
+			cwd,
+			leaseManager: leases,
+		});
+		const assignmentA = "restartuncertain01";
+		const assignmentB = "restartuncertain02";
+		const pathsA = assignmentSpoolPaths(pool.poolRoot, "implementer", assignmentA);
+		mkdirSync(pathsA.root, { recursive: true, mode: 0o700 });
+		const token = createLeaseToken();
+		leases.acquire(cwd, workerId, token);
+		pool.upsert({
+			workerId,
+			generation: 1,
+			generationTombstone: 1,
+			role: "implementer",
+			paneId: "w1:p1",
+			agentName: "momo_implementer",
+			cwd: identity.canonicalRoot,
+			status: "uncertain",
+			uncertainWrite: true,
+			activeAssignmentId: assignmentA,
+			activeParentEpoch: "e1",
+			updatedAt: new Date().toISOString(),
+		});
+		atomicWriteJson(pathsA.command, {
+			version: 1,
+			type: "prompt",
+			task: "stale-a",
+			issuedAt: new Date().toISOString(),
+			runId: assignmentA,
+			workerId,
+			generation: 1,
+			parentEpoch: "e1",
+		});
+		atomicWriteJson(control.active, {
+			version: 1,
+			assignmentId: assignmentA,
+			generation: 1,
+			parentEpoch: "e1",
+			dispatchedAt: new Date().toISOString(),
+		});
+		enqueueAssignment(pool.poolRoot, "implementer", {
+			assignmentId: assignmentB,
+			workerId,
+			generation: 1,
+			parentEpoch: "e1",
+			task: "successor",
+		});
+		await pi.emit("session_start", {}, ctx);
+		await vi.advanceTimersByTimeAsync(200);
+		expect(pi.sendUserMessage).not.toHaveBeenCalled();
+		const after = pool.getByRole("implementer")!;
+		expect(after.status).toBe("uncertain");
+		expect(after.uncertainWrite).toBe(true);
+		expect(after.activeAssignmentId).toBe(assignmentA);
+		expect(leases.stillHeldBy(cwd, workerId, token)).toBe(true);
+		expect(queueCount(pool.poolRoot, "implementer")).toBe(1);
+		expect(existsSync(control.active)).toBe(true);
+	});
+
+	it("same-generation restart: unhealthy + malformed active still handled, queue retained", async () => {
+		vi.useFakeTimers();
+		const cacheRoot = tempDir("momo-restart-malformed-");
+		const cwd = tempDir("momo-restart-malformed-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const { pi, ctx, workerId, control } = installRole({
+			pool,
+			identity,
+			role: "planner",
+			cwd,
+		});
+		const assignmentB = "restartmalformed02";
+		pool.upsert({
+			workerId,
+			generation: 1,
+			generationTombstone: 1,
+			role: "planner",
+			paneId: "w1:p1",
+			agentName: "momo_planner",
+			status: "unhealthy",
+			updatedAt: new Date().toISOString(),
+		});
+		writeFileSync(control.active, "not-json", { mode: 0o600 });
+		enqueueAssignment(pool.poolRoot, "planner", {
+			assignmentId: assignmentB,
+			workerId,
+			generation: 1,
+			parentEpoch: "e1",
+			task: "successor",
+		});
+		await pi.emit("session_start", {}, ctx);
+		await vi.advanceTimersByTimeAsync(200);
+		expect(pi.sendUserMessage).not.toHaveBeenCalled();
+		expect(pool.getByRole("planner")?.status).toBe("unhealthy");
+		expect(queueCount(pool.poolRoot, "planner")).toBe(1);
+	});
 });
 
 describe("clean-result terminal transition races", () => {

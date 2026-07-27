@@ -2100,7 +2100,8 @@ describe("herdr factory + runner integration", () => {
 				});
 			});
 			await proxy.stopAndSettleFailure("Worker heartbeat went stale");
-			expect(pool.getByRole("scout")?.status).toBe("busy");
+			expect(pool.getByRole("scout")?.status).toBe("idle");
+			expect(pool.getByRole("scout")?.activeAssignmentId).toBeUndefined();
 			expect(proxy.uncertainWrite).toBeFalsy();
 			expect(proxy.messages).toEqual([
 				{ role: "assistant", content: [{ type: "text", text: "worker-first" }] },
@@ -2146,7 +2147,7 @@ describe("herdr factory + runner integration", () => {
 				});
 			});
 			await proxy.stopAndSettleFailure("Worker heartbeat went stale");
-			expect(pool.getByRole("scout")?.status).toBe("busy");
+			expect(pool.getByRole("scout")?.status).toBe("idle");
 			expect(proxy.messages).toEqual([
 				{ role: "assistant", content: [{ type: "text", text: "barrier" }] },
 			]);
@@ -2213,7 +2214,7 @@ describe("herdr factory + runner integration", () => {
 			await worker;
 			await parent;
 			expect(order).toEqual(["worker-enter", "worker-wrote", "worker-exit", "parent-done"]);
-			expect(pool.getByRole("scout")?.status).toBe("busy");
+			expect(pool.getByRole("scout")?.status).toBe("idle");
 			expect(proxy.messages).toEqual([
 				{ role: "assistant", content: [{ type: "text", text: "held" }] },
 			]);
@@ -2260,6 +2261,253 @@ describe("herdr factory + runner integration", () => {
 			expect(order.indexOf("parent-commit")).toBeLessThan(order.indexOf("worker-write"));
 			expect(order.indexOf("parent-done")).toBeLessThan(order.indexOf("worker-write"));
 			expect(pool.getByRole("scout")?.status).toBe("unhealthy");
+		});
+	});
+
+	describe("durable-result adoption finalizes clean A under role lock", () => {
+		afterEach(async () => {
+			const { __resetIpcReadersForTest, __setStopAndSettleCommitHookForTest } = await import(
+				"../src/delegation/herdr-factory.js"
+			);
+			__setStopAndSettleCommitHookForTest(undefined);
+			__resetIpcReadersForTest();
+		});
+
+		async function setupBusyScoutWithOptionalQueue(
+			label: string,
+			opts: { queueSuccessor?: boolean; status?: "busy" | "unhealthy" | "uncertain" } = {},
+		) {
+			installFakeHerdrExtension();
+			const cacheRoot = tempDir(`momo-adopt-${label}-cache-`);
+			const cwd = tempDir(`momo-adopt-${label}-cwd-`);
+			const { PoolRegistry } = await import("../src/herdr/pool-registry.js");
+			const { resolvePoolIdentity, stableWorkerId } = await import(
+				"../src/herdr/pool-identity.js"
+			);
+			const { workerControlPaths, assignmentSpoolPaths } = await import(
+				"../src/herdr/assignment-spool.js"
+			);
+			const { enqueueAssignment, queueCount, withRoleLockAsync } = await import(
+				"../src/herdr/role-queue.js"
+			);
+			const identity = resolvePoolIdentity({
+				cwd,
+				canonicalRoot: cwd,
+				workspaceId: "ws",
+				socketPath: "s",
+			});
+			const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+			const workerId = stableWorkerId(identity.poolKey, "scout");
+			const client = new HerdrClient({
+				runCommand: async () => ({
+					code: 0,
+					stdout: JSON.stringify({ id: "ok", result: {} }),
+					stderr: "",
+				}),
+			});
+			const factory = createHerdrChildSessionFactory({
+				cwd,
+				parentPaneId: "w1:p0",
+				parentId: `parent-adopt-${label}`,
+				client,
+				poolRegistry: pool,
+				cacheRoot,
+				canonicalRoot: cwd,
+				workspaceId: "ws",
+				socketPath: "s",
+			});
+			const session = await factory({ cwd, role: getRole("scout") });
+			const proxy = session as unknown as {
+				assignmentId: string;
+				workerId: string;
+				generation: number;
+				promptStarted: boolean;
+				physicalEnsured: boolean;
+				paths: { result: string; command: string };
+				stopAndSettleFailure: (message: string) => Promise<void>;
+				uncertainWrite: boolean;
+				messages: readonly unknown[];
+			};
+			const control = workerControlPaths(pool.poolRoot, "scout");
+			mkdirSync(control.root, { recursive: true, mode: 0o700 });
+			const paths = assignmentSpoolPaths(pool.poolRoot, "scout", proxy.assignmentId);
+			mkdirSync(paths.root, { recursive: true, mode: 0o700 });
+			const status = opts.status ?? "busy";
+			pool.upsert({
+				workerId,
+				generation: 1,
+				generationTombstone: 1,
+				role: "scout",
+				paneId: "w1:p-adopt",
+				agentName: "momo_scout",
+				cwd,
+				status,
+				...(status === "uncertain" ? { uncertainWrite: true } : {}),
+				activeAssignmentId: proxy.assignmentId,
+				activeParentEpoch: "epoch1",
+				updatedAt: new Date().toISOString(),
+			});
+			proxy.generation = 1;
+			proxy.promptStarted = true;
+			proxy.physicalEnsured = true;
+			const assignmentB = "adoptsuccessor0001";
+			if (opts.queueSuccessor) {
+				enqueueAssignment(pool.poolRoot, "scout", {
+					assignmentId: assignmentB,
+					workerId,
+					generation: 1,
+					parentEpoch: "epoch1",
+					task: "successor",
+				});
+			}
+			return {
+				pool,
+				proxy,
+				workerId,
+				paths,
+				control,
+				assignmentB,
+				queueCount,
+				withRoleLockAsync,
+			};
+		}
+
+		it("clean completed result + busy A advances to idle", async () => {
+			const { pool, proxy, workerId, paths } = await setupBusyScoutWithOptionalQueue("completed-idle");
+			atomicWriteJson(paths.result, {
+				version: 1,
+				runId: proxy.assignmentId,
+				workerId,
+				status: "completed",
+				messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
+				finishedAt: new Date().toISOString(),
+			});
+			await proxy.stopAndSettleFailure("Worker heartbeat went stale");
+			expect(pool.getByRole("scout")?.status).toBe("idle");
+			expect(pool.getByRole("scout")?.activeAssignmentId).toBeUndefined();
+			expect(proxy.messages).toEqual([
+				{ role: "assistant", content: [{ type: "text", text: "done" }] },
+			]);
+		});
+
+		it("clean failed result + busy A + queued B advances to B", async () => {
+			const { pool, proxy, workerId, paths, assignmentB, queueCount, control } =
+				await setupBusyScoutWithOptionalQueue("failed-b", { queueSuccessor: true });
+			atomicWriteJson(paths.result, {
+				version: 1,
+				runId: proxy.assignmentId,
+				workerId,
+				status: "failed",
+				messages: [],
+				errorMessage: "task failed",
+				finishedAt: new Date().toISOString(),
+			});
+			await proxy.stopAndSettleFailure("Worker heartbeat went stale");
+			expect(pool.getByRole("scout")?.status).toBe("busy");
+			expect(pool.getByRole("scout")?.activeAssignmentId).toBe(assignmentB);
+			expect(queueCount(pool.poolRoot, "scout")).toBe(0);
+			const active = JSON.parse(
+				(await import("node:fs")).readFileSync(control.active, "utf8"),
+			) as { assignmentId: string };
+			expect(active.assignmentId).toBe(assignmentB);
+		});
+
+		it("uncertain result retains evidence and does not advance", async () => {
+			const { pool, proxy, workerId, paths, queueCount } = await setupBusyScoutWithOptionalQueue(
+				"uncertain-retain",
+				{ queueSuccessor: true },
+			);
+			atomicWriteJson(paths.result, {
+				version: 1,
+				runId: proxy.assignmentId,
+				workerId,
+				status: "failed",
+				messages: [],
+				errorMessage: "lease release failed",
+				uncertainWrite: true,
+				finishedAt: new Date().toISOString(),
+			});
+			await proxy.stopAndSettleFailure("Worker heartbeat went stale");
+			const record = pool.getByRole("scout")!;
+			expect(record.status).toBe("uncertain");
+			expect(record.uncertainWrite).toBe(true);
+			expect(record.activeAssignmentId).toBe(proxy.assignmentId);
+			expect(queueCount(pool.poolRoot, "scout")).toBe(1);
+			expect(proxy.uncertainWrite).toBe(true);
+		});
+
+		it("protocol-unhealthy fence retains even with non-uncertain result", async () => {
+			const { pool, proxy, workerId, paths, queueCount } = await setupBusyScoutWithOptionalQueue(
+				"proto-unhealthy",
+				{ queueSuccessor: true, status: "unhealthy" },
+			);
+			atomicWriteJson(paths.result, {
+				version: 1,
+				runId: proxy.assignmentId,
+				workerId,
+				status: "completed",
+				messages: [{ role: "assistant", content: [{ type: "text", text: "clean" }] }],
+				finishedAt: new Date().toISOString(),
+			});
+			await proxy.stopAndSettleFailure("Worker heartbeat went stale");
+			const record = pool.getByRole("scout")!;
+			expect(record.status).toBe("unhealthy");
+			expect(record.activeAssignmentId).toBe(proxy.assignmentId);
+			expect(queueCount(pool.poolRoot, "scout")).toBe(1);
+			expect(proxy.messages).toEqual([
+				{ role: "assistant", content: [{ type: "text", text: "clean" }] },
+			]);
+		});
+
+		it("stale A cannot touch B after registry advanced", async () => {
+			const { pool, proxy, workerId, paths, assignmentB, withRoleLockAsync } =
+				await setupBusyScoutWithOptionalQueue("stale-a", { queueSuccessor: true });
+			pool.upsert({
+				...pool.getByRole("scout")!,
+				status: "busy",
+				activeAssignmentId: assignmentB,
+				activeParentEpoch: "epoch1",
+				updatedAt: new Date().toISOString(),
+			});
+			atomicWriteJson(paths.result, {
+				version: 1,
+				runId: proxy.assignmentId,
+				workerId,
+				status: "completed",
+				messages: [{ role: "assistant", content: [{ type: "text", text: "stale-a" }] }],
+				finishedAt: new Date().toISOString(),
+			});
+			await proxy.stopAndSettleFailure("Worker heartbeat went stale");
+			expect(pool.getByRole("scout")?.activeAssignmentId).toBe(assignmentB);
+			expect(pool.getByRole("scout")?.status).toBe("busy");
+			await withRoleLockAsync(pool.poolRoot, "scout", () => {
+				expect(pool.getByRole("scout")?.activeAssignmentId).toBe(assignmentB);
+			});
+		});
+
+		it("commit-point adoption advances clean A before settle returns", async () => {
+			const { __setStopAndSettleCommitHookForTest } = await import(
+				"../src/delegation/herdr-factory.js"
+			);
+			const { pool, proxy, workerId, paths, assignmentB, queueCount } =
+				await setupBusyScoutWithOptionalQueue("commit-adopt", { queueSuccessor: true });
+			__setStopAndSettleCommitHookForTest(() => {
+				atomicWriteJson(paths.result, {
+					version: 1,
+					runId: proxy.assignmentId,
+					workerId,
+					status: "completed",
+					messages: [{ role: "assistant", content: [{ type: "text", text: "commit" }] }],
+					finishedAt: new Date().toISOString(),
+				});
+			});
+			await proxy.stopAndSettleFailure("Worker heartbeat went stale");
+			expect(pool.getByRole("scout")?.status).toBe("busy");
+			expect(pool.getByRole("scout")?.activeAssignmentId).toBe(assignmentB);
+			expect(queueCount(pool.poolRoot, "scout")).toBe(0);
+			expect(proxy.messages).toEqual([
+				{ role: "assistant", content: [{ type: "text", text: "commit" }] },
+			]);
 		});
 	});
 

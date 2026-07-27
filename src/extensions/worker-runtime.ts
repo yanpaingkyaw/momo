@@ -478,9 +478,24 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 			if (uncertainWrite) {
 				markRegistryLocked("uncertain", {
 					activeAssignmentId: assignment.assignmentId,
+					...(assignment.parentEpoch !== undefined
+						? { activeParentEpoch: assignment.parentEpoch }
+						: {}),
 					uncertainWrite: true,
 				});
 				protocolUnhealthy = true;
+			} else if (protocolUnhealthy) {
+				// Extension/protocol failure: fence in the same commit as the result so
+				// parent adoption cannot advance a clean-looking failed result.
+				const preferUncertain =
+					role.canWrite && (assignment.mutationAttempted || assignment.leaseHeld);
+				markRegistryLocked(preferUncertain ? "uncertain" : "unhealthy", {
+					activeAssignmentId: assignment.assignmentId,
+					...(assignment.parentEpoch !== undefined
+						? { activeParentEpoch: assignment.parentEpoch }
+						: {}),
+					...(preferUncertain ? { uncertainWrite: true } : {}),
+				});
 			}
 			if (writeResultDurableLockHook) {
 				writeResultDurableLockHook("after-write");
@@ -548,6 +563,14 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 	function reconcileInFlightLocked(
 		current: PoolWorkerRecord,
 	): "in_flight" | "handled" | "idle" {
+		// Preserve protocol fences immediately — never classify idle, clear
+		// active/evidence, or drain a successor for unhealthy/uncertain rows.
+		if (current.status === "unhealthy" || current.status === "uncertain") {
+			disableMutationTools();
+			protocolUnhealthy = true;
+			return "handled";
+		}
+
 		const claiming = listClaiming(poolRoot, role.name);
 		for (const entry of claiming) {
 			if (entry.generation !== generation || entry.workerId !== workerId) {
