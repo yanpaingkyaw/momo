@@ -940,6 +940,382 @@ describe("herdr factory + runner integration", () => {
 		}
 	});
 
+	it("stale-heartbeat race settles when matching result lands before failure synthesis", async () => {
+		installFakeHerdrExtension();
+		vi.useFakeTimers({ shouldAdvanceTime: true });
+		const {
+			__resetIpcReadersForTest,
+			__setIpcReadersForTest,
+		} = await import("../src/delegation/herdr-factory.js");
+		const { tryReadIpcJson: realTryRead } = await import("../src/ipc/validate.js");
+		const cacheRoot = tempDir("momo-stale-hb-race-cache-");
+		const cwd = tempDir("momo-stale-hb-race-cwd-");
+		let now = 1_000_000;
+		const hbAt = now;
+		const client = new HerdrClient({
+			runCommand: async (_file, args) => {
+				if (args[0] === "pane" && args[1] === "split") {
+					const envArgs = args.filter((arg, index) => args[index - 1] === "--env");
+					const controlDir =
+						envArgs
+							.find((value) => value.startsWith("MOMO_CONTROL_DIR="))
+							?.slice("MOMO_CONTROL_DIR=".length) ??
+						envArgs
+							.find((value) => value.startsWith("MOMO_IPC_DIR="))
+							?.slice("MOMO_IPC_DIR=".length);
+					const workerId = envArgs
+						.find((value) => value.startsWith("MOMO_WORKER_ID="))
+						?.slice("MOMO_WORKER_ID=".length);
+					const runId = envArgs
+						.find((value) => value.startsWith("MOMO_RUN_ID="))
+						?.slice("MOMO_RUN_ID=".length);
+					if (controlDir && workerId && runId) {
+						atomicWriteJson(path.join(controlDir, "ready.json"), {
+							version: 1,
+							runId,
+							workerId,
+							readyAt: new Date(hbAt).toISOString(),
+						});
+						atomicWriteJson(path.join(controlDir, "heartbeat.json"), {
+							version: 1,
+							runId,
+							workerId,
+							at: new Date(hbAt).toISOString(),
+							seq: 1,
+						});
+					}
+					return {
+						code: 0,
+						stdout: JSON.stringify({ id: "split", result: { pane: { pane_id: "w1:p11" } } }),
+						stderr: "",
+					};
+				}
+				if (args[0] === "agent" && args[1] === "start") {
+					return {
+						code: 0,
+						stdout: agentStartStdout("w1:p11", String(args[2])),
+						stderr: "",
+					};
+				}
+				return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+			},
+		});
+		const { PoolRegistry } = await import("../src/herdr/pool-registry.js");
+		const { resolvePoolIdentity } = await import("../src/herdr/pool-identity.js");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const factory = createHerdrChildSessionFactory({
+			cwd,
+			parentPaneId: "w1:p1",
+			parentId: "parent-stale-hb-race",
+			client,
+			poolRegistry: pool,
+			cacheRoot,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+			heartbeatStaleMs: 200,
+			pollIntervalMs: 20,
+			readyTimeoutMs: 2_000,
+			resultTimeoutMs: 60_000,
+			now: () => now,
+			sleep: async (ms) => {
+				now += ms;
+				await vi.advanceTimersByTimeAsync(ms);
+			},
+		});
+		const session = await factory({ cwd, role: getRole("scout") });
+		const proxy = session as unknown as {
+			assignmentId: string;
+			workerId: string;
+			paths: { result: string; cancel: string };
+		};
+		const durable = {
+			version: 1,
+			runId: proxy.assignmentId,
+			workerId: proxy.workerId,
+			status: "completed" as const,
+			messages: [{ role: "assistant", content: [{ type: "text", text: "stale-race" }] }],
+			finishedAt: new Date(hbAt).toISOString(),
+		};
+		let postStaleResultReads = 0;
+		__setIpcReadersForTest({
+			tryReadIpcJson: (filePath: string) => {
+				if (String(filePath).endsWith("result.json")) {
+					if (now - hbAt <= 200) return undefined;
+					postStaleResultReads += 1;
+					// Initial poll read after stale: absent. Pre-failure re-read: durable.
+					if (postStaleResultReads === 1) return undefined;
+					return durable;
+				}
+				return realTryRead(filePath);
+			},
+		});
+		try {
+			const wait = session.prompt("go").then(() => session.agent!.waitForIdle());
+			await vi.advanceTimersByTimeAsync(50);
+			now = hbAt + 250;
+			await vi.advanceTimersByTimeAsync(50);
+			await expect(wait).resolves.toBeUndefined();
+			expect(postStaleResultReads).toBeGreaterThanOrEqual(2);
+			expect(pool.getByRole("scout")?.status).not.toBe("unhealthy");
+			const { existsSync } = await import("node:fs");
+			expect(existsSync(proxy.paths.cancel)).toBe(false);
+		} finally {
+			__resetIpcReadersForTest();
+		}
+	});
+
+	it("missing-heartbeat race settles when matching result lands before failure synthesis", async () => {
+		installFakeHerdrExtension();
+		vi.useFakeTimers({ shouldAdvanceTime: true });
+		const {
+			__resetIpcReadersForTest,
+			__setIpcReadersForTest,
+		} = await import("../src/delegation/herdr-factory.js");
+		const { tryReadIpcJson: realTryRead } = await import("../src/ipc/validate.js");
+		const cacheRoot = tempDir("momo-miss-hb-race-cache-");
+		const cwd = tempDir("momo-miss-hb-race-cwd-");
+		let now = 1_000_000;
+		const start = now;
+		const client = new HerdrClient({
+			runCommand: async (_file, args) => {
+				if (args[0] === "pane" && args[1] === "split") {
+					const envArgs = args.filter((arg, index) => args[index - 1] === "--env");
+					const controlDir =
+						envArgs
+							.find((value) => value.startsWith("MOMO_CONTROL_DIR="))
+							?.slice("MOMO_CONTROL_DIR=".length) ??
+						envArgs
+							.find((value) => value.startsWith("MOMO_IPC_DIR="))
+							?.slice("MOMO_IPC_DIR=".length);
+					const workerId = envArgs
+						.find((value) => value.startsWith("MOMO_WORKER_ID="))
+						?.slice("MOMO_WORKER_ID=".length);
+					const runId = envArgs
+						.find((value) => value.startsWith("MOMO_RUN_ID="))
+						?.slice("MOMO_RUN_ID=".length);
+					if (controlDir && workerId && runId) {
+						atomicWriteJson(path.join(controlDir, "ready.json"), {
+							version: 1,
+							runId,
+							workerId,
+							readyAt: new Date(start).toISOString(),
+						});
+						// Intentionally no heartbeat.json
+					}
+					return {
+						code: 0,
+						stdout: JSON.stringify({ id: "split", result: { pane: { pane_id: "w1:p12" } } }),
+						stderr: "",
+					};
+				}
+				if (args[0] === "agent" && args[1] === "start") {
+					return {
+						code: 0,
+						stdout: agentStartStdout("w1:p12", String(args[2])),
+						stderr: "",
+					};
+				}
+				return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+			},
+		});
+		const { PoolRegistry } = await import("../src/herdr/pool-registry.js");
+		const { resolvePoolIdentity } = await import("../src/herdr/pool-identity.js");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const factory = createHerdrChildSessionFactory({
+			cwd,
+			parentPaneId: "w1:p1",
+			parentId: "parent-miss-hb-race",
+			client,
+			poolRegistry: pool,
+			cacheRoot,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+			heartbeatStaleMs: 200,
+			pollIntervalMs: 20,
+			readyTimeoutMs: 2_000,
+			resultTimeoutMs: 60_000,
+			now: () => now,
+			sleep: async (ms) => {
+				now += ms;
+				await vi.advanceTimersByTimeAsync(ms);
+			},
+		});
+		const session = await factory({ cwd, role: getRole("scout") });
+		const proxy = session as unknown as {
+			assignmentId: string;
+			workerId: string;
+			paths: { result: string; cancel: string };
+		};
+		const durable = {
+			version: 1,
+			runId: proxy.assignmentId,
+			workerId: proxy.workerId,
+			status: "completed" as const,
+			messages: [{ role: "assistant", content: [{ type: "text", text: "miss-race" }] }],
+			finishedAt: new Date(start).toISOString(),
+		};
+		let postGraceResultReads = 0;
+		__setIpcReadersForTest({
+			tryReadIpcJson: (filePath: string) => {
+				if (String(filePath).endsWith("result.json")) {
+					if (now - start <= 200) return undefined;
+					postGraceResultReads += 1;
+					if (postGraceResultReads === 1) return undefined;
+					return durable;
+				}
+				return realTryRead(filePath);
+			},
+		});
+		try {
+			const wait = session.prompt("go").then(() => session.agent!.waitForIdle());
+			await vi.advanceTimersByTimeAsync(50);
+			now = start + 250;
+			await vi.advanceTimersByTimeAsync(50);
+			await expect(wait).resolves.toBeUndefined();
+			expect(postGraceResultReads).toBeGreaterThanOrEqual(2);
+			const { existsSync } = await import("node:fs");
+			expect(existsSync(proxy.paths.cancel)).toBe(false);
+			expect(pool.getByRole("scout")?.status).not.toBe("unhealthy");
+		} finally {
+			__resetIpcReadersForTest();
+		}
+	});
+
+	it("invalid raced result fails closed with validation error", async () => {
+		installFakeHerdrExtension();
+		vi.useFakeTimers({ shouldAdvanceTime: true });
+		const {
+			__resetIpcReadersForTest,
+			__setIpcReadersForTest,
+		} = await import("../src/delegation/herdr-factory.js");
+		const { tryReadIpcJson: realTryRead } = await import("../src/ipc/validate.js");
+		const cacheRoot = tempDir("momo-invalid-race-cache-");
+		const cwd = tempDir("momo-invalid-race-cwd-");
+		let now = 1_000_000;
+		const start = now;
+		const client = new HerdrClient({
+			runCommand: async (_file, args) => {
+				if (args[0] === "pane" && args[1] === "split") {
+					const envArgs = args.filter((arg, index) => args[index - 1] === "--env");
+					const controlDir =
+						envArgs
+							.find((value) => value.startsWith("MOMO_CONTROL_DIR="))
+							?.slice("MOMO_CONTROL_DIR=".length) ??
+						envArgs
+							.find((value) => value.startsWith("MOMO_IPC_DIR="))
+							?.slice("MOMO_IPC_DIR=".length);
+					const workerId = envArgs
+						.find((value) => value.startsWith("MOMO_WORKER_ID="))
+						?.slice("MOMO_WORKER_ID=".length);
+					const runId = envArgs
+						.find((value) => value.startsWith("MOMO_RUN_ID="))
+						?.slice("MOMO_RUN_ID=".length);
+					if (controlDir && workerId && runId) {
+						atomicWriteJson(path.join(controlDir, "ready.json"), {
+							version: 1,
+							runId,
+							workerId,
+							readyAt: new Date(start).toISOString(),
+						});
+					}
+					return {
+						code: 0,
+						stdout: JSON.stringify({ id: "split", result: { pane: { pane_id: "w1:p13" } } }),
+						stderr: "",
+					};
+				}
+				if (args[0] === "agent" && args[1] === "start") {
+					return {
+						code: 0,
+						stdout: agentStartStdout("w1:p13", String(args[2])),
+						stderr: "",
+					};
+				}
+				return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+			},
+		});
+		const { PoolRegistry } = await import("../src/herdr/pool-registry.js");
+		const { resolvePoolIdentity } = await import("../src/herdr/pool-identity.js");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const factory = createHerdrChildSessionFactory({
+			cwd,
+			parentPaneId: "w1:p1",
+			parentId: "parent-invalid-race",
+			client,
+			poolRegistry: pool,
+			cacheRoot,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+			heartbeatStaleMs: 200,
+			pollIntervalMs: 20,
+			readyTimeoutMs: 2_000,
+			resultTimeoutMs: 60_000,
+			now: () => now,
+			sleep: async (ms) => {
+				now += ms;
+				await vi.advanceTimersByTimeAsync(ms);
+			},
+		});
+		const session = await factory({ cwd, role: getRole("scout") });
+		const proxy = session as unknown as {
+			assignmentId: string;
+			workerId: string;
+			paths: { result: string; cancel: string };
+		};
+		let postGraceResultReads = 0;
+		__setIpcReadersForTest({
+			tryReadIpcJson: (filePath: string) => {
+				if (String(filePath).endsWith("result.json")) {
+					if (now - start <= 200) return undefined;
+					postGraceResultReads += 1;
+					if (postGraceResultReads === 1) return undefined;
+					return {
+						version: 1,
+						runId: "wrong-assignment-id",
+						workerId: proxy.workerId,
+						status: "completed",
+						messages: [{ role: "assistant", content: [{ type: "text", text: "bad" }] }],
+						finishedAt: new Date(start).toISOString(),
+					};
+				}
+				return realTryRead(filePath);
+			},
+		});
+		try {
+			const wait = session.prompt("go").then(() => session.agent!.waitForIdle());
+			await vi.advanceTimersByTimeAsync(50);
+			now = start + 250;
+			await vi.advanceTimersByTimeAsync(50);
+			await expect(wait).rejects.toThrow(/identity mismatch|invalid/i);
+			expect(postGraceResultReads).toBeGreaterThanOrEqual(2);
+			const { existsSync } = await import("node:fs");
+			expect(existsSync(proxy.paths.cancel)).toBe(true);
+		} finally {
+			__resetIpcReadersForTest();
+		}
+	});
+
 
 	it("queued missing-heartbeat fails and removes queue entry without later execution", async () => {
 		installFakeHerdrExtension();

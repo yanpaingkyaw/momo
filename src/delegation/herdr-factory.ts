@@ -286,17 +286,28 @@ class AssignmentProxy implements ChildSession {
 		}
 	}
 
+	/**
+	 * Authoritative result.json settle helper shared by the initial poll read,
+	 * event-parse race recovery, and heartbeat pre-failure checks.
+	 * @returns true when a valid matching result was settled
+	 * @returns false when no result is present
+	 * @throws when result.json exists but fails validation (fail closed)
+	 */
+	private trySettleAuthoritativeResult(): boolean {
+		if (this.settled) return true;
+		const resultRaw = ipcValidate.tryReadIpcJson(this.paths.result);
+		if (!resultRaw) return false;
+		this.settle(validateResult(resultRaw, assignmentIdentity(this.assignmentId, this.workerId)));
+		return true;
+	}
+
 	private async poll(): Promise<void> {
 		if (this.disposed || this.settled || this.stoppingAfterFailure || !this.promptStarted) return;
 		const paths = this.paths;
 		try {
 			// Durable result is authoritative: validate/settle result BEFORE events so
 			// corrupt/oversized event logs cannot reject an already-valid terminal result.
-			const resultRaw = ipcValidate.tryReadIpcJson(paths.result);
-			if (resultRaw && !this.settled) {
-				this.settle(validateResult(resultRaw, assignmentIdentity(this.assignmentId, this.workerId)));
-				return;
-			}
+			if (this.trySettleAuthoritativeResult()) return;
 
 			// Pre-result event corruption remains fail-closed — but if a durable
 			// result appears while event parsing fails, prefer the result.
@@ -318,27 +329,31 @@ class AssignmentProxy implements ChildSession {
 						runId: controlRunId(this.generation),
 						workerId: this.workerId,
 					});
-					assertHeartbeatFreshness(heartbeat.at, {
-						now: this.runtime.now(),
-						staleMs: this.runtime.heartbeatStaleMs,
-					});
+					try {
+						assertHeartbeatFreshness(heartbeat.at, {
+							now: this.runtime.now(),
+							staleMs: this.runtime.heartbeatStaleMs,
+						});
+					} catch (heartbeatError) {
+						// Result may have landed after the initial poll read.
+						if (this.trySettleAuthoritativeResult()) return;
+						throw heartbeatError;
+					}
 				} else if (
 					this.heartbeatExpectedAt !== undefined &&
 					this.runtime.now() - this.heartbeatExpectedAt > this.runtime.heartbeatStaleMs
 				) {
 					// Missing heartbeat after dispatch/readiness fails like a stale one.
+					// Close the result-vs-heartbeat race before synthesizing failure.
+					if (this.trySettleAuthoritativeResult()) return;
 					await this.stopAndSettleFailure("Worker heartbeat went stale");
 				}
 			}
 		} catch (error) {
 			// Close the check/read race: a result may have landed after the first
-			// result check and before/during event parse failure.
+			// result check and before/during event parse or heartbeat failure.
 			try {
-				const raced = ipcValidate.tryReadIpcJson(paths.result);
-				if (raced && !this.settled) {
-					this.settle(validateResult(raced, assignmentIdentity(this.assignmentId, this.workerId)));
-					return;
-				}
+				if (this.trySettleAuthoritativeResult()) return;
 			} catch (resultError) {
 				const message =
 					resultError instanceof IpcValidationError || resultError instanceof Error
