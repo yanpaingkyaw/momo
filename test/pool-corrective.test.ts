@@ -4499,6 +4499,18 @@ describe("read-only adoption active/no-result", () => {
 		label: string;
 		agentStatus: string;
 		queued?: boolean;
+		/** When set, write a valid started.json at this age (ms before now). */
+		startedAgeMs?: number;
+		/** Age of active.dispatchedAt (ms before now). Defaults to recent (0). */
+		dispatchAgeMs?: number;
+		/** Non-date dispatchedAt string (fail-closed). */
+		malformedDispatchedAt?: boolean;
+		/** dispatchedAt this many ms in the future (fail-closed when beyond skew). */
+		futureDispatchedAtMs?: number;
+		/** Corrupt started marker for fail-closed tests. */
+		corruptStarted?: boolean;
+		/** Corrupt active pointer for fail-closed tests. */
+		corruptActive?: boolean;
 	}) {
 		const { adoptPoolWorkers } = await import("../src/extensions/parent.js");
 		const cacheRoot = tempDir(`momo-ro-adopt-${options.label}-`);
@@ -4546,13 +4558,27 @@ describe("read-only adoption active/no-result", () => {
 			at: new Date().toISOString(),
 			seq: 1,
 		});
-		atomicWriteJson(control.active, {
-			version: 1,
-			assignmentId: assignmentA,
-			generation: 1,
-			parentEpoch: "e1",
-			dispatchedAt: new Date().toISOString(),
-		});
+		if (options.corruptActive) {
+			writeFileSync(control.active, "{not-json", { mode: 0o600 });
+		} else {
+			let dispatchedAt: string;
+			if (options.malformedDispatchedAt) {
+				dispatchedAt = "not-a-date";
+			} else if (options.futureDispatchedAtMs !== undefined) {
+				dispatchedAt = new Date(Date.now() + options.futureDispatchedAtMs).toISOString();
+			} else {
+				dispatchedAt = new Date(
+					Date.now() - (options.dispatchAgeMs ?? 0),
+				).toISOString();
+			}
+			atomicWriteJson(control.active, {
+				version: 1,
+				assignmentId: assignmentA,
+				generation: 1,
+				parentEpoch: "e1",
+				dispatchedAt,
+			});
+		}
 		const pathsA = assignmentSpoolPaths(pool.poolRoot, "scout", assignmentA);
 		mkdirSync(pathsA.root, { recursive: true, mode: 0o700 });
 		atomicWriteJson(pathsA.command, {
@@ -4565,6 +4591,18 @@ describe("read-only adoption active/no-result", () => {
 			generation: 1,
 			parentEpoch: "e1",
 		});
+		if (options.corruptStarted) {
+			writeFileSync(pathsA.started, "{bad", { mode: 0o600 });
+		} else if (options.startedAgeMs !== undefined) {
+			atomicWriteJson(pathsA.started, {
+				version: 1,
+				runId: assignmentA,
+				workerId,
+				generation: 1,
+				parentEpoch: "e1",
+				startedAt: new Date(Date.now() - options.startedAgeMs).toISOString(),
+			});
+		}
 		if (options.queued) {
 			enqueueAssignment(pool.poolRoot, "scout", {
 				assignmentId: assignmentB,
@@ -4594,7 +4632,7 @@ describe("read-only adoption active/no-result", () => {
 		await adoptPoolWorkers(pool, client, identity.poolKey, {
 			ui: { notify: () => undefined },
 		});
-		return { pool, workerId, cwd, cacheRoot, identity, assignmentA, assignmentB, control };
+		return { pool, workerId, cwd, cacheRoot, identity, assignmentA, assignmentB, control, pathsA };
 	}
 
 	it("fresh heartbeat + working remains busy", async () => {
@@ -4608,10 +4646,24 @@ describe("read-only adoption active/no-result", () => {
 		expect(selectClosablePoolWorkers([after]).closable).toHaveLength(0);
 	});
 
-	it("fresh heartbeat + idle becomes unhealthy with active evidence", async () => {
+	it("newly dispatched idle with no started marker retains busy", async () => {
 		const { pool, assignmentA } = await setupBusyScout({
-			label: "idle",
+			label: "idle-nomarker",
 			agentStatus: "idle",
+			dispatchAgeMs: 0,
+		});
+		const after = pool.getByRole("scout")!;
+		expect(after.status).toBe("busy");
+		expect(after.activeAssignmentId).toBe(assignmentA);
+		expect(selectClosablePoolWorkers([after]).closable).toHaveLength(0);
+	});
+
+	it("old dispatch + idle + no started becomes unhealthy (died before start)", async () => {
+		const { ADOPTION_STARTED_GRACE_MS } = await import("../src/extensions/parent.js");
+		const { pool, assignmentA } = await setupBusyScout({
+			label: "idle-old-dispatch",
+			agentStatus: "idle",
+			dispatchAgeMs: ADOPTION_STARTED_GRACE_MS + 5_000,
 		});
 		const after = pool.getByRole("scout")!;
 		expect(after.status).toBe("unhealthy");
@@ -4619,7 +4671,54 @@ describe("read-only adoption active/no-result", () => {
 		expect(selectClosablePoolWorkers([after]).closable).toHaveLength(1);
 	});
 
-	it("fresh heartbeat + done becomes unhealthy", async () => {
+	it("malformed dispatchedAt fails closed to unhealthy", async () => {
+		const { pool, assignmentA } = await setupBusyScout({
+			label: "bad-dispatch",
+			agentStatus: "idle",
+			malformedDispatchedAt: true,
+		});
+		const after = pool.getByRole("scout")!;
+		expect(after.status).toBe("unhealthy");
+		expect(after.activeAssignmentId).toBe(assignmentA);
+	});
+
+	it("implausibly future dispatchedAt fails closed to unhealthy", async () => {
+		const { pool, assignmentA } = await setupBusyScout({
+			label: "future-dispatch",
+			agentStatus: "idle",
+			futureDispatchedAtMs: 60_000,
+		});
+		const after = pool.getByRole("scout")!;
+		expect(after.status).toBe("unhealthy");
+		expect(after.activeAssignmentId).toBe(assignmentA);
+	});
+
+	it("idle with recent started marker retains busy (settlement race)", async () => {
+		const { ADOPTION_STARTED_GRACE_MS } = await import("../src/extensions/parent.js");
+		const { pool, assignmentA } = await setupBusyScout({
+			label: "idle-recent",
+			agentStatus: "idle",
+			startedAgeMs: Math.floor(ADOPTION_STARTED_GRACE_MS / 2),
+		});
+		const after = pool.getByRole("scout")!;
+		expect(after.status).toBe("busy");
+		expect(after.activeAssignmentId).toBe(assignmentA);
+	});
+
+	it("idle with started marker older than grace becomes unhealthy", async () => {
+		const { ADOPTION_STARTED_GRACE_MS } = await import("../src/extensions/parent.js");
+		const { pool, assignmentA } = await setupBusyScout({
+			label: "idle-old",
+			agentStatus: "idle",
+			startedAgeMs: ADOPTION_STARTED_GRACE_MS + 5_000,
+		});
+		const after = pool.getByRole("scout")!;
+		expect(after.status).toBe("unhealthy");
+		expect(after.activeAssignmentId).toBe(assignmentA);
+		expect(selectClosablePoolWorkers([after]).closable).toHaveLength(1);
+	});
+
+	it("done becomes unhealthy with active evidence", async () => {
 		const { pool, assignmentA } = await setupBusyScout({
 			label: "done",
 			agentStatus: "done",
@@ -4629,11 +4728,24 @@ describe("read-only adoption active/no-result", () => {
 		expect(after.activeAssignmentId).toBe(assignmentA);
 	});
 
+	it("invalid started marker fails closed to unhealthy", async () => {
+		const { pool, assignmentA } = await setupBusyScout({
+			label: "bad-started",
+			agentStatus: "idle",
+			corruptStarted: true,
+		});
+		const after = pool.getByRole("scout")!;
+		expect(after.status).toBe("unhealthy");
+		expect(after.activeAssignmentId).toBe(assignmentA);
+	});
+
 	it("cleanup terminalizes active A + queued B then N+1 can provision", async () => {
+		const { ADOPTION_STARTED_GRACE_MS } = await import("../src/extensions/parent.js");
 		const fixture = await setupBusyScout({
 			label: "cleanup-n1",
 			agentStatus: "idle",
 			queued: true,
+			startedAgeMs: ADOPTION_STARTED_GRACE_MS + 5_000,
 		});
 		const { pool, workerId, cwd, cacheRoot, identity, assignmentA, assignmentB } = fixture;
 		expect(pool.getByRole("scout")?.status).toBe("unhealthy");

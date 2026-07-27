@@ -35,7 +35,7 @@ import { assignmentSpoolPaths, workerControlPaths } from "../herdr/assignment-sp
 import { completeCleanAssignmentLocked } from "../herdr/terminal-transition.js";
 import { terminalizeAndClearRoleAssignmentsLocked } from "../herdr/cleanup-terminalize.js";
 import { WriterLeaseManager, LeaseCorruptionError } from "../lease/writer-lease.js";
-import { atomicWriteJson, DEFAULT_HEARTBEAT_STALE_MS } from "../ipc/spool.js";
+import { atomicWriteJson, DEFAULT_HEARTBEAT_STALE_MS, DEFAULT_HEARTBEAT_CLOCK_SKEW_MS } from "../ipc/spool.js";
 import {
 	IpcValidationError,
 	assertHeartbeatFreshness,
@@ -55,6 +55,12 @@ import {
 } from "../herdr/role-queue.js";
 
 export const PARENT_ACTIVE_TOOLS = ["read", "grep", "find", "ls", "delegate"] as const;
+
+/**
+ * Adoption grace for a read-only assignment that has started but Herdr reports idle
+ * with no terminal result yet (settlement/result race). Matches heartbeat stale budget.
+ */
+export const ADOPTION_STARTED_GRACE_MS = DEFAULT_HEARTBEAT_STALE_MS;
 
 export interface InstallMomoParentOptions {
 	env?: NodeJS.ProcessEnv;
@@ -514,19 +520,14 @@ export async function adoptPoolWorkers(
 					}
 
 					if (!getRole(worker.role).canWrite) {
-						// Read-only active/no-result: retain exact busy only while Herdr
-						// proves live work. Idle/done/unknown/missing → unhealthy so
-						// default cleanup can terminalize without leaving a stopped
-						// worker stuck busy. Preserve active assignment evidence.
-						const herdrLive =
-							info.agentStatus === "working" || info.agentStatus === "blocked";
-						if (herdrLive) {
-							return;
-						}
-						pool.upsert({
-							...current,
-							status: "unhealthy",
-							updatedAt: new Date().toISOString(),
+						classifyReadOnlyActiveNoResultAdoption({
+							pool,
+							current,
+							worker,
+							controlActivePath: control.active,
+							paths,
+							agentStatus: info.agentStatus,
+							nowMs: Date.now(),
 						});
 						return;
 					}
@@ -623,6 +624,117 @@ function matchesExactSnapshot(
 		current.agentName === snapshot.agentName &&
 		current.cwd === snapshot.cwd
 	);
+}
+
+/**
+ * Read-only busy/blocked assignment with no terminal result.
+ * Must not mark a newly dispatched worker unhealthy merely because Herdr is still
+ * idle before the worker poll/start fence. Invalid active/started identity fails
+ * closed to unhealthy while preserving active evidence for cleanup.
+ *
+ * Must run under the role lock with an exact snapshot fence already applied.
+ */
+function classifyReadOnlyActiveNoResultAdoption(options: {
+	pool: PoolRegistry;
+	current: PoolWorkerRecord;
+	worker: PoolWorkerRecord;
+	controlActivePath: string;
+	paths: ReturnType<typeof assignmentSpoolPaths>;
+	agentStatus: string | undefined;
+	nowMs: number;
+	startedGraceMs?: number;
+	maxFutureSkewMs?: number;
+}): void {
+	const { pool, current, worker, controlActivePath, paths } = options;
+	const assignmentId = worker.activeAssignmentId!;
+	const markUnhealthy = (): void => {
+		pool.upsert({
+			...current,
+			status: "unhealthy",
+			updatedAt: new Date(options.nowMs).toISOString(),
+		});
+	};
+
+	let parentEpoch: string;
+	let dispatchedAtMs: number;
+	try {
+		const activeRaw = tryReadIpcJson(controlActivePath);
+		const ptr = validateActivePointer(activeRaw, {
+			generation: worker.generation,
+			assignmentId,
+		});
+		const expectedEpoch = current.activeParentEpoch ?? worker.activeParentEpoch;
+		if (expectedEpoch !== undefined && ptr.parentEpoch !== expectedEpoch) {
+			markUnhealthy();
+			return;
+		}
+		parentEpoch = ptr.parentEpoch;
+		const parsedDispatch = Date.parse(ptr.dispatchedAt);
+		if (!Number.isFinite(parsedDispatch)) {
+			markUnhealthy();
+			return;
+		}
+		dispatchedAtMs = parsedDispatch;
+	} catch {
+		markUnhealthy();
+		return;
+	}
+
+	let startedAtMs: number | undefined;
+	if (existsSync(paths.started)) {
+		try {
+			const startedRaw = tryReadIpcJson(paths.started);
+			const started = validateStarted(startedRaw, {
+				runId: assignmentId,
+				workerId: worker.workerId,
+				generation: worker.generation,
+				parentEpoch,
+			});
+			const parsed = Date.parse(started.startedAt);
+			if (!Number.isFinite(parsed)) {
+				markUnhealthy();
+				return;
+			}
+			startedAtMs = parsed;
+		} catch {
+			markUnhealthy();
+			return;
+		}
+	}
+
+	const status = options.agentStatus;
+	if (status === "working" || status === "blocked") {
+		return;
+	}
+
+	const graceMs = options.startedGraceMs ?? ADOPTION_STARTED_GRACE_MS;
+	const maxFutureSkewMs = options.maxFutureSkewMs ?? DEFAULT_HEARTBEAT_CLOCK_SKEW_MS;
+	const withinGrace = (atMs: number): boolean => {
+		const ageMs = options.nowMs - atMs;
+		if (ageMs < -maxFutureSkewMs) return false;
+		return ageMs <= graceMs;
+	};
+
+	if (status === "idle") {
+		if (startedAtMs === undefined) {
+			// No started.json yet: retain busy only while dispatch is still within grace
+			// (covers the pre-poll window). Stale dispatch → worker likely died before start.
+			if (withinGrace(dispatchedAtMs)) {
+				return;
+			}
+			markUnhealthy();
+			return;
+		}
+		if (withinGrace(startedAtMs)) {
+			// Recent start + idle: settlement/result race — retain busy.
+			return;
+		}
+		markUnhealthy();
+		return;
+	}
+
+	// done / unknown / missing: no live execution proof.
+	markUnhealthy();
 }
 
 /** Current live record is an active writer assignment (any id). */
