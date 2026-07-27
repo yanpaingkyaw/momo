@@ -1,14 +1,14 @@
 # Momo Architecture
 
-Status: Current-state record for package `momo-orchestrator@0.1.0`, plus user-approved Herdr target (implementation pending)
-Document type: Durable architecture description (current state) and approved target architecture (not yet implemented)
+Status: Package `momo-orchestrator@0.2.0` is an **implementation candidate** for baseline in-process orchestration plus the approved Herdr pane-worker target (mocked tests; live Herdr acceptance still operator-run and incomplete)
+Document type: Durable architecture description (baseline current behavior, approved target, and candidate module map)
 Last updated: 2026-07-26
 
 Labels used below:
 
-- **Verified:** confirmed by repository code inspection and/or the 2026-07-26 automated package checks (`typecheck` / `test` / `build` / compiled CLI smoke).
+- **Verified:** confirmed by repository code inspection and/or automated package checks (`typecheck` / `test` / `build` / compiled CLI smoke).
 - **Operator-run smoke:** executed and captured by Pi in the operator environment during the 2026-07-26 assessment; authoritative for what was observed then, but **not** reproduced by any repository-owned automated test or checked-in evidence artifact.
-- **Approved target:** user-approved design for Herdr pane workers; normative details also live in `SPEC.md` §32. **Implementation status: pending** until code lands.
+- **Approved target / implementation candidate:** user-approved Herdr pane-worker design (`SPEC.md` §32). Code for §32 is present in `0.2.0` with mocked coverage; **not live-compatible until §32.11 passes**.
 - **Risk / limitation:** observed or structural constraint; not a design proposal.
 
 ## 1. Purpose, status, and scope
@@ -21,20 +21,22 @@ Momo is a local, interactive software-engineering orchestrator. It reuses the Pi
 
 | Item | State |
 |---|---|
-| Spec contract | Baseline v1 in `SPEC.md` (spec version `1.1.0` adds approved Herdr target §32) |
-| Package implementation | `package.json` version `0.1.0` (unchanged; Herdr target not shipped) |
-| Automated verification (2026-07-26) | `npm run typecheck` passed; `npm test` 43/43 across six files; `npm run build` passed; compiled `--help` / `--version` / unknown-option smoke checks passed |
+| Spec contract | `SPEC.md` version `1.1.0` (baseline + §32 Herdr target) |
+| Package implementation | `package.json` version `0.2.0` |
+| Pi SDK / CLI | `@earendil-works/pi-coding-agent` / `pi` `0.82.1` |
+| Herdr | CLI `0.7.5`, protocol `17` (preflight-enforced) |
+| Automated verification | `npm run typecheck` / `npm test` (mocked Herdr included) / `npm run build` / compiled CLI smoke |
 | Authenticated manual acceptance | Incomplete (`SPEC.md` §27) |
-| Herdr (current) | Not established as compatible. Operator-run 2026-07-26 smoke showed partial detection/misidentification as Pi and failed Herdr agent control; see §10 |
-| Herdr (approved target) | Documented in §13 and `SPEC.md` §32; **implementation pending** |
+| Live Herdr acceptance | Incomplete (`SPEC.md` §32.11); not claimed by this implementation pass |
+| Historical operator smoke (2026-07-26) | Partial Pi misdetection / `agent_not_ready`; retained in §10 as pre-implementation evidence |
 
 ### Scope of this document
 
 **Part A (§2–§12):** current runtime topology, module boundaries, execution flows, trust boundaries, concurrency, cancellation, observability, operator Herdr smoke evidence, and ADRs already embodied in code.
 
-**Part B (§13–§14):** user-approved Herdr target architecture and target ADRs. This is not present in running code.
+**Part B (§13–§14):** user-approved Herdr target architecture and target ADRs. Code for this target exists as an **implementation candidate** in `0.2.0` (mocked coverage); live Herdr acceptance remains incomplete.
 
-Out of scope here: implementing the target, automatic product Git worktrees for specialist isolation, upstream Herdr `momo` kind, and other deferred items in `SPEC.md` §29 except as referenced by the approved target.
+Out of scope here: claiming live Herdr readiness, automatic product Git worktrees for specialist isolation, upstream Herdr `momo` kind, and other deferred items in `SPEC.md` §29 except as referenced by the approved target.
 
 ## 2. System context
 
@@ -287,11 +289,27 @@ Expect variability: detection may still show Pi rather than Momo, and `agent pro
 
 ---
 
-## 13. Approved Herdr target architecture (implementation pending)
+## 13. Approved Herdr target architecture (0.2.0 implementation candidate; live acceptance pending)
 
 **Authority:** User-approved implementation plan (Phase 2).
-**Code status:** Not implemented in `0.1.0`. Until code lands, Part A remains the running system.
+**Code status:** Implementation candidate in package `0.2.0` with unit/integration coverage against injected Herdr CLI/filesystem seams. Live Herdr matrix (`SPEC.md` §32.11) is still operator-run and incomplete — do not treat as shipped/live-compatible.
 **Normative twin:** `SPEC.md` §32.
+
+### 13.0 Shipped module map
+
+| Module | Path |
+|---|---|
+| Thin wrapper / launch | `src/cli.ts`, `src/launch.ts` |
+| Backend selection | `src/herdr/env.ts` |
+| Herdr CLI adapter | `src/herdr/client.ts` |
+| Pane registry | `src/herdr/registry.ts` |
+| IPC spool | `src/ipc/spool.ts` |
+| Writer lease | `src/lease/writer-lease.ts` |
+| Remote ChildSession factory | `src/delegation/herdr-factory.ts` |
+| Runner pre-allocation | `src/delegation/runner.ts` |
+| Parent Pi extension | `src/extensions/parent.ts` → `dist/extensions/parent.js` |
+| Worker Pi extension | `src/extensions/worker.ts` → `dist/extensions/worker.js` |
+| In-process runtime (non-Herdr) | `src/runtime.ts` |
 
 ### 13.1 Goals of the target
 
@@ -365,6 +383,7 @@ For each accepted specialist task under Herdr mode:
 | Crash / missing result | Task fails or aborts; do not invent success from TTY |
 | Implementer uncertain write | If writer lease was held and worker ends without a clean terminal result after possible mutation, surface **uncertain-write** risk to the parent/user; do not claim verified success |
 | Lease release | Implementer lease releases only on clean completion, explicit abort handling, or supervised recovery rules defined in `SPEC.md` §32 |
+| Cross-parent implementer wait | Second implementer **waits/retries** (cancellation-aware, default up to one hour) for the writer lease; never steals; stays read-only with waiting progress until acquire |
 
 ### 13.8 Pane retention
 
@@ -381,69 +400,68 @@ Completed, failed, and aborted specialist panes are **retained until explicit cl
 
 ### 13.10 Platform and version alignment
 
-- Initial support: **macOS and Linux** only.
-- Align tested **Pi SDK** (`@earendil-works/pi-coding-agent`, currently `0.80.10` in package metadata) and documented **Herdr CLI** major/protocol used in acceptance.
-- Windows and remote-only topologies are out of initial scope.
+- Initial support target: **macOS and Linux** only.
+- Required versions for this candidate: **Pi** `0.82.1` (`@earendil-works/pi-coding-agent` / PATH `pi`) and **Herdr CLI** `0.7.5` (protocol `17`).
+- In Herdr mode, `MOMO_PI_BINARY` is rejected unless it realpath-equals PATH `pi` (no resolve-and-discard).
+- Windows and remote-only topologies remain out of scope.
+- **Operator evidence (macOS, partial):** canonical parent prompt; scout E2E; four role panes opened; implementer exact ok-newline in a disposable fixture; reviewer `workspace_diff`; hardened active planner cancellation (aborted retained pane); retention/cleanup. **Still pending live:** queued-task cancellation, full cross-parent lease contention, crash recovery, Linux. Do **not** claim full `SPEC.md` §32.11.
 
 ### 13.11 Delivery governance (not product behavior)
 
 Development of this target proceeds in a **separate Git worktree / feature branch** and lands through a **GitHub PR**. That process is **delivery governance only**. The product must **not** automatically create Git worktrees for specialist execution as part of Herdr mode.
 
-### 13.12 Likely module map (target; not yet created)
+### 13.12 Process-death and recovery honesty
 
-| Module | Intended responsibility |
-|---|---|
-| `src/cli.ts` (wrapper path) | Thin foreground launch of parent Pi / worker entry routing |
-| Momo parent Pi extension | Display name Momo, Herdr metadata/lifecycle cooperation |
-| `src/herdr/*` | Env detect, CLI client (no shell), layout, identity |
-| `src/delegation/ipc.ts` | Versioned IPC schema |
-| `src/delegation/herdr-factory.ts` | Pane-per-worker `ChildSessionFactory` |
-| `src/delegation/writer-lock.ts` | Cross-process writer lease |
-| Worker launch path | Full Pi TUI per role in allocated pane |
-| Tests + live matrix | Mocked Herdr client unit/integration; manual/live Herdr acceptance |
+| Event | Guaranteed behavior | Limitation |
+|---|---|---|
+| Parent `session_shutdown` | Writes cancel IPC for active registered workers; best-effort ctrl+c; does **not** close retained terminal panes | Hard kill / SIGKILL of the parent may skip this path |
+| Parent relaunch (`session_start`) | Stable `parentId` (hash of Herdr pane + workspace + real cwd) rediscovers registry; privately validates `result.json` for active records (identity-checked); maps completed/aborted/failed/uncertain; idle/done/unknown without result → failed or uncertain; `working`/`blocked` without result stays active; corrupt result is terminal with notify (not startup crash) | Cannot resume in-flight tool calls; registry JSON corruption fails closed with an actionable error |
+| Worker OS death without IPC result | Heartbeat stale / missing result ⇒ failed or uncertain-write (implementer) | No invent-success from TTY |
+
+Shipped modules are listed in **§13.0** (not the obsolete “not yet created” table from earlier drafts).
 
 ---
 
-## 14. Approved target ADRs (implementation pending)
+## 14. Approved target ADRs (implemented candidate; live §32.11 incomplete)
 
 ### ADR-009 — Thin momo wrapper + Momo parent Pi extension
 
-- **Status:** Accepted (approved target; **implementation pending**)
+- **Status:** Accepted (**implemented** in `0.2.0`; live Herdr acceptance incomplete)
 - **Context:** Launching a non-Pi-shaped process caused Herdr mislabeling and `agent_not_ready` during operator smoke.
 - **Decision:** `momo` is a thin wrapper that execs a canonical Pi foreground parent; a Momo parent Pi extension sets display name **Momo** while Herdr kind remains **`pi`**. Upstream `momo` kind is deferred.
 - **Consequences:** Controllability depends on Pi remaining pane foreground; branding is display/metadata-level until Herdr adds a native kind.
 
 ### ADR-010 — Pane-per-worker Herdr backend
 
-- **Status:** Accepted (approved target; **implementation pending**)
+- **Status:** Accepted (**implemented** in `0.2.0`; live Herdr acceptance incomplete)
 - **Context:** In-process children hide specialist activity from Herdr and the user.
 - **Decision:** Under Herdr mode, each accepted specialist task gets a newly created pane running a full Pi TUI worker; allocate panes when queued; cap four active read-only workers and one implementer.
 - **Consequences:** Higher process/pane churn; layout management and cleanup UX become first-class; in-process path remains for non-Herdr.
 
 ### ADR-011 — Structured versioned IPC
 
-- **Status:** Accepted (approved target; **implementation pending**)
+- **Status:** Accepted (**implemented** in `0.2.0`; live Herdr acceptance incomplete)
 - **Context:** TTY scraping is brittle and unsafe for orchestration truth.
 - **Decision:** Private versioned IPC is authoritative for progress and results; never scrape TTY for completion or output extraction.
 - **Consequences:** Workers must speak IPC correctly; human pane output can diverge visually without affecting orchestration correctness.
 
 ### ADR-012 — Cross-process writer lease
 
-- **Status:** Accepted (approved target; **implementation pending**)
+- **Status:** Accepted (**implemented** in `0.2.0`; live Herdr acceptance incomplete)
 - **Context:** In-process `writerTail` cannot serialize implementers across OS processes/panes.
 - **Decision:** Introduce a cross-process writer lease for implementers, composed with existing validation (no parallel implementers).
 - **Consequences:** Requires crash/uncertain-write rules; lease path must be documented and tested.
 
 ### ADR-013 — Retain specialist panes until explicit cleanup
 
-- **Status:** Accepted (approved target; **implementation pending**)
+- **Status:** Accepted (**implemented** in `0.2.0`; live Herdr acceptance incomplete)
 - **Context:** Users need to inspect completed/failed/aborted specialist TUIs after the parent synthesizes results.
 - **Decision:** Retain those panes until explicit cleanup; do not auto-close on completion.
 - **Consequences:** Pane accumulation risk; cleanup command/UX required; delivery docs must explain retention.
 
 ### ADR-014 — In-process fallback and Herdr fail-closed
 
-- **Status:** Accepted (approved target; **implementation pending**)
+- **Status:** Accepted (**implemented** in `0.2.0`; live Herdr acceptance incomplete)
 - **Context:** Operators need a non-Herdr path and must not get silent degradation when Herdr is broken.
 - **Decision:** Default in-process outside Herdr; allow explicit in-process override; if Herdr is detected but incompatible, fail closed.
 - **Consequences:** Clearer errors inside broken Herdr sessions; override must be explicit and documented.

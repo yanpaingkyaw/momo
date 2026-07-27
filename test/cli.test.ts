@@ -7,13 +7,14 @@ import { getPackageVersion, isEntryPoint, parseCliArgs } from "../src/cli.js";
 
 describe("parseCliArgs", () => {
   it("opens the TUI without an initial message", () => {
-    expect(parseCliArgs([])).toEqual({ action: "run" });
+    expect(parseCliArgs([])).toEqual({ action: "run", rawArgs: [] });
   });
 
   it("joins positional arguments into one initial message", () => {
     expect(parseCliArgs(["fix", "the", "tests"])).toEqual({
       action: "run",
       initialMessage: "fix the tests",
+      rawArgs: ["fix", "the", "tests"],
     });
   });
 
@@ -23,7 +24,7 @@ describe("parseCliArgs", () => {
     ["--version", "version"],
     ["-v", "version"],
   ] as const)("recognizes %s", (flag, action) => {
-    expect(parseCliArgs([flag])).toEqual({ action });
+    expect(parseCliArgs([flag])).toEqual({ action, rawArgs: [flag] });
   });
 
   it("rejects unknown options", () => {

@@ -1,25 +1,28 @@
 # Momo Orchestrator Specification
 
-Status: Implemented baseline; authenticated manual acceptance pending;
-Herdr pane-worker target approved, implementation pending
+Status: Baseline + Herdr pane-worker **implementation candidate** in package
+0.2.0; authenticated §27 and live §32.11 Herdr acceptance still pending
 Spec version: 1.1.0
-Package implementation version: 0.1.0 (`package.json` — unchanged; do not bump
-for documentation-only Milestone 0A)
-Last updated: 2026-07-26
+Package implementation version: 0.2.0 (`package.json`)
+Last updated: 2026-07-27
 
 Implementation-status summary (does not weaken normative requirements below):
 
-- Automated checks on 2026-07-26: `npm run typecheck` passed; `npm test`
-  passed 43/43 across six files; `npm run build` passed; compiled
-  `--help` / `--version` / unknown-option smoke checks passed.
+- Package `0.2.0` depends on `@earendil-works/pi-coding-agent@0.82.1`.
+- Automated checks cover typecheck/tests/build/CLI smoke with mocked Herdr
+  seams; they do **not** prove live Herdr compatibility.
 - Authenticated manual acceptance in §27 remains incomplete.
-- Current-state architecture is recorded in `Architecture.md` Part A.
+- Architecture is recorded in `Architecture.md` (baseline + candidate §32 map).
 - Known implementation gaps versus some presentation/redaction expectations
   are called out inline as **Implementation status** notes.
-- Spec 1.1.0 adds §32, the user-approved Herdr target contract.
-  **§32 implementation status: pending** until code lands. Until then, the
-  running system remains the in-process baseline described elsewhere in this
-  document and in `Architecture.md` Part A.
+- Spec 1.1.0 §32 Herdr target is an **implementation candidate** (fail-closed
+  preflight, execve Pi parent wrapper, pane-per-worker backend, IPC, writer
+  lease with wait/serialize never-steal, retention/cleanup, result-aware
+  relaunch reconciliation, in-process fallback/override). It is **not**
+  shipped/live-compatible until §32.11 passes.
+- Partial macOS operator evidence exists (parent prompt, scout E2E, four-role
+  panes, implementer write, reviewer diff, active planner cancel, cleanup).
+  Full cross-parent contention, crash recovery, and Linux remain pending.
 
 ## 1. Purpose
 
@@ -89,7 +92,7 @@ The implementation must use:
 - Node.js 22.19.0 or newer.
 - TypeScript in ECMAScript module mode.
 - npm for dependency and script management.
-- `@earendil-works/pi-coding-agent` compatible with version `0.80.10`.
+- `@earendil-works/pi-coding-agent` / `pi` CLI version `0.82.1` (required).
 - `typebox` for model-facing tool schemas.
 - Vitest for automated tests.
 
@@ -1034,9 +1037,9 @@ Momo version 1 is complete only when:
 9. User-facing documentation explains setup, usage, role behavior, and the
    absence of operating-system sandboxing.
 10. Current-state architecture is documented in `Architecture.md`.
-11. When claiming Herdr pane-worker support, §32 and its acceptance matrix are
-    satisfied. Until then, §32 remains implementation-pending and must not be
-    advertised as shipped behavior.
+11. When claiming production-ready Herdr pane-worker support, §32 and its
+    acceptance matrix are satisfied. Until §32.11 passes, §32 must be advertised
+    only as an implementation candidate, not as production/live Herdr-ready behavior.
 
 ## 29. Deferred Enhancements
 
@@ -1060,16 +1063,16 @@ The following may be considered after version 1:
 Deferred features must not weaken the version 1 permission boundaries when
 introduced.
 
-**Note:** §32 Herdr pane workers are an approved additive target tracked in
-spec 1.1.0. They are not deferred; they are **implementation-pending**.
+**Note:** §32 Herdr pane workers are an implementation candidate in package
+`0.2.0` code; live §32.11 acceptance remains pending.
 
 ## 30. Verified Implementation Notes
 
 The version 0.1.0 implementation established these SDK-specific details:
 
-- Spec contract version is `1.1.0` after Milestone 0A documentation; the
-  published package metadata version remains `0.1.0` until Herdr code ships.
-  Do not treat those numbers as interchangeable.
+- Spec contract version is `1.1.0`; package metadata version is `0.2.0` with
+  Pi SDK `0.82.1` and Herdr preflight targeting CLI `0.7.x` / protocol `17`.
+  Do not treat spec and package versions as interchangeable.
 - The delegate schema uses `Type.Unsafe` to emit a JSON Schema string enum.
   This matches Pi's `StringEnum` wire shape without adding a direct dependency
   on the transitive `@earendil-works/pi-ai` package.
@@ -1102,10 +1105,11 @@ The version 0.1.0 implementation established these SDK-specific details:
   a confirmed observed limitation from that smoke, not established Herdr
   compatibility and not a future design.
 
-As of 2026-07-26, `npm run typecheck` passed, `npm test` passed 43/43 across
-six files, `npm run build` passed, and compiled CLI help/version/unknown-option
-smoke checks passed. Authenticated TUI execution and the manual scenarios in
-section 27 remain incomplete.
+As of the 0.2.0 implementation pass, `npm run typecheck` passed, `npm test`
+passed (including mocked Herdr/IPC/lease/launch coverage), `npm run build`
+passed, and compiled CLI help/version/unknown-option smoke checks passed.
+Authenticated TUI scenarios in section 27 and live Herdr acceptance in §32.11
+remain incomplete and are not claimed here.
 
 ## 31. References
 
@@ -1118,15 +1122,16 @@ section 27 remain incomplete.
 - Herdr socket API docs: <https://herdr.dev/docs/socket-api/>
 - Current-state and approved-target architecture: `Architecture.md`
 
-## 32. Herdr Pane-Worker Target Contract (Approved; Implementation Pending)
+## 32. Herdr Pane-Worker Target Contract (Approved; Implementation Candidate)
 
 This section is normative for the user-approved Herdr target. Requirements use
 **must**, **must not**, **should**, and **may** as elsewhere.
 
-**Implementation status:** Pending. No package implementation version bump is
-authorized by documentation-only Milestone 0A. Until the implementation lands
-and acceptance in §32.11 passes, Momo must continue to behave according to the
-baseline in-process contract when Herdr mode is not active.
+**Implementation status:** Implementation candidate in package `0.2.0` with
+mocked unit and integration coverage. Live operator acceptance in §32.11 is
+still incomplete; do not advertise production/live Herdr readiness until it
+passes. When Herdr mode is not active (or `MOMO_BACKEND=inprocess`), Momo
+continues to use the baseline in-process specialist backend.
 
 Architecture companion: `Architecture.md` §13–§14 (ADR-009 through ADR-014).
 
@@ -1260,7 +1265,7 @@ least the following with a real Herdr session and configured Pi model:
 4. Parallel read-only tasks allocate panes immediately and never exceed four
    active read-only workers.
 5. An implementer acquires the cross-process writer lease; a second implementer
-   waits or is serialized; parallel implementer validation still fails.
+   waits/serializes (never steals); parallel implementer validation still fails.
 6. Progress and final results arrive over IPC; killing TTY readability does not
    corrupt authoritative completion if IPC remains intact.
 7. Cancellation aborts active workers and skips queued work without orphan
