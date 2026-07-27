@@ -120,6 +120,27 @@ function controlRunId(generation: number): string {
 	return `g${generation}`;
 }
 
+/**
+ * Non-archival live pool workers must already execute at the pool canonical root.
+ * Missing (pre-fix) or subdirectory cwd is incompatible — fail closed for cleanup.
+ */
+function assertLiveWorkerCanonicalCwd(
+	record: PoolWorkerRecord,
+	canonicalRoot: string,
+	roleName: string,
+): void {
+	if (!record.cwd) {
+		throw new Error(
+			`Role ${roleName} live worker missing cwd (incompatible with canonical pool); run /momo-cleanup`,
+		);
+	}
+	if (record.cwd !== canonicalRoot) {
+		throw new Error(
+			`Role ${roleName} live worker cwd is not the pool canonical root; run /momo-cleanup`,
+		);
+	}
+}
+
 function assignmentIdentity(assignmentId: string, workerId: string): { runId: string; workerId: string } {
 	return { runId: assignmentId, workerId };
 }
@@ -354,6 +375,11 @@ class AssignmentProxy implements ChildSession {
 				// Live starting reservation (even before paneId lands) must WAIT —
 				// never treat !paneId as a signal to reserve generation N+1.
 				if (existing && !isArchivalTombstone(existing) && existing.status === "starting") {
+					assertLiveWorkerCanonicalCwd(
+						existing,
+						this.runtime.cwd,
+						this.role.name,
+					);
 					if (existing.workerId !== this.workerId) {
 						throw new Error(
 							`Role ${this.role.name} starting worker ${existing.workerId} mismatches ${this.workerId}`,
@@ -386,10 +412,14 @@ class AssignmentProxy implements ChildSession {
 						role: this.role.name,
 						agentName,
 						status: "starting",
+						cwd: this.runtime.cwd,
 						updatedAt: new Date(this.runtime.now()).toISOString(),
 					});
 					return { kind: "provision", generation, agentName };
 				}
+
+				// Every other non-archival live record must already be at canonical root.
+				assertLiveWorkerCanonicalCwd(existing, this.runtime.cwd, this.role.name);
 
 				if (!existing.paneId || !existing.agentName) {
 					throw new Error(
@@ -448,6 +478,7 @@ class AssignmentProxy implements ChildSession {
 							paneId,
 							agentName: plan.agentName,
 							status: "starting",
+							cwd: this.runtime.cwd,
 							generationTombstone: Math.max(record.generationTombstone, plan.generation),
 							updatedAt: new Date(this.runtime.now()).toISOString(),
 						});
@@ -505,6 +536,7 @@ class AssignmentProxy implements ChildSession {
 				) {
 					throw new Error(`Role ${this.role.name} worker superseded after ready`);
 				}
+				assertLiveWorkerCanonicalCwd(record, this.runtime.cwd, this.role.name);
 				if (!record.paneId || !record.agentName) {
 					throw new Error(`Role ${this.role.name} worker missing pane/agent after ready`);
 				}
@@ -545,6 +577,7 @@ class AssignmentProxy implements ChildSession {
 		if (record.generation !== this.generation || record.workerId !== this.workerId) {
 			throw new Error("dispatch generation/worker fence mismatch");
 		}
+		assertLiveWorkerCanonicalCwd(record, this.runtime.cwd, this.role.name);
 		if (!record.paneId || !record.agentName) {
 			throw new Error("dispatch requires live pane/agent identity");
 		}
@@ -879,7 +912,9 @@ export function createHerdrChildSessionFactory(options: HerdrFactoryOptions): Ch
 		((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
 
 	const runtime: FactoryRuntime = {
-		cwd: options.cwd,
+		// Persistent workers always execute from the pool canonical root so
+		// parents in different subdirectories of the same repo share one pane.
+		cwd: identity.canonicalRoot,
 		parentPaneId: options.parentPaneId,
 		parentId: options.parentId,
 		parentEpoch,
@@ -897,6 +932,7 @@ export function createHerdrChildSessionFactory(options: HerdrFactoryOptions): Ch
 	};
 
 	return async ({ cwd, role }: ChildSessionFactoryInput) => {
+		// Factory still accepts the parent request cwd (must match parent options).
 		if (cwd !== options.cwd) {
 			throw new Error("Child working directory must match the parent working directory");
 		}

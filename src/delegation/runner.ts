@@ -262,6 +262,14 @@ function skippedResult(task: DelegatedTask): TaskResult {
 	};
 }
 
+function allocationFailedResult(task: DelegatedTask, error: unknown): TaskResult {
+	return {
+		...skippedResult(task),
+		status: "failed",
+		error: { message: errorMessage(error) },
+	};
+}
+
 function taskOutput(output: string): Pick<TaskResult, "output" | "outputTruncated" | "fullOutput"> {
 	const visible = truncateUtf8(output);
 	return {
@@ -321,24 +329,26 @@ export function createDelegationRunner(options: DelegationRunnerOptions): Delega
 		}
 	};
 
-	/** Prepare all children; on any failure terminal-cancel successes then throw. */
-	const prepareAllChildren = async (tasks: readonly DelegatedTask[]): Promise<PreparedChild[]> => {
+	/**
+	 * Parallel allocation: settle each child independently. Failures become
+	 * structured TaskResults — never dispose healthy siblings without running them.
+	 */
+	const allocateParallelSlots = async (
+		tasks: readonly DelegatedTask[],
+	): Promise<
+		Array<
+			| { ok: true; prepared: PreparedChild }
+			| { ok: false; task: DelegatedTask; error: unknown }
+		>
+	> => {
 		const outcomes = await Promise.allSettled(tasks.map((task) => allocateChild(task)));
-		const prepared: PreparedChild[] = [];
-		const failures: unknown[] = [];
-		for (const outcome of outcomes) {
-			if (outcome.status === "fulfilled") prepared.push(outcome.value);
-			else failures.push(outcome.reason);
-		}
-		if (failures.length > 0) {
-			await Promise.allSettled(
-				prepared.map((child) => terminalSkipPrepared(child, "allocation_failed")),
-			);
-			throw failures[0] instanceof Error
-				? failures[0]
-				: new Error(errorMessage(failures[0]));
-		}
-		return prepared;
+		return outcomes.map((outcome, index) => {
+			const task = tasks[index]!;
+			if (outcome.status === "fulfilled") {
+				return { ok: true as const, prepared: outcome.value };
+			}
+			return { ok: false as const, task, error: outcome.reason };
+		});
 	};
 
 	const executeTask = async (
@@ -573,23 +583,27 @@ export function createDelegationRunner(options: DelegationRunnerOptions): Delega
 			if (request.mode === "single") {
 				const task = { agent: request.agent, task: request.task };
 				reportProgress(runOptions, { mode: request.mode, phase: "queued", index: 0, agent: task.agent, message: `${task.agent} queued` });
-				const [prepared] = await prepareAllChildren([task]);
-				if (!prepared) throw new Error("Failed to prepare single child");
-				return finish(request.mode, [await runTask(request.mode, task, 0, runOptions, prepared)]);
+				// Lazy: allocate inside executeTask so allocation failures are TaskResults.
+				return finish(request.mode, [await runTask(request.mode, task, 0, runOptions)]);
 			}
 
 			if (request.mode === "parallel") {
 				for (const [index, task] of request.tasks.entries()) {
 					reportProgress(runOptions, { mode: request.mode, phase: "queued", index, agent: task.agent, message: `${task.agent} queued` });
 				}
-				const preparedList = await prepareAllChildren(request.tasks);
-				const scheduled = await mapWithConcurrency<PreparedChild, TaskResult>(
-					preparedList,
-					(prepared, index, signal) =>
-						runTask(request.mode, prepared.task, index, {
-								...runOptions,
-								...(signal === undefined ? {} : { signal }),
-							}, prepared),
+				const slots = await allocateParallelSlots(request.tasks);
+				type ParallelSlot = (typeof slots)[number];
+				const scheduled = await mapWithConcurrency<ParallelSlot, TaskResult>(
+					slots,
+					async (slot, index, signal) => {
+						if (!slot.ok) {
+							return allocationFailedResult(slot.task, slot.error);
+						}
+						return runTask(request.mode, slot.prepared.task, index, {
+							...runOptions,
+							...(signal === undefined ? {} : { signal }),
+						}, slot.prepared);
+					},
 					{
 						concurrency,
 						...(runOptions.signal === undefined ? {} : { signal: runOptions.signal }),
@@ -607,14 +621,14 @@ export function createDelegationRunner(options: DelegationRunnerOptions): Delega
 				for (let index = 0; index < scheduled.length; index += 1) {
 					const item = scheduled[index];
 					const task = request.tasks[index];
-					const prepared = preparedList[index];
-					if (!task || !item) throw new Error(`Missing parallel task at index ${index}`);
+					const slot = slots[index];
+					if (!task || !item || !slot) throw new Error(`Missing parallel task at index ${index}`);
 					if (item.status === "fulfilled") {
 						results.push(item.value);
 						continue;
 					}
 					if (item.status === "skipped") {
-						if (prepared) await terminalSkipPrepared(prepared, "parallel_skipped");
+						if (slot.ok) await terminalSkipPrepared(slot.prepared, "parallel_skipped");
 						results.push(skippedResult(task));
 						continue;
 					}
@@ -637,37 +651,22 @@ export function createDelegationRunner(options: DelegationRunnerOptions): Delega
 				return finish(request.mode, results);
 			}
 
-			// Chain: allocate all step panes immediately; prompt sequentially with {previous}.
-			const preparedSteps = await prepareAllChildren(
-				request.steps.map((step) => ({ agent: step.agent, task: step.task })),
-			);
+			// Chain: allocate one step at a time (lazy). Failed/aborted steps skip
+			// remaining tails without creating their sessions.
 			const results: TaskResult[] = [];
 			let previous = "";
 			for (let index = 0; index < request.steps.length; index++) {
 				const step = request.steps[index];
-				const prepared = preparedSteps[index];
-				if (!step || !prepared) throw new Error(`Missing chain step at index ${index}`);
+				if (!step) throw new Error(`Missing chain step at index ${index}`);
 				if (runOptions.signal?.aborted) {
 					results.push({
 						...skippedResult(step),
 						status: "aborted",
 						error: { message: "Delegation aborted before child startup" },
 					});
-					// Bounded abort for the current step; remaining steps get terminal skip.
-					const abortPromise = prepared.session.abort().catch(() => {});
-					await waitWithTimeout(abortPromise, abortTimeoutMs);
-					try {
-						await prepared.session.dispose();
-					} catch {
-						// best effort
-					}
-					for (let rest = index + 1; rest < preparedSteps.length; rest += 1) {
+					for (let rest = index + 1; rest < request.steps.length; rest += 1) {
 						const remaining = request.steps[rest];
-						const remainingPrepared = preparedSteps[rest];
 						if (remaining) results.push(skippedResult(remaining));
-						if (remainingPrepared) {
-							await terminalSkipPrepared(remainingPrepared, "chain_cancelled");
-						}
 					}
 					break;
 				}
@@ -676,22 +675,12 @@ export function createDelegationRunner(options: DelegationRunnerOptions): Delega
 					task: step.task.replaceAll("{previous}", previous),
 				};
 				reportProgress(runOptions, { mode: request.mode, phase: "queued", index, agent: task.agent, message: `${task.agent} queued` });
-				const result = await runTask(
-					request.mode,
-					task,
-					index,
-					runOptions,
-					{ ...prepared, task },
-				);
+				const result = await runTask(request.mode, task, index, runOptions);
 				results.push(result);
 				if (result.status !== "completed") {
-					for (let rest = index + 1; rest < preparedSteps.length; rest += 1) {
+					for (let rest = index + 1; rest < request.steps.length; rest += 1) {
 						const remaining = request.steps[rest];
-						const remainingPrepared = preparedSteps[rest];
 						if (remaining) results.push(skippedResult(remaining));
-						if (remainingPrepared) {
-							await terminalSkipPrepared(remainingPrepared, "chain_skipped_after_failure");
-						}
 					}
 					break;
 				}

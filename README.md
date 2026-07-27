@@ -82,11 +82,13 @@ herdr integration install pi
 When the Herdr backend is active, accepted specialist tasks use a **persistent
 role-pane pool**:
 
-1. Runner logically preallocates assignment proxies (chain tails that never
-   prompt create no panes)
+1. Parallel tasks allocate assignment proxies concurrently (failures are
+   structured `TaskResult`s). Single/chain allocate lazily one step at a time
+   (chain tails that never prompt create no sessions/panes)
 2. Physical pane/agent starts lazily on first `prompt()` for that role
 3. Exactly one Momo-managed pane per role per pool key (canonical repo + Herdr
-   workspace + socket); busy same-role work FIFO-queues with no overflow panes
+   workspace + socket); workers execute from the canonical root; busy same-role
+   work FIFO-queues with no overflow panes
 4. Model-visible context resets each assignment; transcript/pane persists
 5. Progress/results use private versioned IPC (control heartbeat separate from
    assignment spools; never TTY scraping)

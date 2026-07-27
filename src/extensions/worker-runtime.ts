@@ -270,6 +270,7 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 				role: role.name,
 				...(current.paneId ? { paneId: current.paneId } : {}),
 				...(current.agentName ? { agentName: current.agentName } : {}),
+				...(current.cwd ? { cwd: current.cwd } : cwd ? { cwd } : {}),
 				status: "idle",
 				updatedAt: new Date(now()).toISOString(),
 			});
@@ -282,6 +283,7 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 			role: role.name,
 			...(current.paneId ? { paneId: current.paneId } : {}),
 			...(current.agentName ? { agentName: current.agentName } : {}),
+			...(current.cwd ? { cwd: current.cwd } : cwd ? { cwd } : {}),
 			status,
 			updatedAt: new Date(now()).toISOString(),
 			...(extra.activeAssignmentId !== undefined

@@ -317,43 +317,120 @@ describe("herdr factory + runner integration", () => {
 		});
 		expect(chain.results[0]?.status).toBe("failed");
 		expect(chain.results[1]?.status).toBe("skipped");
-		expect(sessions[1]?.skip).toHaveBeenCalledWith("chain_skipped_after_failure");
+		// Lazy chain: second step never allocated, so no skip IPC.
+		expect(sessions).toHaveLength(1);
 	});
 
-	it("cleans up successfully prepared workers when allocation partially fails", async () => {
+	it("preserves sibling results when parallel allocation partially fails", async () => {
 		const cwd = tempDir("momo-alloc-cwd-");
-		const skips: string[] = [];
+		const prompts: string[] = [];
 		let count = 0;
 		const runner = createDelegationRunner({
 			cwd,
 			roles: ROLE_LIST,
 			createChildSession: async ({ role }) => {
 				count += 1;
-				if (count === 2) throw new Error("split failed");
+				if (role.name === "planner") throw new Error("split failed");
 				return {
-					messages: [],
+					messages: [
+						{
+							role: "assistant",
+							content: [{ type: "text", text: `${role.name}-ok` }],
+							usage: { input: 1, output: 1, totalTokens: 2, cost: { total: 0 } },
+						},
+					],
 					agent: { waitForIdle: async () => {} },
 					subscribe: () => () => {},
-					prompt: async () => {},
-					abort: async () => {},
-					skip: async (reason: string) => {
-						skips.push(`${role.name}:${reason}`);
+					prompt: async (text: string) => {
+						prompts.push(`${role.name}:${text}`);
 					},
+					abort: async () => {},
 					dispose: async () => {},
 				};
 			},
 		});
 
-		await expect(
-			runner.run({
-				mode: "parallel",
-				tasks: [
-					{ agent: "scout", task: "a" },
-					{ agent: "planner", task: "b" },
-				],
-			}),
-		).rejects.toThrow(/split failed/);
-		expect(skips).toEqual(["scout:allocation_failed"]);
+		const result = await runner.run({
+			mode: "parallel",
+			tasks: [
+				{ agent: "scout", task: "a" },
+				{ agent: "planner", task: "b" },
+				{ agent: "reviewer", task: "c" },
+			],
+		});
+		expect(result.status).toBe("partial");
+		expect(result.results.map((task) => task.status)).toEqual([
+			"completed",
+			"failed",
+			"completed",
+		]);
+		expect(result.results[1]?.error?.message).toMatch(/split failed/);
+		expect(prompts).toHaveLength(2);
+		expect(prompts).toContain("scout:a");
+		expect(prompts).toContain("reviewer:c");
+		expect(count).toBe(3);
+	});
+
+	it("returns failed TaskResult for single allocation failure", async () => {
+		const cwd = tempDir("momo-alloc-single-");
+		const runner = createDelegationRunner({
+			cwd,
+			roles: ROLE_LIST,
+			createChildSession: async () => {
+				throw new Error("pane split failed");
+			},
+		});
+		const result = await runner.run({
+			mode: "single",
+			agent: "scout",
+			task: "x",
+		});
+		expect(result.status).toBe("failed");
+		expect(result.results).toHaveLength(1);
+		expect(result.results[0]?.status).toBe("failed");
+		expect(result.results[0]?.error?.message).toMatch(/pane split failed/);
+	});
+
+	it("skips chain tails when a later step fails to allocate", async () => {
+		const cwd = tempDir("momo-alloc-chain-");
+		let count = 0;
+		const runner = createDelegationRunner({
+			cwd,
+			roles: ROLE_LIST,
+			createChildSession: async ({ role }) => {
+				count += 1;
+				if (role.name === "planner") throw new Error("later alloc failed");
+				return {
+					messages: [
+						{
+							role: "assistant",
+							content: [{ type: "text", text: "scout-ok" }],
+							usage: { input: 1, output: 1, totalTokens: 2, cost: { total: 0 } },
+						},
+					],
+					agent: { waitForIdle: async () => {} },
+					subscribe: () => () => {},
+					prompt: async () => {},
+					abort: async () => {},
+					dispose: async () => {},
+				};
+			},
+		});
+		const result = await runner.run({
+			mode: "chain",
+			steps: [
+				{ agent: "scout", task: "first" },
+				{ agent: "planner", task: "second {previous}" },
+				{ agent: "reviewer", task: "third" },
+			],
+		});
+		expect(result.results.map((task) => task.status)).toEqual([
+			"completed",
+			"failed",
+			"skipped",
+		]);
+		expect(result.results[1]?.error?.message).toMatch(/later alloc failed/);
+		expect(count).toBe(2);
 	});
 
 	it("preserves assistant output and stopReason when remote wait fails", async () => {

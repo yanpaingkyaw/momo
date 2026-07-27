@@ -122,8 +122,8 @@ describe("delegation runner", () => {
 		expect(result.status).toBe("failed");
 		expect(result.results.map(({ status }) => status)).toEqual(["failed", "skipped"]);
 		expect(result.results[0]?.error?.message).toBe("provider unavailable");
-		// Immediate allocation creates every chain pane/session up front.
-		expect(current.disposals).toBe(2);
+		// Lazy chain: only the failed step allocated a session.
+		expect(current.disposals).toBe(1);
 	});
 
 	it("serializes writers across concurrent delegations", async () => {

@@ -357,14 +357,15 @@ flowchart LR
 
 For each accepted specialist task under Herdr mode:
 
-1. **Logically preallocate** an assignment proxy when the runner prepares children (parallel/chain). Prepared chain tails that never prompt **must not** enqueue or create panes.
+1. **Parallel** tasks allocate assignment proxies concurrently (allocation failures become structured failed `TaskResult`s without discarding healthy siblings). **Single** and **chain** allocate lazily one step at a time — chain tails that never prompt must not create sessions or panes.
 2. **Lazily create** the physical role pane only when `prompt()` executes and no compatible idle/busy pool worker exists for that role.
-3. **Reuse** only Momo-managed compatible panes: exactly **one persistent pane per role** per `poolKey`.
+3. **Reuse** only Momo-managed compatible panes: exactly **one persistent pane per role** per `poolKey`. Live reuse requires registry `cwd` exactly equal to the pool canonical root (missing/subdirectory cwd fails closed for `/momo-cleanup`).
 4. `poolKey` = hash(canonical git root or cwd + `HERDR_WORKSPACE_ID` + Herdr socket/server identity). **Excludes** parent pane id so multiple parents in the same workspace share the pool.
-5. Busy same-role tasks enter a cross-parent filesystem **FIFO** queue (no overflow panes). Cross-role work may run in parallel (subject to the writer lease for implementers).
-6. Model-visible context resets each assignment via the Pi `context` event (latest assignment user message onward). Transcript/pane persists. **Do not** call `ctx.newSession`.
-7. Registry states: `starting` / `idle` / `busy` / `blocked` / `unhealthy` / `uncertain`. Task failure → idle (or next queued). Protocol/process failure → unhealthy. Ambiguous implementer → uncertain (no reuse).
-8. Interactive/RPC input is **always blocked** on persistent workers (including idle).
+5. Physical worker `cwd` / `MOMO_CWD` / manifest / writer-lease cwd is always the **canonical repository root** (realpath of supplied or detected root), never the parent subdirectory that first provisioned the pane. Registry transitions must retain that cwd.
+6. Busy same-role tasks enter a cross-parent filesystem **FIFO** queue (no overflow panes). Cross-role work may run in parallel (subject to the writer lease for implementers).
+7. Model-visible context resets each assignment via the Pi `context` event (latest assignment user message onward). Transcript/pane persists. **Do not** call `ctx.newSession`.
+8. Registry states: `starting` / `idle` / `busy` / `blocked` / `unhealthy` / `uncertain`. Task failure → idle (or next queued). Protocol/process failure → unhealthy. Ambiguous implementer → uncertain (no reuse).
+9. Interactive/RPC input is **always blocked** on persistent workers (including idle).
 
 ### 13.5 IPC (authoritative)
 
@@ -452,7 +453,7 @@ Shipped modules are listed in **§13.0** (not the obsolete “not yet created”
 
 - **Status:** Accepted (**implemented** in `0.2.0` candidate; live Herdr acceptance incomplete)
 - **Context:** Pane-per-task allocation created duplicate implementer/reviewer panes for repeated work.
-- **Decision:** Under Herdr mode, keep exactly one persistent Momo-managed pane per role per `poolKey` (canonical repo + Herdr workspace + socket). Runner still logically preallocates; factory returns assignment proxies; physical panes are lazy on prompt; busy same-role work FIFO-queues without overflow panes.
+- **Decision:** Under Herdr mode, keep exactly one persistent Momo-managed pane per role per `poolKey` (canonical repo + Herdr workspace + socket). Runner allocates parallel proxies concurrently (failures are structured task results); single/chain allocate lazily per step. Physical panes are lazy on prompt; busy same-role work FIFO-queues without overflow panes. Workers always run from the canonical repo root so subdirectory parents share cwd and panes.
 - **Consequences:** Shared cross-parent pool requires transaction locks and adoption identity checks; legacy v1 panes must be migrated/closed, never adopted.
 
 ### ADR-011 — Structured versioned IPC

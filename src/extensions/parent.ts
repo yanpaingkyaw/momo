@@ -233,7 +233,8 @@ export function installMomoParent(pi: ExtensionAPI, options: InstallMomoParentOp
 						if (current.status === "uncertain") {
 							// Do not treat a missing lease as proof of safety: it
 							// can be a corrupted/partially removed lease.
-							const owner = leases.peekOwner(cwd);
+							const leaseCwd = current.cwd ?? identity.canonicalRoot;
+							const owner = leases.peekOwner(leaseCwd);
 							if (!owner || owner.ownerId !== current.workerId) {
 								notes.push(`refused uncertain ${current.workerId}: lease owner unavailable or mismatched`);
 								return;
@@ -249,7 +250,8 @@ export function installMomoParent(pi: ExtensionAPI, options: InstallMomoParentOp
 							}
 						}
 						if (current.status === "uncertain") {
-							const release = leases.forceReleaseIfOwner(cwd, current.workerId);
+							const leaseCwd = current.cwd ?? identity.canonicalRoot;
+							const release = leases.forceReleaseIfOwner(leaseCwd, current.workerId);
 							if (!release.released) {
 								notes.push(`lease not released for ${current.workerId}: ${release.reason ?? "unknown"}`);
 								return;
@@ -359,10 +361,16 @@ export async function adoptPoolWorkers(
 				manifest.generation !== worker.generation ||
 				manifest.paneId !== worker.paneId ||
 				manifest.agentName !== worker.agentName ||
-				manifest.role !== worker.role ||
-				(worker.cwd !== undefined && manifest.cwd !== worker.cwd)
+				manifest.role !== worker.role
 			) {
 				throw new Error("manifest identity mismatch");
+			}
+			// Live manifested workers must carry canonical cwd on registry + manifest.
+			if (worker.cwd === undefined || typeof manifest.cwd !== "string") {
+				throw new Error("missing canonical cwd on registry or manifest");
+			}
+			if (manifest.cwd !== worker.cwd) {
+				throw new Error("manifest cwd mismatch");
 			}
 
 			const heartbeatRaw = tryReadIpcJson(control.heartbeat);
@@ -379,7 +387,7 @@ export async function adoptPoolWorkers(
 			}
 
 			const info = await client.agentGet(worker.agentName);
-			if (info.paneId && info.paneId !== worker.paneId) {
+			if (info.paneId !== worker.paneId) {
 				throw new Error("Herdr pane identity mismatch");
 			}
 

@@ -1011,6 +1011,7 @@ describe("dispatch/claim durable order fault injection", () => {
 				role: "scout",
 				paneId: "w1:p1",
 				agentName: "momo_scout",
+				cwd: identity.canonicalRoot,
 				status: "idle",
 				updatedAt: new Date().toISOString(),
 			});
@@ -1089,6 +1090,7 @@ describe("dispatch/claim durable order fault injection", () => {
 				role: "scout",
 				paneId: "w1:p1",
 				agentName: "momo_scout",
+				cwd: identity.canonicalRoot,
 				status: "idle",
 				updatedAt: new Date().toISOString(),
 			});
@@ -1233,6 +1235,135 @@ describe("adoption generation/worker fence", () => {
 		const final = pool.getByRole("scout")!;
 		expect(final.status).toBe("busy");
 		expect(final.activeAssignmentId).toBe("newnewnewnewnew2");
+	});
+
+	it("missing Herdr paneId is an adoption identity mismatch (fail closed)", async () => {
+		const { adoptPoolWorkers } = await import("../src/extensions/parent.js");
+		const cacheRoot = tempDir("momo-adopt-nopane-");
+		const cwd = tempDir("momo-adopt-nopane-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const workerId = stableWorkerId(identity.poolKey, "scout");
+		const control = workerControlPaths(pool.poolRoot, "scout");
+		mkdirSync(control.root, { recursive: true, mode: 0o700 });
+		pool.upsert({
+			workerId,
+			generation: 1,
+			generationTombstone: 1,
+			role: "scout",
+			paneId: "w1:p1",
+			agentName: "momo_scout",
+			cwd,
+			status: "idle",
+			updatedAt: new Date().toISOString(),
+		});
+		atomicWriteJson(control.manifest, {
+			version: 2,
+			poolKey: identity.poolKey,
+			workerId,
+			generation: 1,
+			role: "scout",
+			cwd,
+			paneId: "w1:p1",
+			agentName: "momo_scout",
+			createdAt: new Date().toISOString(),
+		});
+		atomicWriteJson(control.heartbeat, {
+			version: 1,
+			runId: "g1",
+			workerId,
+			at: new Date().toISOString(),
+			seq: 1,
+		});
+		const notes: string[] = [];
+		const client = new HerdrClient({
+			runCommand: async () => ({
+				code: 0,
+				stdout: JSON.stringify({
+					id: "ok",
+					result: {
+						type: "agent_info",
+						// Successful but incomplete — no pane_id.
+						agent: { agent_status: "idle", name: "momo_scout" },
+					},
+				}),
+				stderr: "",
+			}),
+		});
+		await adoptPoolWorkers(pool, client, identity.poolKey, {
+			ui: { notify: (m: string) => notes.push(m) },
+		});
+		expect(notes.join("\n")).toMatch(/pane identity|Did not adopt/i);
+		expect(pool.getByRole("scout")?.status).toBe("unhealthy");
+	});
+
+	it("adoption of live worker without registry cwd fails closed", async () => {
+		const { adoptPoolWorkers } = await import("../src/extensions/parent.js");
+		const cacheRoot = tempDir("momo-adopt-nocwd-");
+		const cwd = tempDir("momo-adopt-nocwd-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const workerId = stableWorkerId(identity.poolKey, "scout");
+		const control = workerControlPaths(pool.poolRoot, "scout");
+		mkdirSync(control.root, { recursive: true, mode: 0o700 });
+		pool.upsert({
+			workerId,
+			generation: 1,
+			generationTombstone: 1,
+			role: "scout",
+			paneId: "w1:p1",
+			agentName: "momo_scout",
+			// Missing registry cwd — pre-fix candidate.
+			status: "idle",
+			updatedAt: new Date().toISOString(),
+		});
+		atomicWriteJson(control.manifest, {
+			version: 2,
+			poolKey: identity.poolKey,
+			workerId,
+			generation: 1,
+			role: "scout",
+			cwd,
+			paneId: "w1:p1",
+			agentName: "momo_scout",
+			createdAt: new Date().toISOString(),
+		});
+		atomicWriteJson(control.heartbeat, {
+			version: 1,
+			runId: "g1",
+			workerId,
+			at: new Date().toISOString(),
+			seq: 1,
+		});
+		const notes: string[] = [];
+		const client = new HerdrClient({
+			runCommand: async () => ({
+				code: 0,
+				stdout: JSON.stringify({
+					id: "ok",
+					result: {
+						type: "agent_info",
+						agent: { agent_status: "idle", pane_id: "w1:p1", name: "momo_scout" },
+					},
+				}),
+				stderr: "",
+			}),
+		});
+		await adoptPoolWorkers(pool, client, identity.poolKey, {
+			ui: { notify: (m: string) => notes.push(m) },
+		});
+		expect(notes.join("\n")).toMatch(/canonical cwd|Did not adopt/i);
+		expect(pool.getByRole("scout")?.status).toBe("unhealthy");
 	});
 
 	it("stale busy-A snapshot does not overwrite current idle (success path)", async () => {
@@ -3103,6 +3234,88 @@ describe("at-most-once startup reconcile", () => {
 		await vi.advanceTimersByTimeAsync(200);
 		expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
 		expect(pi.sendUserMessage).toHaveBeenCalledWith("task-b");
+	});
+
+	it("preserves canonical cwd across busy→idle and sequential claim publish", async () => {
+		vi.useFakeTimers();
+		const cacheRoot = tempDir("momo-cwd-persist-");
+		const cwd = tempDir("momo-cwd-persist-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const { pi, ctx, workerId, control } = installRole({ pool, identity, role: "scout", cwd });
+		pool.upsert({
+			workerId,
+			generation: 1,
+			generationTombstone: 1,
+			role: "scout",
+			paneId: "w1:p1",
+			agentName: "momo_scout",
+			cwd: identity.canonicalRoot,
+			status: "idle",
+			updatedAt: new Date().toISOString(),
+		});
+		const assignmentA = "cwdpersistaaaa01";
+		const assignmentB = "cwdpersistbbbb02";
+		enqueueAssignment(pool.poolRoot, "scout", {
+			assignmentId: assignmentA,
+			workerId,
+			generation: 1,
+			parentEpoch: "e1",
+			task: "task-a",
+		});
+		enqueueAssignment(pool.poolRoot, "scout", {
+			assignmentId: assignmentB,
+			workerId,
+			generation: 1,
+			parentEpoch: "e1",
+			task: "task-b",
+		});
+		await pi.emit("session_start", {}, ctx);
+		expect(pool.getByRole("scout")?.status).toBe("busy");
+		expect(pool.getByRole("scout")?.activeAssignmentId).toBe(assignmentA);
+		expect(pool.getByRole("scout")?.cwd).toBe(identity.canonicalRoot);
+
+		await vi.advanceTimersByTimeAsync(200);
+		expect(pi.sendUserMessage).toHaveBeenCalledWith("task-a");
+		await pi.emit(
+			"message_end",
+			{
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "done-a" }],
+					stopReason: "stop",
+				},
+			},
+			ctx,
+		);
+		await pi.emit("agent_settled", {}, ctx);
+		expect(pool.getByRole("scout")?.activeAssignmentId).toBe(assignmentB);
+		expect(pool.getByRole("scout")?.status).toBe("busy");
+		expect(pool.getByRole("scout")?.cwd).toBe(identity.canonicalRoot);
+
+		await vi.advanceTimersByTimeAsync(200);
+		await pi.emit(
+			"message_end",
+			{
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "done-b" }],
+					stopReason: "stop",
+				},
+			},
+			ctx,
+		);
+		await pi.emit("agent_settled", {}, ctx);
+		expect(pool.getByRole("scout")?.status).toBe("idle");
+		expect(pool.getByRole("scout")?.cwd).toBe(identity.canonicalRoot);
+		expect(pool.getByRole("scout")?.activeAssignmentId).toBeUndefined();
+		void control;
+		vi.useRealTimers();
 	});
 
 	it("uncertain result retains evidence and does not advance B", async () => {

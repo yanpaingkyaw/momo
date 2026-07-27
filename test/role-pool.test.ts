@@ -529,4 +529,212 @@ describe("persistent worker assignment isolation", () => {
 		void tokens;
 		expect(existsSync(control.ready)).toBe(true);
 	});
+
+	it("two parents in different subdirs of same repo share one role pane at canonical root", async () => {
+		installFakeHerdrExtension();
+		const { execFileSync } = await import("node:child_process");
+		const cacheRoot = tempDir("momo-subdir-cache-");
+		const repo = tempDir("momo-subdir-repo-");
+		execFileSync("git", ["init"], { cwd: repo, stdio: "ignore" });
+		const subA = path.join(repo, "packages", "a");
+		const subB = path.join(repo, "apps", "b");
+		mkdirSync(subA, { recursive: true });
+		mkdirSync(subB, { recursive: true });
+
+		const splitCwds: string[] = [];
+		const momoCwds: string[] = [];
+		const splits: string[] = [];
+		const counter = { n: 0 };
+		const client = new HerdrClient({
+			runCommand: async (_file, args) => {
+				if (args[0] === "pane" && args[1] === "split") {
+					counter.n += 1;
+					const cwdIdx = args.indexOf("--cwd");
+					if (cwdIdx >= 0) splitCwds.push(String(args[cwdIdx + 1]));
+					const paneId = `w1:p${counter.n}`;
+					splits.push(paneId);
+					const envArgs = args.filter((arg, index) => args[index - 1] === "--env");
+					const env: Record<string, string> = {};
+					for (const value of envArgs) {
+						const eq = value.indexOf("=");
+						if (eq > 0) env[value.slice(0, eq)] = value.slice(eq + 1);
+					}
+					momoCwds.push(env.MOMO_CWD ?? "");
+					const controlDir = env.MOMO_CONTROL_DIR || env.MOMO_IPC_DIR;
+					const workerId = env.MOMO_WORKER_ID;
+					const runId = env.MOMO_RUN_ID;
+					if (controlDir && workerId && runId) {
+						atomicWriteJson(path.join(controlDir, "ready.json"), {
+							version: 1,
+							runId,
+							workerId,
+							readyAt: new Date().toISOString(),
+						});
+						atomicWriteJson(path.join(controlDir, "heartbeat.json"), {
+							version: 1,
+							runId,
+							workerId,
+							at: new Date().toISOString(),
+							seq: 1,
+						});
+					}
+					return {
+						code: 0,
+						stdout: JSON.stringify({ id: "s", result: { pane: { pane_id: paneId } } }),
+						stderr: "",
+					};
+				}
+				if (args[0] === "pane" && args[1] === "rename") {
+					return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+				}
+				if (args[0] === "pane" && args[1] === "report-metadata") {
+					return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+				}
+				if (args[0] === "agent" && args[1] === "start") {
+					const paneFlag = args.indexOf("--pane");
+					const paneId = args[paneFlag + 1] ?? "";
+					const name = args[2] ?? "";
+					return { code: 0, stdout: agentStartStdout(paneId, name), stderr: "" };
+				}
+				return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+			},
+		});
+
+		const identityA = resolvePoolIdentity({
+			cwd: subA,
+			workspaceId: "ws-shared",
+			socketPath: "/tmp/herdr-shared.sock",
+		});
+		const identityB = resolvePoolIdentity({
+			cwd: subB,
+			workspaceId: "ws-shared",
+			socketPath: "/tmp/herdr-shared.sock",
+		});
+		expect(identityA.poolKey).toBe(identityB.poolKey);
+		expect(identityA.canonicalRoot).toBe(identityB.canonicalRoot);
+
+		const pool = new PoolRegistry(identityA.poolKey, cacheRoot);
+		const factoryA = createHerdrChildSessionFactory({
+			cwd: subA,
+			parentPaneId: "w1:pA",
+			parentId: "parent-a",
+			client,
+			poolRegistry: pool,
+			cacheRoot,
+			workspaceId: "ws-shared",
+			socketPath: "/tmp/herdr-shared.sock",
+			pollIntervalMs: 10,
+			readyTimeoutMs: 2_000,
+			sleep: async (ms) => new Promise((r) => setTimeout(r, ms)),
+		});
+		const factoryB = createHerdrChildSessionFactory({
+			cwd: subB,
+			parentPaneId: "w1:pB",
+			parentId: "parent-b",
+			client,
+			poolRegistry: pool,
+			cacheRoot,
+			workspaceId: "ws-shared",
+			socketPath: "/tmp/herdr-shared.sock",
+			pollIntervalMs: 10,
+			readyTimeoutMs: 2_000,
+			sleep: async (ms) => new Promise((r) => setTimeout(r, ms)),
+		});
+
+		const sessionA = (await factoryA({ cwd: subA, role: getRole("scout") })) as unknown as {
+			paths: { result: string; command?: string };
+			assignmentId: string;
+			workerId: string;
+			prompt: (t: string) => Promise<void>;
+			agent: { waitForIdle: () => Promise<void> };
+			dispose: () => Promise<void>;
+			paneId?: string;
+		};
+		await completeAssignmentResult(sessionA, "from-a", "ok-a");
+		await sessionA.agent.waitForIdle();
+		await sessionA.dispose();
+
+		const worker = pool.getByRole("scout")!;
+		expect(worker.cwd).toBe(identityA.canonicalRoot);
+		expect(momoCwds[0]).toBe(identityA.canonicalRoot);
+		expect(splitCwds[0]).toBe(identityA.canonicalRoot);
+		const control = workerControlPaths(pool.poolRoot, "scout");
+		const manifest = JSON.parse(
+			(await import("node:fs")).readFileSync(control.manifest, "utf8"),
+		) as { cwd?: string };
+		expect(manifest.cwd).toBe(identityA.canonicalRoot);
+
+		pool.upsert({
+			...worker,
+			status: "idle",
+			updatedAt: new Date().toISOString(),
+		});
+
+		const sessionB = (await factoryB({ cwd: subB, role: getRole("scout") })) as unknown as typeof sessionA;
+		await completeAssignmentResult(sessionB, "from-b", "ok-b");
+		await sessionB.agent.waitForIdle();
+		expect(splits).toHaveLength(1);
+		expect(sessionB.paneId).toBe(sessionA.paneId);
+		expect(pool.getByRole("scout")?.cwd).toBe(identityA.canonicalRoot);
+		await sessionB.dispose();
+	});
+
+	it("refuses reuse when live worker cwd is missing or a subdirectory", async () => {
+		installFakeHerdrExtension();
+		const cacheRoot = tempDir("momo-cwd-reuse-cache-");
+		const cwd = tempDir("momo-cwd-reuse-cwd-");
+		const { client } = makeClient({});
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const factory = createHerdrChildSessionFactory({
+			cwd,
+			parentPaneId: "w1:p0",
+			parentId: "parent-cwd-reuse",
+			client,
+			poolRegistry: pool,
+			cacheRoot,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+			pollIntervalMs: 10,
+			readyTimeoutMs: 1_000,
+			sleep: async (ms) => new Promise((r) => setTimeout(r, ms)),
+		});
+		const workerId = stableWorkerId(identity.poolKey, "scout");
+
+		pool.upsert({
+			workerId,
+			generation: 1,
+			generationTombstone: 1,
+			role: "scout",
+			paneId: "w1:p1",
+			agentName: "momo_scout",
+			status: "idle",
+			// Missing cwd — pre-fix / stripped record.
+			updatedAt: new Date().toISOString(),
+		});
+		const missing = await factory({ cwd, role: getRole("scout") });
+		await expect(missing.prompt("x")).rejects.toThrow(/missing cwd|momo-cleanup/i);
+		await missing.dispose();
+
+		pool.upsert({
+			workerId,
+			generation: 1,
+			generationTombstone: 1,
+			role: "scout",
+			paneId: "w1:p1",
+			agentName: "momo_scout",
+			cwd: path.join(cwd, "subdir"),
+			status: "idle",
+			updatedAt: new Date().toISOString(),
+		});
+		const subdir = await factory({ cwd, role: getRole("scout") });
+		await expect(subdir.prompt("y")).rejects.toThrow(/canonical root|momo-cleanup/i);
+		await subdir.dispose();
+	});
 });

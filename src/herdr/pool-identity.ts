@@ -69,7 +69,11 @@ export function computePoolKey(material: {
 }
 
 export function resolvePoolIdentity(input: PoolIdentityInput): PoolIdentity {
-	const canonicalRoot = input.canonicalRoot ?? resolveCanonicalRoot(input.cwd);
+	// Always canonicalize supplied roots so subdirectory parents share one identity.
+	const canonicalRoot =
+		input.canonicalRoot !== undefined
+			? realpathSync(input.canonicalRoot)
+			: resolveCanonicalRoot(input.cwd);
 	const workspaceId = input.workspaceId ?? "";
 	const socketPath = canonicalizeSocketIdentity(input.socketPath ?? "");
 	return {
