@@ -269,8 +269,8 @@ describe("worker active-tool posture", () => {
 		expect(pi.setActiveTools.mock.calls[0]?.[0]).toEqual(["read", "grep", "find", "ls"]);
 
 		dispatchAssignment({
-			controlRoot: fixture.control.root,
-			paths: fixture.paths,
+			pool: fixture.pool,
+			role: fixture.role, controlRoot: fixture.control.root, paths: fixture.paths,
 			assignmentId: fixture.assignmentId,
 			workerId: fixture.workerId,
 			generation: fixture.generation,

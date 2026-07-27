@@ -552,7 +552,8 @@ describe("lease release race with foreign acquirer", () => {
 		} as unknown as ExtensionContext;
 		await pi.emit("session_start", {}, ctx);
 		dispatchAssignment({
-			controlRoot: fixture.control.root, paths: fixture.paths, assignmentId: fixture.assignmentId,
+			pool: fixture.pool,
+			role: fixture.role, controlRoot: fixture.control.root, paths: fixture.paths, assignmentId: fixture.assignmentId,
 			workerId: fixture.workerId, generation: fixture.generation, task: "edit",
 		});
 		await vi.advanceTimersByTimeAsync(150);
@@ -662,7 +663,8 @@ describe("cross-parent implementer wait/serialize", () => {
 		const ctx = { hasUI: true, isIdle: () => true, abort: vi.fn(), cwd } as unknown as ExtensionContext;
 		await pi.emit("session_start", {}, ctx);
 		dispatchAssignment({
-			controlRoot: fixture.control.root, paths: fixture.paths, assignmentId: fixture.assignmentId,
+			pool: fixture.pool,
+			role: fixture.role, controlRoot: fixture.control.root, paths: fixture.paths, assignmentId: fixture.assignmentId,
 			workerId: fixture.workerId, generation: fixture.generation, task: "edit",
 		});
 		await new Promise((r) => setTimeout(r, 150));
@@ -726,7 +728,8 @@ describe("cross-parent implementer wait/serialize", () => {
 		} as unknown as ExtensionContext;
 		await pi.emit("session_start", {}, ctx);
 		dispatchAssignment({
-			controlRoot: fixture.control.root, paths: fixture.paths, assignmentId: fixture.assignmentId,
+			pool: fixture.pool,
+			role: fixture.role, controlRoot: fixture.control.root, paths: fixture.paths, assignmentId: fixture.assignmentId,
 			workerId: fixture.workerId, generation: fixture.generation, task: "edit",
 		});
 
@@ -761,7 +764,8 @@ describe("worker cancellation IPC fail-closed", () => {
 		const ctx = { hasUI: true, isIdle: () => true, abort: vi.fn(), cwd } as unknown as ExtensionContext;
 		await pi.emit("session_start", {}, ctx);
 		dispatchAssignment({
-			controlRoot: fixture.control.root, paths: fixture.paths, assignmentId: fixture.assignmentId,
+			pool: fixture.pool,
+			role: fixture.role, controlRoot: fixture.control.root, paths: fixture.paths, assignmentId: fixture.assignmentId,
 			workerId: fixture.workerId, generation: fixture.generation, task: "look",
 		});
 		atomicWriteJson(fixture.paths.cancel, { version: 1, bad: true });

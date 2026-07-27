@@ -336,61 +336,132 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 		});
 	}
 
+	/**
+	 * Must run under the role lock immediately before publishing a terminal
+	 * result. Generation/worker/active must still own a busy|blocked registry
+	 * row, and no terminal result path may already exist. Parent fencing
+	 * (unhealthy/uncertain), generation change, active change, or an unexpected
+	 * result file rejects publication without overwrite.
+	 */
+	function canPublishTerminalResultLocked(assignment: ActiveAssignment): boolean {
+		const current = pool.getByRole(role.name);
+		if (!ownsCurrentGeneration(current)) {
+			failGenerationFence();
+			return false;
+		}
+		if (current.status !== "busy" && current.status !== "blocked") {
+			failGenerationFence();
+			return false;
+		}
+		if (current.activeAssignmentId !== assignment.assignmentId) {
+			failGenerationFence();
+			return false;
+		}
+		if (existsSync(assignment.paths.result)) {
+			failGenerationFence();
+			return false;
+		}
+		return true;
+	}
+
+	/**
+	 * After a failed durable publish: never weaken an existing parent fence
+	 * (unhealthy/uncertain), never resurrect idle/busy for a foreign active,
+	 * and never clear active evidence. Only mark when this generation still
+	 * owns busy|blocked for the exact assignment (e.g. I/O failure).
+	 */
+	function markRegistryAfterPublishFailure(
+		assignment: ActiveAssignment,
+		preferUncertain: boolean,
+	): void {
+		withRoleLock(poolRoot, role.name, () => {
+			const current = pool.getByRole(role.name);
+			if (!ownsCurrentGeneration(current)) {
+				failGenerationFence();
+				return;
+			}
+			if (current.status === "unhealthy" || current.status === "uncertain") {
+				return;
+			}
+			if (current.status !== "busy" && current.status !== "blocked") {
+				return;
+			}
+			if (current.activeAssignmentId !== assignment.assignmentId) {
+				return;
+			}
+			markRegistryLocked(preferUncertain ? "uncertain" : "unhealthy", {
+				activeAssignmentId: assignment.assignmentId,
+				...(assignment.parentEpoch !== undefined
+					? { activeParentEpoch: assignment.parentEpoch }
+					: {}),
+				...(preferUncertain ? { uncertainWrite: true } : {}),
+			});
+		});
+	}
+
 	function writeResultDurable(
 		assignment: ActiveAssignment,
 		partial: Omit<IpcResult, "version" | "runId" | "workerId" | "finishedAt" | "messages"> & {
 			messages?: unknown[];
 		},
 	): boolean {
+		// Tools off immediately; lease/result/registry stay untouched until the
+		// role-lock fence accepts publication (rejected fence must not drop lease).
 		disableMutationTools();
 
-		let status = partial.status;
-		let uncertainWrite = partial.uncertainWrite === true;
-		let errorMessage = partial.errorMessage;
-
-		// Lease release is independent of the role lock; never touch a foreign lease.
-		if (assignment.leaseHeld && !uncertainWrite) {
-			try {
-				lease.release(cwd, leaseOwner, assignment.leaseToken);
-				assignment.leaseHeld = false;
-				if (lease.stillHeldBy(cwd, leaseOwner, assignment.leaseToken)) {
-					throw new Error("Writer lease still held by this worker after release");
-				}
-			} catch (error) {
-				status = "failed";
-				uncertainWrite = true;
-				errorMessage = `Writer lease release failed: ${
-					error instanceof Error ? error.message : String(error)
-				}`;
-			}
-		}
-
-		const messages = sanitizeAssistantMessages(
-			partial.messages ?? assignment.assistantMessages,
-			Math.floor(MAX_IPC_JSON_BYTES * 0.75),
-		);
-		const payload: IpcResult = {
-			version: 1,
-			runId: assignment.assignmentId,
-			workerId,
-			status,
-			messages,
-			finishedAt: new Date(now()).toISOString(),
-		};
-		if (partial.stopReason !== undefined) payload.stopReason = partial.stopReason;
-		if (errorMessage !== undefined) payload.errorMessage = errorMessage;
-		if (uncertainWrite) payload.uncertainWrite = true;
-		if (partial.usage !== undefined) payload.usage = partial.usage;
-
-		if (uncertainWrite && payload.status === "completed") {
-			payload.status = "failed";
-		}
-
-		// Serialize terminal result publication with parent fencing under the role lock.
 		return withRoleLock(poolRoot, role.name, () => {
 			if (writeResultDurableLockHook) {
 				writeResultDurableLockHook("before-write");
 			}
+			// Fence first: parent uncertain/unhealthy, generation/active drift, or an
+			// existing terminal result rejects without releasing the writer lease.
+			if (!canPublishTerminalResultLocked(assignment)) {
+				return false;
+			}
+
+			let status = partial.status;
+			let uncertainWrite = partial.uncertainWrite === true;
+			let errorMessage = partial.errorMessage;
+
+			// Exact-token release only after the fence; never touch a foreign lease.
+			// Worker-first path: release-before-result remains ordered inside this lock.
+			if (assignment.leaseHeld && !uncertainWrite) {
+				try {
+					lease.release(cwd, leaseOwner, assignment.leaseToken);
+					if (lease.stillHeldBy(cwd, leaseOwner, assignment.leaseToken)) {
+						throw new Error("Writer lease still held by this worker after release");
+					}
+					assignment.leaseHeld = false;
+				} catch (error) {
+					status = "failed";
+					uncertainWrite = true;
+					errorMessage = `Writer lease release failed: ${
+						error instanceof Error ? error.message : String(error)
+					}`;
+				}
+			}
+
+			const messages = sanitizeAssistantMessages(
+				partial.messages ?? assignment.assistantMessages,
+				Math.floor(MAX_IPC_JSON_BYTES * 0.75),
+			);
+			const payload: IpcResult = {
+				version: 1,
+				runId: assignment.assignmentId,
+				workerId,
+				status,
+				messages,
+				finishedAt: new Date(now()).toISOString(),
+			};
+			if (partial.stopReason !== undefined) payload.stopReason = partial.stopReason;
+			if (errorMessage !== undefined) payload.errorMessage = errorMessage;
+			if (uncertainWrite) payload.uncertainWrite = true;
+			if (partial.usage !== undefined) payload.usage = partial.usage;
+
+			if (uncertainWrite && payload.status === "completed") {
+				payload.status = "failed";
+			}
+
 			let written = false;
 			for (let attempt = 0; attempt < 3; attempt += 1) {
 				try {
@@ -821,11 +892,11 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 		if (!ok) {
 			// The active pointer and claiming entry are recovery evidence. Do
 			// not advance the queue or announce a completion that was not durable.
+			// Never weaken an existing parent unhealthy/uncertain fence.
 			protocolUnhealthy = true;
-			markRegistry(role.canWrite && (assignment.mutationAttempted || assignment.leaseHeld) ? "uncertain" : "unhealthy", {
-				activeAssignmentId: assignment.assignmentId,
-				...(role.canWrite ? { uncertainWrite: true } : {}),
-			});
+			const preferUncertain =
+				role.canWrite && (assignment.mutationAttempted || assignment.leaseHeld);
+			markRegistryAfterPublishFailure(assignment, preferUncertain);
 			return;
 		}
 		// Durable result is authoritative. Terminal event append is best-effort
@@ -1041,17 +1112,9 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 					// Terminal event append is best-effort after the durable attempt.
 				}
 				if (!persisted) {
-					markRegistry(ambiguous ? "uncertain" : "unhealthy", {
-						...(ambiguous
-							? {
-									activeAssignmentId: active.assignmentId,
-									...(active.parentEpoch
-										? { activeParentEpoch: active.parentEpoch }
-										: {}),
-									uncertainWrite: true,
-								}
-							: {}),
-					});
+					// Preserve parent unhealthy/uncertain fence; only mark when
+					// still busy|blocked for this exact assignment.
+					markRegistryAfterPublishFailure(active, ambiguous);
 				} else if (!ambiguous) {
 					markRegistry("unhealthy");
 				}
@@ -1066,6 +1129,8 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 		try {
 			const cancelReason = cancelPending(assignment);
 			if (cancelReason) {
+				// Publish only when production dispatch already left busy|blocked
+				// for this exact assignment; never manufacture busy from idle/starting.
 				await finishAssignment(
 					assignment,
 					{
@@ -1212,16 +1277,23 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 					? error.message
 					: String(error);
 			protocolUnhealthy = true;
-			markRegistry("unhealthy");
-			await finishAssignment(
+			// Publish only when registry is already busy|blocked for this exact
+			// assignment. Never promote idle/starting to pass the commit fence.
+			if (!assignment.resultWritten) {
+				await finishAssignment(
+					assignment,
+					{
+						status: "failed",
+						messages: assignment.assistantMessages,
+						errorMessage: message,
+						uncertainWrite: role.canWrite && assignment.mutationAttempted,
+					},
+					"failed",
+				);
+			}
+			markRegistryAfterPublishFailure(
 				assignment,
-				{
-					status: "failed",
-					messages: assignment.assistantMessages,
-					errorMessage: message,
-					uncertainWrite: role.canWrite && assignment.mutationAttempted,
-				},
-				"failed",
+				role.canWrite && (assignment.mutationAttempted || assignment.leaseHeld),
 			);
 		}
 	}

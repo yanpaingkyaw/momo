@@ -55,10 +55,16 @@ export function setupPoolWorkerFixture(options: {
 		MOMO_RUN_ID: `g${generation}`,
 		MOMO_CWD: options.cwd,
 	};
-	return { identity, pool, workerId, control, assignmentId, paths, env, generation };
+	return { identity, pool, workerId, control, assignmentId, paths, env, generation, role: options.role };
 }
 
+/**
+ * Mirror production dispatch order under the role lock:
+ * 1) command.json  2) registry busy (exact assignment)  3) active.json.
+ */
 export function dispatchAssignment(options: {
+	pool: PoolRegistry;
+	role: AgentName;
 	controlRoot: string;
 	paths: { command: string };
 	assignmentId: string;
@@ -68,6 +74,13 @@ export function dispatchAssignment(options: {
 	parentEpoch?: string;
 }): void {
 	const parentEpoch = options.parentEpoch ?? "epoch1";
+	const current = options.pool.getByRole(options.role);
+	if (!current) {
+		throw new Error(`dispatchAssignment: missing registry row for ${options.role}`);
+	}
+	if (current.generation !== options.generation || current.workerId !== options.workerId) {
+		throw new Error("dispatchAssignment: generation/worker fence mismatch");
+	}
 	atomicWriteJson(options.paths.command, {
 		version: 1,
 		type: "prompt",
@@ -77,6 +90,13 @@ export function dispatchAssignment(options: {
 		workerId: options.workerId,
 		generation: options.generation,
 		parentEpoch,
+	});
+	options.pool.upsert({
+		...current,
+		status: "busy",
+		activeAssignmentId: options.assignmentId,
+		activeParentEpoch: parentEpoch,
+		updatedAt: new Date().toISOString(),
 	});
 	atomicWriteJson(path.join(options.controlRoot, "active.json"), {
 		version: 1,

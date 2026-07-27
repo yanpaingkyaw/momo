@@ -2,7 +2,7 @@ import { mkdtempSync, mkdirSync, rmSync, existsSync, writeFileSync, readFileSync
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { installMomoWorker } from "../src/extensions/worker-runtime.js";
+import { installMomoWorker, __setWriteResultDurableLockHookForTest, __resetWriteResultDurableLockHookForTest } from "../src/extensions/worker-runtime.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { WriterLeaseManager } from "../src/lease/writer-lease.js";
 import { MAX_IPC_JSON_BYTES, MAX_EVENTS_FILE_BYTES, atomicWriteJson, readJsonFile } from "../src/ipc/spool.js";
@@ -20,6 +20,7 @@ afterEach(() => {
 		if (dir) rmSync(dir, { recursive: true, force: true });
 	}
 	vi.useRealTimers();
+	__resetWriteResultDurableLockHookForTest();
 });
 
 function tempDir(prefix: string): string {
@@ -1418,6 +1419,998 @@ describe("worker runtime (persistent pool)", () => {
 		expect(record.activeAssignmentId).toBe(assignmentA);
 		expect(queueCount(pool.poolRoot, "implementer")).toBe(1);
 		expect(existsSync(pathsB.started)).toBe(false);
+		await vi.advanceTimersByTimeAsync(200);
+		expect(pi.sendUserMessage).not.toHaveBeenCalledWith("successor");
+	});
+
+	it("parent-first barrier: no result overwrite, no idle/busy resurrection, no successor", async () => {
+		vi.useFakeTimers();
+		const cacheRoot = tempDir("momo-parent-first-barrier-");
+		const cwd = tempDir("momo-parent-first-barrier-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const workerId = stableWorkerId(identity.poolKey, "scout");
+		const control = workerControlPaths(pool.poolRoot, "scout");
+		mkdirSync(control.root, { recursive: true, mode: 0o700 });
+		const assignmentA = "parentfirst000001";
+		const assignmentB = "parentfirst000002";
+		const pathsA = assignmentSpoolPaths(pool.poolRoot, "scout", assignmentA);
+		const pathsB = assignmentSpoolPaths(pool.poolRoot, "scout", assignmentB);
+		mkdirSync(pathsA.root, { recursive: true, mode: 0o700 });
+		mkdirSync(pathsB.root, { recursive: true, mode: 0o700 });
+		pool.upsert({
+			workerId,
+			generation: 1,
+			generationTombstone: 1,
+			role: "scout",
+			paneId: "w1:p2",
+			agentName: "momo_scout",
+			cwd,
+			status: "idle",
+			updatedAt: new Date().toISOString(),
+		});
+
+		const parentEvidence = {
+			version: 1 as const,
+			runId: assignmentA,
+			workerId,
+			status: "failed" as const,
+			messages: [{ role: "assistant", content: [{ type: "text", text: "parent-fence" }] }],
+			finishedAt: new Date().toISOString(),
+			errorMessage: "Worker heartbeat went stale",
+		};
+
+		__setWriteResultDurableLockHookForTest((phase) => {
+			if (phase !== "before-write") return;
+			// Parent-first commit under the same role lock: fence + evidence before
+			// the worker's publish recheck/write.
+			pool.upsert({
+				...pool.getByRole("scout")!,
+				status: "unhealthy",
+				activeAssignmentId: assignmentA,
+				activeParentEpoch: "epoch1",
+				updatedAt: new Date().toISOString(),
+			});
+			atomicWriteJson(pathsA.result, parentEvidence);
+		});
+
+		const pi = createFakePi();
+		installMomoWorker(pi as unknown as ExtensionAPI, {
+			env: {
+				MOMO_WORKER: "1",
+				MOMO_ROLE: "scout",
+				MOMO_IPC_DIR: control.root,
+				MOMO_CONTROL_DIR: control.root,
+				MOMO_WORKER_ID: workerId,
+				MOMO_WORKER_GENERATION: "1",
+				MOMO_POOL_KEY: identity.poolKey,
+				MOMO_POOL_ROOT: pool.poolRoot,
+				MOMO_RUN_ID: "g1",
+				MOMO_CWD: cwd,
+			},
+			poolRegistry: pool,
+			now: () => 1_700_000_000_000,
+			sleep: async () => {},
+		});
+		const ctx = {
+			hasUI: true,
+			isIdle: () => true,
+			abort: vi.fn(),
+			cwd,
+		} as unknown as ExtensionContext;
+		await pi.emit("session_start", {}, ctx);
+		atomicWriteJson(pathsA.command, {
+			version: 1,
+			type: "prompt",
+			task: "first",
+			issuedAt: new Date().toISOString(),
+			runId: assignmentA,
+			workerId,
+			generation: 1,
+			parentEpoch: "epoch1",
+		});
+		atomicWriteJson(control.active, {
+			version: 1,
+			assignmentId: assignmentA,
+			generation: 1,
+			parentEpoch: "epoch1",
+			dispatchedAt: new Date().toISOString(),
+		});
+		pool.upsert({
+			...pool.getByRole("scout")!,
+			status: "busy",
+			activeAssignmentId: assignmentA,
+			activeParentEpoch: "epoch1",
+			updatedAt: new Date().toISOString(),
+		});
+		enqueueAssignment(pool.poolRoot, "scout", {
+			assignmentId: assignmentB,
+			workerId,
+			generation: 1,
+			parentEpoch: "epoch1",
+			task: "successor",
+		});
+		await vi.advanceTimersByTimeAsync(150);
+		expect(pi.sendUserMessage).toHaveBeenCalledWith("first");
+		await pi.emit(
+			"message_end",
+			{
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "worker-completed" }],
+					stopReason: "stop",
+				},
+			},
+			ctx,
+		);
+		await pi.emit("agent_settled", {}, ctx);
+
+		const result = readJsonFile(pathsA.result) as {
+			status: string;
+			errorMessage?: string;
+			messages: unknown[];
+		};
+		expect(result.status).toBe("failed");
+		expect(result.errorMessage).toBe("Worker heartbeat went stale");
+		expect(result.messages).toEqual(parentEvidence.messages);
+		const record = pool.getByRole("scout")!;
+		expect(record.status).toBe("unhealthy");
+		expect(record.activeAssignmentId).toBe(assignmentA);
+		expect(existsSync(control.active)).toBe(true);
+		expect(queueCount(pool.poolRoot, "scout")).toBe(1);
+		expect(existsSync(pathsB.started)).toBe(false);
+		await vi.advanceTimersByTimeAsync(200);
+		expect(pi.sendUserMessage).not.toHaveBeenCalledWith("successor");
+		expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+	});
+
+	it("parent-first implementer uncertain fence retains exact lease (with started)", async () => {
+		vi.useFakeTimers();
+		const cacheRoot = tempDir("momo-parent-first-lease-started-");
+		const cwd = tempDir("momo-parent-first-lease-started-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const workerId = stableWorkerId(identity.poolKey, "implementer");
+		const control = workerControlPaths(pool.poolRoot, "implementer");
+		mkdirSync(control.root, { recursive: true, mode: 0o700 });
+		const assignmentA = "pfleasewithstart001";
+		const assignmentB = "pfleasewithstart002";
+		const pathsA = assignmentSpoolPaths(pool.poolRoot, "implementer", assignmentA);
+		const pathsB = assignmentSpoolPaths(pool.poolRoot, "implementer", assignmentB);
+		mkdirSync(pathsA.root, { recursive: true, mode: 0o700 });
+		mkdirSync(pathsB.root, { recursive: true, mode: 0o700 });
+		pool.upsert({
+			workerId,
+			generation: 1,
+			generationTombstone: 1,
+			role: "implementer",
+			paneId: "w1:p3",
+			agentName: "momo_implementer",
+			cwd,
+			status: "idle",
+			updatedAt: new Date().toISOString(),
+		});
+		const leases = new WriterLeaseManager({ cacheRoot, now: () => 1_700_000_000_000 });
+		const releaseSpy = vi.spyOn(leases, "release");
+
+		__setWriteResultDurableLockHookForTest((phase) => {
+			if (phase !== "before-write") return;
+			pool.upsert({
+				...pool.getByRole("implementer")!,
+				status: "uncertain",
+				uncertainWrite: true,
+				activeAssignmentId: assignmentA,
+				activeParentEpoch: "epoch1",
+				updatedAt: new Date().toISOString(),
+			});
+		});
+
+		const pi = createFakePi();
+		installMomoWorker(pi as unknown as ExtensionAPI, {
+			env: {
+				MOMO_WORKER: "1",
+				MOMO_ROLE: "implementer",
+				MOMO_IPC_DIR: control.root,
+				MOMO_CONTROL_DIR: control.root,
+				MOMO_WORKER_ID: workerId,
+				MOMO_WORKER_GENERATION: "1",
+				MOMO_POOL_KEY: identity.poolKey,
+				MOMO_POOL_ROOT: pool.poolRoot,
+				MOMO_RUN_ID: "g1",
+				MOMO_CWD: cwd,
+			},
+			poolRegistry: pool,
+			leaseManager: leases,
+			now: () => 1_700_000_000_000,
+			sleep: async () => {},
+		});
+		const ctx = {
+			hasUI: true,
+			isIdle: () => true,
+			abort: vi.fn(),
+			cwd,
+		} as unknown as ExtensionContext;
+		await pi.emit("session_start", {}, ctx);
+		atomicWriteJson(pathsA.command, {
+			version: 1,
+			type: "prompt",
+			task: "edit",
+			issuedAt: new Date().toISOString(),
+			runId: assignmentA,
+			workerId,
+			generation: 1,
+			parentEpoch: "epoch1",
+		});
+		pool.upsert({
+			...pool.getByRole("implementer")!,
+			status: "busy",
+			activeAssignmentId: assignmentA,
+			activeParentEpoch: "epoch1",
+			updatedAt: new Date().toISOString(),
+		});
+		atomicWriteJson(control.active, {
+			version: 1,
+			assignmentId: assignmentA,
+			generation: 1,
+			parentEpoch: "epoch1",
+			dispatchedAt: new Date().toISOString(),
+		});
+		enqueueAssignment(pool.poolRoot, "implementer", {
+			assignmentId: assignmentB,
+			workerId,
+			generation: 1,
+			parentEpoch: "epoch1",
+			task: "successor",
+		});
+		await vi.advanceTimersByTimeAsync(200);
+		expect(pi.sendUserMessage).toHaveBeenCalledWith("edit");
+		expect(existsSync(pathsA.started)).toBe(true);
+		expect(leases.isLocked(cwd)).toBe(true);
+		const ownerBefore = leases.peekOwner(cwd);
+		expect(ownerBefore?.ownerId).toBe(workerId);
+		const tokenBefore = ownerBefore!.token;
+		releaseSpy.mockClear();
+
+		await pi.emit(
+			"message_end",
+			{
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "late-worker" }],
+					stopReason: "stop",
+				},
+			},
+			ctx,
+		);
+		await pi.emit("agent_settled", {}, ctx);
+
+		expect(releaseSpy).not.toHaveBeenCalled();
+		expect(existsSync(pathsA.result)).toBe(false);
+		expect(leases.isLocked(cwd)).toBe(true);
+		expect(leases.stillHeldBy(cwd, workerId, tokenBefore)).toBe(true);
+		const record = pool.getByRole("implementer")!;
+		expect(record.status).toBe("uncertain");
+		expect(record.uncertainWrite).toBe(true);
+		expect(record.activeAssignmentId).toBe(assignmentA);
+		expect(existsSync(control.active)).toBe(true);
+		expect(queueCount(pool.poolRoot, "implementer")).toBe(1);
+		expect(existsSync(pathsB.started)).toBe(false);
+		await vi.advanceTimersByTimeAsync(200);
+		expect(pi.sendUserMessage).not.toHaveBeenCalledWith("successor");
+	});
+
+	it("parent-first implementer uncertain fence retains exact lease (without started)", async () => {
+		vi.useFakeTimers();
+		const cacheRoot = tempDir("momo-parent-first-lease-nostart-");
+		const cwd = tempDir("momo-parent-first-lease-nostart-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const workerId = stableWorkerId(identity.poolKey, "implementer");
+		const control = workerControlPaths(pool.poolRoot, "implementer");
+		mkdirSync(control.root, { recursive: true, mode: 0o700 });
+		const assignmentA = "pfleasenostart00001";
+		const assignmentB = "pfleasenostart00002";
+		const pathsA = assignmentSpoolPaths(pool.poolRoot, "implementer", assignmentA);
+		const pathsB = assignmentSpoolPaths(pool.poolRoot, "implementer", assignmentB);
+		mkdirSync(pathsA.root, { recursive: true, mode: 0o700 });
+		mkdirSync(pathsB.root, { recursive: true, mode: 0o700 });
+		pool.upsert({
+			workerId,
+			generation: 1,
+			generationTombstone: 1,
+			role: "implementer",
+			paneId: "w1:p3",
+			agentName: "momo_implementer",
+			cwd,
+			status: "idle",
+			updatedAt: new Date().toISOString(),
+		});
+		const leases = new WriterLeaseManager({ cacheRoot, now: () => 1_700_000_000_000 });
+		const releaseSpy = vi.spyOn(leases, "release");
+
+		__setWriteResultDurableLockHookForTest((phase) => {
+			if (phase !== "before-write") return;
+			pool.upsert({
+				...pool.getByRole("implementer")!,
+				status: "uncertain",
+				uncertainWrite: true,
+				activeAssignmentId: assignmentA,
+				activeParentEpoch: "epoch1",
+				updatedAt: new Date().toISOString(),
+			});
+		});
+
+		const pi = createFakePi();
+		installMomoWorker(pi as unknown as ExtensionAPI, {
+			env: {
+				MOMO_WORKER: "1",
+				MOMO_ROLE: "implementer",
+				MOMO_IPC_DIR: control.root,
+				MOMO_CONTROL_DIR: control.root,
+				MOMO_WORKER_ID: workerId,
+				MOMO_WORKER_GENERATION: "1",
+				MOMO_POOL_KEY: identity.poolKey,
+				MOMO_POOL_ROOT: pool.poolRoot,
+				MOMO_RUN_ID: "g1",
+				MOMO_CWD: cwd,
+			},
+			poolRegistry: pool,
+			leaseManager: leases,
+			now: () => 1_700_000_000_000,
+			sleep: async () => {},
+		});
+		const ctx = {
+			hasUI: true,
+			isIdle: () => true,
+			abort: vi.fn(),
+			cwd,
+		} as unknown as ExtensionContext;
+		await pi.emit("session_start", {}, ctx);
+		atomicWriteJson(pathsA.command, {
+			version: 1,
+			type: "prompt",
+			task: "edit",
+			issuedAt: new Date().toISOString(),
+			runId: assignmentA,
+			workerId,
+			generation: 1,
+			parentEpoch: "epoch1",
+		});
+		pool.upsert({
+			...pool.getByRole("implementer")!,
+			status: "busy",
+			activeAssignmentId: assignmentA,
+			activeParentEpoch: "epoch1",
+			updatedAt: new Date().toISOString(),
+		});
+		atomicWriteJson(control.active, {
+			version: 1,
+			assignmentId: assignmentA,
+			generation: 1,
+			parentEpoch: "epoch1",
+			dispatchedAt: new Date().toISOString(),
+		});
+		enqueueAssignment(pool.poolRoot, "implementer", {
+			assignmentId: assignmentB,
+			workerId,
+			generation: 1,
+			parentEpoch: "epoch1",
+			task: "successor",
+		});
+		await vi.advanceTimersByTimeAsync(200);
+		expect(pi.sendUserMessage).toHaveBeenCalledWith("edit");
+		expect(leases.isLocked(cwd)).toBe(true);
+		// Drop started evidence while the same-worker lease remains held.
+		expect(existsSync(pathsA.started)).toBe(true);
+		rmSync(pathsA.started, { force: true });
+		expect(existsSync(pathsA.started)).toBe(false);
+		const ownerBefore = leases.peekOwner(cwd);
+		expect(ownerBefore?.ownerId).toBe(workerId);
+		const tokenBefore = ownerBefore!.token;
+		releaseSpy.mockClear();
+
+		await pi.emit(
+			"message_end",
+			{
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "late-worker" }],
+					stopReason: "stop",
+				},
+			},
+			ctx,
+		);
+		await pi.emit("agent_settled", {}, ctx);
+
+		expect(releaseSpy).not.toHaveBeenCalled();
+		expect(existsSync(pathsA.result)).toBe(false);
+		expect(existsSync(pathsA.started)).toBe(false);
+		expect(leases.isLocked(cwd)).toBe(true);
+		expect(leases.stillHeldBy(cwd, workerId, tokenBefore)).toBe(true);
+		const record = pool.getByRole("implementer")!;
+		expect(record.status).toBe("uncertain");
+		expect(record.uncertainWrite).toBe(true);
+		expect(record.activeAssignmentId).toBe(assignmentA);
+		expect(existsSync(control.active)).toBe(true);
+		expect(queueCount(pool.poolRoot, "implementer")).toBe(1);
+		expect(existsSync(pathsB.started)).toBe(false);
+		await vi.advanceTimersByTimeAsync(200);
+		expect(pi.sendUserMessage).not.toHaveBeenCalledWith("successor");
+	});
+
+	it("stale generation fence rejects result publish without overwrite", async () => {
+		vi.useFakeTimers();
+		const cacheRoot = tempDir("momo-stale-gen-fence-");
+		const cwd = tempDir("momo-stale-gen-fence-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const workerId = stableWorkerId(identity.poolKey, "scout");
+		const control = workerControlPaths(pool.poolRoot, "scout");
+		mkdirSync(control.root, { recursive: true, mode: 0o700 });
+		const assignmentId = "stalegenfence00001";
+		const paths = assignmentSpoolPaths(pool.poolRoot, "scout", assignmentId);
+		mkdirSync(paths.root, { recursive: true, mode: 0o700 });
+		pool.upsert({
+			workerId,
+			generation: 1,
+			generationTombstone: 1,
+			role: "scout",
+			paneId: "w1:p2",
+			agentName: "momo_scout",
+			cwd,
+			status: "idle",
+			updatedAt: new Date().toISOString(),
+		});
+
+		__setWriteResultDurableLockHookForTest((phase) => {
+			if (phase !== "before-write") return;
+			pool.upsert({
+				...pool.getByRole("scout")!,
+				generation: 2,
+				generationTombstone: 2,
+				workerId: `${workerId}-n1`,
+				status: "busy",
+				activeAssignmentId: assignmentId,
+				activeParentEpoch: "epoch1",
+				updatedAt: new Date().toISOString(),
+			});
+		});
+
+		const pi = createFakePi();
+		installMomoWorker(pi as unknown as ExtensionAPI, {
+			env: {
+				MOMO_WORKER: "1",
+				MOMO_ROLE: "scout",
+				MOMO_IPC_DIR: control.root,
+				MOMO_CONTROL_DIR: control.root,
+				MOMO_WORKER_ID: workerId,
+				MOMO_WORKER_GENERATION: "1",
+				MOMO_POOL_KEY: identity.poolKey,
+				MOMO_POOL_ROOT: pool.poolRoot,
+				MOMO_RUN_ID: "g1",
+				MOMO_CWD: cwd,
+			},
+			poolRegistry: pool,
+			now: () => 1_700_000_000_000,
+			sleep: async () => {},
+		});
+		const ctx = {
+			hasUI: true,
+			isIdle: () => true,
+			abort: vi.fn(),
+			cwd,
+		} as unknown as ExtensionContext;
+		await pi.emit("session_start", {}, ctx);
+		atomicWriteJson(paths.command, {
+			version: 1,
+			type: "prompt",
+			task: "first",
+			issuedAt: new Date().toISOString(),
+			runId: assignmentId,
+			workerId,
+			generation: 1,
+			parentEpoch: "epoch1",
+		});
+		atomicWriteJson(control.active, {
+			version: 1,
+			assignmentId,
+			generation: 1,
+			parentEpoch: "epoch1",
+			dispatchedAt: new Date().toISOString(),
+		});
+		pool.upsert({
+			...pool.getByRole("scout")!,
+			status: "busy",
+			activeAssignmentId: assignmentId,
+			activeParentEpoch: "epoch1",
+			updatedAt: new Date().toISOString(),
+		});
+		await vi.advanceTimersByTimeAsync(150);
+		await pi.emit(
+			"message_end",
+			{
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "should-not-publish" }],
+					stopReason: "stop",
+				},
+			},
+			ctx,
+		);
+		await pi.emit("agent_settled", {}, ctx);
+
+		expect(existsSync(paths.result)).toBe(false);
+		const record = pool.getByRole("scout")!;
+		expect(record.generation).toBe(2);
+		expect(record.workerId).toBe(`${workerId}-n1`);
+		expect(record.status).toBe("busy");
+		expect(record.activeAssignmentId).toBe(assignmentId);
+		expect(existsSync(control.active)).toBe(true);
+	});
+
+	it("stale active assignment fence rejects result publish without overwrite", async () => {
+		vi.useFakeTimers();
+		const cacheRoot = tempDir("momo-stale-asn-fence-");
+		const cwd = tempDir("momo-stale-asn-fence-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const workerId = stableWorkerId(identity.poolKey, "scout");
+		const control = workerControlPaths(pool.poolRoot, "scout");
+		mkdirSync(control.root, { recursive: true, mode: 0o700 });
+		const assignmentA = "staleasn0000000001";
+		const assignmentB = "staleasn0000000002";
+		const pathsA = assignmentSpoolPaths(pool.poolRoot, "scout", assignmentA);
+		mkdirSync(pathsA.root, { recursive: true, mode: 0o700 });
+		pool.upsert({
+			workerId,
+			generation: 1,
+			generationTombstone: 1,
+			role: "scout",
+			paneId: "w1:p2",
+			agentName: "momo_scout",
+			cwd,
+			status: "idle",
+			updatedAt: new Date().toISOString(),
+		});
+
+		__setWriteResultDurableLockHookForTest((phase) => {
+			if (phase !== "before-write") return;
+			pool.upsert({
+				...pool.getByRole("scout")!,
+				status: "busy",
+				activeAssignmentId: assignmentB,
+				activeParentEpoch: "epoch1",
+				updatedAt: new Date().toISOString(),
+			});
+		});
+
+		const pi = createFakePi();
+		installMomoWorker(pi as unknown as ExtensionAPI, {
+			env: {
+				MOMO_WORKER: "1",
+				MOMO_ROLE: "scout",
+				MOMO_IPC_DIR: control.root,
+				MOMO_CONTROL_DIR: control.root,
+				MOMO_WORKER_ID: workerId,
+				MOMO_WORKER_GENERATION: "1",
+				MOMO_POOL_KEY: identity.poolKey,
+				MOMO_POOL_ROOT: pool.poolRoot,
+				MOMO_RUN_ID: "g1",
+				MOMO_CWD: cwd,
+			},
+			poolRegistry: pool,
+			now: () => 1_700_000_000_000,
+			sleep: async () => {},
+		});
+		const ctx = {
+			hasUI: true,
+			isIdle: () => true,
+			abort: vi.fn(),
+			cwd,
+		} as unknown as ExtensionContext;
+		await pi.emit("session_start", {}, ctx);
+		atomicWriteJson(pathsA.command, {
+			version: 1,
+			type: "prompt",
+			task: "first",
+			issuedAt: new Date().toISOString(),
+			runId: assignmentA,
+			workerId,
+			generation: 1,
+			parentEpoch: "epoch1",
+		});
+		atomicWriteJson(control.active, {
+			version: 1,
+			assignmentId: assignmentA,
+			generation: 1,
+			parentEpoch: "epoch1",
+			dispatchedAt: new Date().toISOString(),
+		});
+		pool.upsert({
+			...pool.getByRole("scout")!,
+			status: "busy",
+			activeAssignmentId: assignmentA,
+			activeParentEpoch: "epoch1",
+			updatedAt: new Date().toISOString(),
+		});
+		await vi.advanceTimersByTimeAsync(150);
+		await pi.emit(
+			"message_end",
+			{
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "should-not-publish" }],
+					stopReason: "stop",
+				},
+			},
+			ctx,
+		);
+		await pi.emit("agent_settled", {}, ctx);
+
+		expect(existsSync(pathsA.result)).toBe(false);
+		const record = pool.getByRole("scout")!;
+		expect(record.status).toBe("busy");
+		expect(record.activeAssignmentId).toBe(assignmentB);
+		expect(existsSync(control.active)).toBe(true);
+	});
+
+	it("existing terminal result is not overwritten on publish reject", async () => {
+		vi.useFakeTimers();
+		const cacheRoot = tempDir("momo-existing-result-");
+		const cwd = tempDir("momo-existing-result-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const workerId = stableWorkerId(identity.poolKey, "scout");
+		const control = workerControlPaths(pool.poolRoot, "scout");
+		mkdirSync(control.root, { recursive: true, mode: 0o700 });
+		const assignmentA = "existingresult0001";
+		const assignmentB = "existingresult0002";
+		const pathsA = assignmentSpoolPaths(pool.poolRoot, "scout", assignmentA);
+		const pathsB = assignmentSpoolPaths(pool.poolRoot, "scout", assignmentB);
+		mkdirSync(pathsA.root, { recursive: true, mode: 0o700 });
+		mkdirSync(pathsB.root, { recursive: true, mode: 0o700 });
+		pool.upsert({
+			workerId,
+			generation: 1,
+			generationTombstone: 1,
+			role: "scout",
+			paneId: "w1:p2",
+			agentName: "momo_scout",
+			cwd,
+			status: "idle",
+			updatedAt: new Date().toISOString(),
+		});
+
+		const existing = {
+			version: 1 as const,
+			runId: assignmentA,
+			workerId,
+			status: "failed" as const,
+			messages: [{ role: "assistant", content: [{ type: "text", text: "already-terminal" }] }],
+			finishedAt: new Date().toISOString(),
+			errorMessage: "preexisting",
+		};
+		atomicWriteJson(pathsA.result, existing);
+
+		const pi = createFakePi();
+		installMomoWorker(pi as unknown as ExtensionAPI, {
+			env: {
+				MOMO_WORKER: "1",
+				MOMO_ROLE: "scout",
+				MOMO_IPC_DIR: control.root,
+				MOMO_CONTROL_DIR: control.root,
+				MOMO_WORKER_ID: workerId,
+				MOMO_WORKER_GENERATION: "1",
+				MOMO_POOL_KEY: identity.poolKey,
+				MOMO_POOL_ROOT: pool.poolRoot,
+				MOMO_RUN_ID: "g1",
+				MOMO_CWD: cwd,
+			},
+			poolRegistry: pool,
+			now: () => 1_700_000_000_000,
+			sleep: async () => {},
+		});
+		const ctx = {
+			hasUI: true,
+			isIdle: () => true,
+			abort: vi.fn(),
+			cwd,
+		} as unknown as ExtensionContext;
+		await pi.emit("session_start", {}, ctx);
+		atomicWriteJson(pathsA.command, {
+			version: 1,
+			type: "prompt",
+			task: "first",
+			issuedAt: new Date().toISOString(),
+			runId: assignmentA,
+			workerId,
+			generation: 1,
+			parentEpoch: "epoch1",
+		});
+		atomicWriteJson(control.active, {
+			version: 1,
+			assignmentId: assignmentA,
+			generation: 1,
+			parentEpoch: "epoch1",
+			dispatchedAt: new Date().toISOString(),
+		});
+		pool.upsert({
+			...pool.getByRole("scout")!,
+			status: "busy",
+			activeAssignmentId: assignmentA,
+			activeParentEpoch: "epoch1",
+			updatedAt: new Date().toISOString(),
+		});
+		enqueueAssignment(pool.poolRoot, "scout", {
+			assignmentId: assignmentB,
+			workerId,
+			generation: 1,
+			parentEpoch: "epoch1",
+			task: "successor",
+		});
+		await vi.advanceTimersByTimeAsync(150);
+		await pi.emit(
+			"message_end",
+			{
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "would-overwrite" }],
+					stopReason: "stop",
+				},
+			},
+			ctx,
+		);
+		await pi.emit("agent_settled", {}, ctx);
+
+		const result = readJsonFile(pathsA.result) as {
+			status: string;
+			errorMessage?: string;
+			messages: unknown[];
+		};
+		expect(result.status).toBe("failed");
+		expect(result.errorMessage).toBe("preexisting");
+		expect(result.messages).toEqual(existing.messages);
+		// Still busy for this assignment → publish-failure fallback may mark unhealthy,
+		// but must not idle/busy-resurrect a successor or overwrite the result.
+		const record = pool.getByRole("scout")!;
+		expect(record.status).toBe("unhealthy");
+		expect(record.activeAssignmentId).toBe(assignmentA);
+		expect(queueCount(pool.poolRoot, "scout")).toBe(1);
+		expect(existsSync(pathsB.started)).toBe(false);
+		expect(pi.sendUserMessage).not.toHaveBeenCalledWith("successor");
+	});
+
+	it("idle registry + stale active cancel does not promote busy or publish result", async () => {
+		vi.useFakeTimers();
+		const cacheRoot = tempDir("momo-idle-stale-cancel-");
+		const cwd = tempDir("momo-idle-stale-cancel-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const workerId = stableWorkerId(identity.poolKey, "scout");
+		const control = workerControlPaths(pool.poolRoot, "scout");
+		mkdirSync(control.root, { recursive: true, mode: 0o700 });
+		const assignmentA = "idlestalecancel0001";
+		const assignmentB = "idlestalecancel0002";
+		const pathsA = assignmentSpoolPaths(pool.poolRoot, "scout", assignmentA);
+		mkdirSync(pathsA.root, { recursive: true, mode: 0o700 });
+		pool.upsert({
+			workerId,
+			generation: 1,
+			generationTombstone: 1,
+			role: "scout",
+			paneId: "w1:p2",
+			agentName: "momo_scout",
+			cwd,
+			status: "idle",
+			updatedAt: new Date().toISOString(),
+		});
+		const pi = createFakePi();
+		installMomoWorker(pi as unknown as ExtensionAPI, {
+			env: {
+				MOMO_WORKER: "1",
+				MOMO_ROLE: "scout",
+				MOMO_IPC_DIR: control.root,
+				MOMO_CONTROL_DIR: control.root,
+				MOMO_WORKER_ID: workerId,
+				MOMO_WORKER_GENERATION: "1",
+				MOMO_POOL_KEY: identity.poolKey,
+				MOMO_POOL_ROOT: pool.poolRoot,
+				MOMO_RUN_ID: "g1",
+				MOMO_CWD: cwd,
+			},
+			poolRegistry: pool,
+			now: () => 1_700_000_000_000,
+			sleep: async () => {},
+		});
+		const ctx = {
+			hasUI: true,
+			isIdle: () => true,
+			abort: vi.fn(),
+			cwd,
+		} as unknown as ExtensionContext;
+		await pi.emit("session_start", {}, ctx);
+		// Incomplete/stale dispatch: active+command+cancel without registry busy.
+		atomicWriteJson(pathsA.command, {
+			version: 1,
+			type: "prompt",
+			task: "stale",
+			issuedAt: new Date().toISOString(),
+			runId: assignmentA,
+			workerId,
+			generation: 1,
+			parentEpoch: "epoch1",
+		});
+		atomicWriteJson(control.active, {
+			version: 1,
+			assignmentId: assignmentA,
+			generation: 1,
+			parentEpoch: "epoch1",
+			dispatchedAt: new Date().toISOString(),
+		});
+		atomicWriteJson(pathsA.cancel, {
+			version: 1,
+			runId: assignmentA,
+			workerId,
+			generation: 1,
+			reason: "parent_abort",
+			issuedAt: new Date().toISOString(),
+		});
+		enqueueAssignment(pool.poolRoot, "scout", {
+			assignmentId: assignmentB,
+			workerId,
+			generation: 1,
+			parentEpoch: "epoch1",
+			task: "successor",
+		});
+		await vi.advanceTimersByTimeAsync(250);
+
+		expect(existsSync(pathsA.result)).toBe(false);
+		expect(existsSync(pathsA.started)).toBe(false);
+		expect(pi.sendUserMessage).not.toHaveBeenCalled();
+		const record = pool.getByRole("scout")!;
+		expect(record.status).toBe("idle");
+		expect(record.activeAssignmentId).toBeUndefined();
+		expect(queueCount(pool.poolRoot, "scout")).toBe(1);
+		await vi.advanceTimersByTimeAsync(200);
+		expect(pi.sendUserMessage).not.toHaveBeenCalledWith("successor");
+	});
+
+	it("starting registry + stale active cancel does not promote busy or publish result", async () => {
+		vi.useFakeTimers();
+		const cacheRoot = tempDir("momo-starting-stale-cancel-");
+		const cwd = tempDir("momo-starting-stale-cancel-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const workerId = stableWorkerId(identity.poolKey, "planner");
+		const control = workerControlPaths(pool.poolRoot, "planner");
+		mkdirSync(control.root, { recursive: true, mode: 0o700 });
+		const assignmentA = "startstalecancel001";
+		const assignmentB = "startstalecancel002";
+		const pathsA = assignmentSpoolPaths(pool.poolRoot, "planner", assignmentA);
+		mkdirSync(pathsA.root, { recursive: true, mode: 0o700 });
+		pool.upsert({
+			workerId,
+			generation: 1,
+			generationTombstone: 1,
+			role: "planner",
+			paneId: "w1:p4",
+			agentName: "momo_planner",
+			cwd,
+			status: "starting",
+			updatedAt: new Date().toISOString(),
+		});
+		const pi = createFakePi();
+		installMomoWorker(pi as unknown as ExtensionAPI, {
+			env: {
+				MOMO_WORKER: "1",
+				MOMO_ROLE: "planner",
+				MOMO_IPC_DIR: control.root,
+				MOMO_CONTROL_DIR: control.root,
+				MOMO_WORKER_ID: workerId,
+				MOMO_WORKER_GENERATION: "1",
+				MOMO_POOL_KEY: identity.poolKey,
+				MOMO_POOL_ROOT: pool.poolRoot,
+				MOMO_RUN_ID: "g1",
+				MOMO_CWD: cwd,
+			},
+			poolRegistry: pool,
+			now: () => 1_700_000_000_000,
+			sleep: async () => {},
+		});
+		const ctx = {
+			hasUI: true,
+			isIdle: () => true,
+			abort: vi.fn(),
+			cwd,
+		} as unknown as ExtensionContext;
+		await pi.emit("session_start", {}, ctx);
+		// Keep starting (do not let claimNext force idle); inject stale active+cancel.
+		pool.upsert({
+			...pool.getByRole("planner")!,
+			status: "starting",
+			updatedAt: new Date().toISOString(),
+		});
+		atomicWriteJson(pathsA.command, {
+			version: 1,
+			type: "prompt",
+			task: "stale",
+			issuedAt: new Date().toISOString(),
+			runId: assignmentA,
+			workerId,
+			generation: 1,
+			parentEpoch: "epoch1",
+		});
+		atomicWriteJson(control.active, {
+			version: 1,
+			assignmentId: assignmentA,
+			generation: 1,
+			parentEpoch: "epoch1",
+			dispatchedAt: new Date().toISOString(),
+		});
+		atomicWriteJson(pathsA.cancel, {
+			version: 1,
+			runId: assignmentA,
+			workerId,
+			generation: 1,
+			reason: "parent_abort",
+			issuedAt: new Date().toISOString(),
+		});
+		enqueueAssignment(pool.poolRoot, "planner", {
+			assignmentId: assignmentB,
+			workerId,
+			generation: 1,
+			parentEpoch: "epoch1",
+			task: "successor",
+		});
+		await vi.advanceTimersByTimeAsync(250);
+
+		expect(existsSync(pathsA.result)).toBe(false);
+		expect(existsSync(pathsA.started)).toBe(false);
+		expect(pi.sendUserMessage).not.toHaveBeenCalled();
+		const record = pool.getByRole("planner")!;
+		expect(record.status).toBe("starting");
+		expect(record.activeAssignmentId).toBeUndefined();
+		expect(queueCount(pool.poolRoot, "planner")).toBe(1);
 		await vi.advanceTimersByTimeAsync(200);
 		expect(pi.sendUserMessage).not.toHaveBeenCalledWith("successor");
 	});

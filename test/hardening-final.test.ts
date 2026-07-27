@@ -119,8 +119,8 @@ describe("writer settlement ordering", () => {
 			} as unknown as ExtensionContext;
 			await pi.emit("session_start", {}, ctx);
 			dispatchAssignment({
-				controlRoot: fixture.control.root,
-				paths: fixture.paths,
+				pool: fixture.pool,
+				role: fixture.role, controlRoot: fixture.control.root, paths: fixture.paths,
 				assignmentId: fixture.assignmentId,
 				workerId: fixture.workerId,
 				generation: fixture.generation,
@@ -173,7 +173,8 @@ describe("writer settlement ordering", () => {
 		} as unknown as ExtensionContext;
 		await pi.emit("session_start", {}, ctx);
 		dispatchAssignment({
-			controlRoot: fixture.control.root, paths: fixture.paths, assignmentId: fixture.assignmentId,
+			pool: fixture.pool,
+			role: fixture.role, controlRoot: fixture.control.root, paths: fixture.paths, assignmentId: fixture.assignmentId,
 			workerId: fixture.workerId, generation: fixture.generation, task: "edit",
 		});
 		await vi.advanceTimersByTimeAsync(150);
@@ -226,7 +227,8 @@ describe("writer settlement ordering", () => {
 		} as unknown as ExtensionContext;
 		await pi.emit("session_start", {}, ctx);
 		dispatchAssignment({
-			controlRoot: fixture.control.root, paths: fixture.paths, assignmentId: fixture.assignmentId,
+			pool: fixture.pool,
+			role: fixture.role, controlRoot: fixture.control.root, paths: fixture.paths, assignmentId: fixture.assignmentId,
 			workerId: fixture.workerId, generation: fixture.generation, task: "edit",
 		});
 		atomicWriteJson(fixture.paths.cancel, {
@@ -256,7 +258,8 @@ describe("writer settlement ordering", () => {
 		});
 		await pi2.emit("session_start", {}, ctx);
 		dispatchAssignment({
-			controlRoot: fixture2.control.root, paths: fixture2.paths, assignmentId: fixture2.assignmentId,
+			pool: fixture2.pool,
+			role: fixture2.role, controlRoot: fixture2.control.root, paths: fixture2.paths, assignmentId: fixture2.assignmentId,
 			workerId: fixture2.workerId, generation: fixture2.generation, task: "edit",
 		});
 		await vi.advanceTimersByTimeAsync(150);
@@ -1147,7 +1150,8 @@ describe("worker input policy", () => {
 		expect(notify).toHaveBeenCalled();
 
 		dispatchAssignment({
-			controlRoot: fixture.control.root, paths: fixture.paths, assignmentId: fixture.assignmentId,
+			pool: fixture.pool,
+			role: fixture.role, controlRoot: fixture.control.root, paths: fixture.paths, assignmentId: fixture.assignmentId,
 			workerId: fixture.workerId, generation: fixture.generation, task: "look",
 		});
 		await vi.advanceTimersByTimeAsync(150);
