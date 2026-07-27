@@ -20,6 +20,7 @@ afterEach(() => {
 	if (previousPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 	else process.env.PI_CODING_AGENT_DIR = previousPiDir;
 	vi.restoreAllMocks();
+	vi.useRealTimers();
 });
 
 function tempDir(prefix: string): string {
@@ -518,4 +519,323 @@ describe("herdr factory + runner integration", () => {
 		expect(splits).toBe(0);
 		expect(pool.list()).toHaveLength(0);
 	});
+
+	it("fails after heartbeatStaleMs when control heartbeat never appears", async () => {
+		installFakeHerdrExtension();
+		vi.useFakeTimers({ shouldAdvanceTime: true });
+		const cacheRoot = tempDir("momo-miss-hb-cache-");
+		const cwd = tempDir("momo-miss-hb-cwd-");
+		let now = 1_000_000;
+		const client = new HerdrClient({
+			runCommand: async (_file, args) => {
+				if (args[0] === "pane" && args[1] === "split") {
+					const envArgs = args.filter((arg, index) => args[index - 1] === "--env");
+					const controlDir =
+						envArgs
+							.find((value) => value.startsWith("MOMO_CONTROL_DIR="))
+							?.slice("MOMO_CONTROL_DIR=".length) ??
+						envArgs
+							.find((value) => value.startsWith("MOMO_IPC_DIR="))
+							?.slice("MOMO_IPC_DIR=".length);
+					const workerId = envArgs
+						.find((value) => value.startsWith("MOMO_WORKER_ID="))
+						?.slice("MOMO_WORKER_ID=".length);
+					const runId = envArgs
+						.find((value) => value.startsWith("MOMO_RUN_ID="))
+						?.slice("MOMO_RUN_ID=".length);
+					if (controlDir && workerId && runId) {
+						atomicWriteJson(path.join(controlDir, "ready.json"), {
+							version: 1,
+							runId,
+							workerId,
+							readyAt: new Date(now).toISOString(),
+						});
+						// Intentionally no heartbeat.json
+					}
+					return {
+						code: 0,
+						stdout: JSON.stringify({ id: "split", result: { pane: { pane_id: "w1:p2" } } }),
+						stderr: "",
+					};
+				}
+				if (args[0] === "agent" && args[1] === "start") {
+					return {
+						code: 0,
+						stdout: agentStartStdout("w1:p2", String(args[2])),
+						stderr: "",
+					};
+				}
+				return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+			},
+		});
+		const { PoolRegistry } = await import("../src/herdr/pool-registry.js");
+		const { resolvePoolIdentity } = await import("../src/herdr/pool-identity.js");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const factory = createHerdrChildSessionFactory({
+			cwd,
+			parentPaneId: "w1:p1",
+			parentId: "parent-miss-hb",
+			client,
+			poolRegistry: pool,
+			cacheRoot,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+			heartbeatStaleMs: 200,
+			pollIntervalMs: 20,
+			readyTimeoutMs: 2_000,
+			resultTimeoutMs: 60_000,
+			now: () => now,
+			sleep: async (ms) => {
+				now += ms;
+				await vi.advanceTimersByTimeAsync(ms);
+			},
+		});
+		const session = await factory({ cwd, role: getRole("scout") });
+		const promptPromise = session.prompt("go").then(() => session.agent!.waitForIdle());
+		await vi.advanceTimersByTimeAsync(50);
+		await expect(promptPromise).rejects.toThrow(/heartbeat went stale/i);
+		vi.useRealTimers();
+	});
+
+	it("settles valid result even when events.ndjson is oversized", async () => {
+		installFakeHerdrExtension();
+		const cacheRoot = tempDir("momo-evt-result-cache-");
+		const cwd = tempDir("momo-evt-result-cwd-");
+		const client = new HerdrClient({
+			runCommand: async (_file, args) => {
+				if (args[0] === "pane" && args[1] === "split") {
+					const envArgs = args.filter((arg, index) => args[index - 1] === "--env");
+					const controlDir =
+						envArgs
+							.find((value) => value.startsWith("MOMO_CONTROL_DIR="))
+							?.slice("MOMO_CONTROL_DIR=".length) ??
+						envArgs
+							.find((value) => value.startsWith("MOMO_IPC_DIR="))
+							?.slice("MOMO_IPC_DIR=".length);
+					const workerId = envArgs
+						.find((value) => value.startsWith("MOMO_WORKER_ID="))
+						?.slice("MOMO_WORKER_ID=".length);
+					const runId = envArgs
+						.find((value) => value.startsWith("MOMO_RUN_ID="))
+						?.slice("MOMO_RUN_ID=".length);
+					if (controlDir && workerId && runId) {
+						atomicWriteJson(path.join(controlDir, "ready.json"), {
+							version: 1,
+							runId,
+							workerId,
+							readyAt: new Date().toISOString(),
+						});
+						atomicWriteJson(path.join(controlDir, "heartbeat.json"), {
+							version: 1,
+							runId,
+							workerId,
+							at: new Date().toISOString(),
+							seq: 1,
+						});
+					}
+					return {
+						code: 0,
+						stdout: JSON.stringify({ id: "split", result: { pane: { pane_id: "w1:p3" } } }),
+						stderr: "",
+					};
+				}
+				if (args[0] === "agent" && args[1] === "start") {
+					return {
+						code: 0,
+						stdout: agentStartStdout("w1:p3", String(args[2])),
+						stderr: "",
+					};
+				}
+				return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+			},
+		});
+		const { PoolRegistry } = await import("../src/herdr/pool-registry.js");
+		const { resolvePoolIdentity } = await import("../src/herdr/pool-identity.js");
+		const { MAX_EVENTS_FILE_BYTES } = await import("../src/ipc/spool.js");
+		const { writeFileSync } = await import("node:fs");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const factory = createHerdrChildSessionFactory({
+			cwd,
+			parentPaneId: "w1:p1",
+			parentId: "parent-evt-result",
+			client,
+			poolRegistry: pool,
+			cacheRoot,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+			pollIntervalMs: 20,
+			readyTimeoutMs: 2_000,
+			sleep: async (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+		});
+		const session = await factory({ cwd, role: getRole("scout") });
+		const proxy = session as unknown as {
+			paths: { events: string; result: string; root: string };
+			assignmentId: string;
+			workerId: string;
+		};
+		const wait = session.prompt("go").then(() => session.agent!.waitForIdle());
+		for (let i = 0; i < 50; i++) {
+			if (proxy.paths.root) {
+				const { mkdirSync, existsSync } = await import("node:fs");
+				if (!existsSync(proxy.paths.root)) mkdirSync(proxy.paths.root, { recursive: true, mode: 0o700 });
+				writeFileSync(proxy.paths.events, "x".repeat(MAX_EVENTS_FILE_BYTES + 8), { mode: 0o600 });
+				atomicWriteJson(proxy.paths.result, {
+					version: 1,
+					runId: proxy.assignmentId,
+					workerId: proxy.workerId,
+					status: "completed",
+					messages: [{ role: "assistant", content: [{ type: "text", text: "ok" }] }],
+					finishedAt: new Date().toISOString(),
+				});
+				break;
+			}
+			await new Promise((r) => setTimeout(r, 20));
+		}
+		await expect(wait).resolves.toBeUndefined();
+	});
+
+	it("event parse fault settles when a matching durable result races in", async () => {
+		installFakeHerdrExtension();
+		const {
+			__resetIpcReadersForTest,
+			__setIpcReadersForTest,
+		} = await import("../src/delegation/herdr-factory.js");
+		const { tryReadIpcJson: realTryRead } = await import("../src/ipc/validate.js");
+		const cacheRoot = tempDir("momo-evt-race-cache-");
+		const cwd = tempDir("momo-evt-race-cwd-");
+		const client = new HerdrClient({
+			runCommand: async (_file, args) => {
+				if (args[0] === "pane" && args[1] === "split") {
+					const envArgs = args.filter((arg, index) => args[index - 1] === "--env");
+					const controlDir =
+						envArgs
+							.find((value) => value.startsWith("MOMO_CONTROL_DIR="))
+							?.slice("MOMO_CONTROL_DIR=".length) ??
+						envArgs
+							.find((value) => value.startsWith("MOMO_IPC_DIR="))
+							?.slice("MOMO_IPC_DIR=".length);
+					const workerId = envArgs
+						.find((value) => value.startsWith("MOMO_WORKER_ID="))
+						?.slice("MOMO_WORKER_ID=".length);
+					const runId = envArgs
+						.find((value) => value.startsWith("MOMO_RUN_ID="))
+						?.slice("MOMO_RUN_ID=".length);
+					if (controlDir && workerId && runId) {
+						atomicWriteJson(path.join(controlDir, "ready.json"), {
+							version: 1,
+							runId,
+							workerId,
+							readyAt: new Date().toISOString(),
+						});
+						atomicWriteJson(path.join(controlDir, "heartbeat.json"), {
+							version: 1,
+							runId,
+							workerId,
+							at: new Date().toISOString(),
+							seq: 1,
+						});
+					}
+					return {
+						code: 0,
+						stdout: JSON.stringify({ id: "split", result: { pane: { pane_id: "w1:p9" } } }),
+						stderr: "",
+					};
+				}
+				if (args[0] === "agent" && args[1] === "start") {
+					return {
+						code: 0,
+						stdout: agentStartStdout("w1:p9", String(args[2])),
+						stderr: "",
+					};
+				}
+				return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+			},
+		});
+		const { PoolRegistry } = await import("../src/herdr/pool-registry.js");
+		const { resolvePoolIdentity } = await import("../src/herdr/pool-identity.js");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const factory = createHerdrChildSessionFactory({
+			cwd,
+			parentPaneId: "w1:p1",
+			parentId: "parent-evt-race",
+			client,
+			poolRegistry: pool,
+			cacheRoot,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+			pollIntervalMs: 20,
+			readyTimeoutMs: 2_000,
+			sleep: async (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+		});
+		const session = await factory({ cwd, role: getRole("scout") });
+		const proxy = session as unknown as {
+			paths: { events: string; root: string };
+			assignmentId: string;
+			workerId: string;
+		};
+		let resultReads = 0;
+		const durable = {
+			version: 1,
+			runId: proxy.assignmentId,
+			workerId: proxy.workerId,
+			status: "completed" as const,
+			messages: [{ role: "assistant", content: [{ type: "text", text: "raced" }] }],
+			finishedAt: new Date().toISOString(),
+		};
+		__setIpcReadersForTest({
+			readEventsIncrementally: () => {
+				throw new Error("injected event parse fault");
+			},
+			tryReadIpcJson: (filePath: string) => {
+				if (String(filePath).endsWith("result.json")) {
+					resultReads += 1;
+					// First poll check: absent. Catch re-check: durable result present.
+					if (resultReads === 1) return undefined;
+					return durable;
+				}
+				return realTryRead(filePath);
+			},
+		});
+		try {
+			const wait = session.prompt("go").then(() => session.agent!.waitForIdle());
+			// Ensure events path exists so the injected parse fault is hit.
+			const { mkdirSync, writeFileSync, existsSync } = await import("node:fs");
+			for (let i = 0; i < 50; i++) {
+				if (proxy.paths.root) {
+					if (!existsSync(proxy.paths.root)) {
+						mkdirSync(proxy.paths.root, { recursive: true, mode: 0o700 });
+					}
+					writeFileSync(proxy.paths.events, "{partial\n", { mode: 0o600 });
+					break;
+				}
+				await new Promise((r) => setTimeout(r, 20));
+			}
+			await expect(wait).resolves.toBeUndefined();
+			expect(resultReads).toBeGreaterThanOrEqual(2);
+		} finally {
+			__resetIpcReadersForTest();
+		}
+	});
+
 });

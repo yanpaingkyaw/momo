@@ -388,12 +388,12 @@ For each accepted specialist task under Herdr mode:
 |---|---|
 | Cancel queued | Remove exact FIFO entry; **must not** interrupt the active assignment |
 | Cancel active | Assignment cancel IPC only (never terminal keys on shared panes) |
-| Heartbeat | Control-plane heartbeat while worker alive; stale ⇒ crashed/unresponsive |
+| Heartbeat | Control-plane heartbeat while worker alive; stale **or missing after dispatch beyond `heartbeatStaleMs`** ⇒ crashed/unresponsive |
 | Crash / missing result | Task fails or aborts; do not invent success from TTY |
 | Implementer uncertain write | Ambiguous mutation ⇒ `uncertain`; **no reuse** until supervised cleanup |
 | Lease release | Per assignment; release before clean result publish |
 | Cross-parent implementer wait | Second implementer **waits/retries** for the writer lease; never steals |
-| Parent shutdown | Cancel IPC only for assignments with **exact** `activeParentEpoch ===` current parent epoch; never terminal keys; never another parent's task |
+| Parent shutdown | Under each role lock: remove every queued entry with matching `parentEpoch`; remove non-active matching claiming entries; write assignment cancel for the exact active/claiming assignment when `activeParentEpoch ===` this epoch; leave foreign-epoch FIFO/claiming untouched; never terminal keys |
 
 ### 13.8 Pane retention and cleanup
 
@@ -403,7 +403,7 @@ Persistent role panes remain until explicit cleanup:
 |---|---|
 | Default | Close `idle` / `unhealthy` |
 | Refuses | `busy` / `blocked` / `starting` |
-| `--force` | Also closes `uncertain` **only** when writer lease ownerId equals registry workerId (UI confirm) |
+| `--force` | Also closes `uncertain` **only** when writer lease ownerId equals registry workerId (UI confirm). After a successful pane close, registry records generation-fenced `paneClosed:true` before agent-stop confirmation so a transient `agentGet` failure can retry without re-closing. Force-release failure after confirmed close retains `paneClosed` + `recoveryRequired`. |
 
 `/momo-workers` shows role, state, current assignment, and queued count.
 
@@ -432,9 +432,9 @@ Development of this target proceeds in a **separate Git worktree / feature branc
 
 | Event | Guaranteed behavior | Limitation |
 |---|---|---|
-| Parent `session_shutdown` | Writes cancel IPC only when `activeParentEpoch` exactly matches this parent epoch; does **not** send terminal keys; does **not** close retained panes | Hard kill / SIGKILL of the parent may skip this path |
+| Parent `session_shutdown` | Under each role lock: remove matching-epoch queued entries; remove non-active matching claiming entries; write cancel IPC for the exact active/claiming assignment when `activeParentEpoch` matches; leave foreign-epoch FIFO/claiming untouched; does **not** send terminal keys; does **not** close retained panes | Hard kill / SIGKILL of the parent may skip this path |
 | Parent relaunch (`session_start`) | Stable `parentId` (hash of Herdr pane + workspace + real cwd) rediscovers registry; privately validates `result.json` for active records (identity-checked); maps completed/aborted/failed/uncertain; idle/done/unknown without result → failed or uncertain; `working`/`blocked` without result stays active; corrupt result is terminal with notify (not startup crash) | Cannot resume in-flight tool calls; registry JSON corruption fails closed with an actionable error |
-| Worker OS death without IPC result | Heartbeat stale / missing result ⇒ failed or uncertain-write (implementer) | No invent-success from TTY |
+| Worker OS death without IPC result | Heartbeat stale / **missing after dispatch beyond heartbeat grace** / missing result ⇒ failed or uncertain-write (implementer) | No invent-success from TTY |
 
 Shipped modules are listed in **§13.0** (not the obsolete “not yet created” table from earlier drafts).
 

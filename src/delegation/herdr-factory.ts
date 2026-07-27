@@ -40,18 +40,45 @@ import {
 	DEFAULT_HEARTBEAT_STALE_MS,
 	ensurePrivateDir,
 	momoCacheRoot,
-	readEventsIncrementally,
+	readEventsIncrementally as readEventsIncrementallyImpl,
 	type IpcEvent,
 	type IpcResult,
 } from "../ipc/spool.js";
 import {
 	IpcValidationError,
-	tryReadIpcJson,
+	tryReadIpcJson as tryReadIpcJsonImpl,
 	validateEvent,
 	validateHeartbeat,
 	validateReady,
 	validateResult,
 } from "../ipc/validate.js";
+
+/** Namespace handles so tests can inject result/event races deterministically. */
+const ipcSpool = {
+	readEventsIncrementally: readEventsIncrementallyImpl,
+};
+const ipcValidate = {
+	tryReadIpcJson: tryReadIpcJsonImpl,
+};
+
+/** @internal test-only: restore default IPC readers. */
+export function __resetIpcReadersForTest(): void {
+	ipcSpool.readEventsIncrementally = readEventsIncrementallyImpl;
+	ipcValidate.tryReadIpcJson = tryReadIpcJsonImpl;
+}
+
+/** @internal test-only: override IPC readers for race/fault injection. */
+export function __setIpcReadersForTest(options: {
+	readEventsIncrementally?: typeof readEventsIncrementallyImpl;
+	tryReadIpcJson?: typeof tryReadIpcJsonImpl;
+}): void {
+	if (options.readEventsIncrementally) {
+		ipcSpool.readEventsIncrementally = options.readEventsIncrementally;
+	}
+	if (options.tryReadIpcJson) {
+		ipcValidate.tryReadIpcJson = options.tryReadIpcJson;
+	}
+}
 import {
 	getHerdrPiExtensionPath,
 	getWorkerExtensionPath,
@@ -154,6 +181,8 @@ class AssignmentProxy implements ChildSession {
 	private disposed = false;
 	private promptStarted = false;
 	private physicalEnsured = false;
+	/** Set when this assignment is dispatched and should expect control heartbeats. */
+	private heartbeatExpectedAt: number | undefined;
 	private diagnosticFailure: string | undefined;
 	private stoppingAfterFailure = false;
 	private pollTimer: ReturnType<typeof setInterval> | undefined;
@@ -228,8 +257,18 @@ class AssignmentProxy implements ChildSession {
 		if (this.disposed || this.settled || this.stoppingAfterFailure || !this.promptStarted) return;
 		const paths = this.paths;
 		try {
+			// Durable result is authoritative: validate/settle result BEFORE events so
+			// corrupt/oversized event logs cannot reject an already-valid terminal result.
+			const resultRaw = ipcValidate.tryReadIpcJson(paths.result);
+			if (resultRaw && !this.settled) {
+				this.settle(validateResult(resultRaw, assignmentIdentity(this.assignmentId, this.workerId)));
+				return;
+			}
+
+			// Pre-result event corruption remains fail-closed — but if a durable
+			// result appears while event parsing fails, prefer the result.
 			if (existsSync(paths.events)) {
-				const chunk = readEventsIncrementally(paths.events, this.eventOffset);
+				const chunk = ipcSpool.readEventsIncrementally(paths.events, this.eventOffset);
 				this.eventOffset = chunk.nextOffset;
 				for (const parsed of chunk.events) {
 					const event = validateEvent(parsed, assignmentIdentity(this.assignmentId, this.workerId), this.lastEventSeq);
@@ -238,16 +277,10 @@ class AssignmentProxy implements ChildSession {
 				}
 			}
 
-			const resultRaw = tryReadIpcJson(paths.result);
-			if (resultRaw && !this.settled) {
-				this.settle(validateResult(resultRaw, assignmentIdentity(this.assignmentId, this.workerId)));
-				return;
-			}
-
-			if (this.physicalEnsured && !this.settled) {
+			if (this.physicalEnsured && !this.settled && this.generation > 0) {
 				const control = workerControlPaths(this.runtime.pool.poolRoot, this.role.name);
-				const heartbeatRaw = tryReadIpcJson(control.heartbeat);
-				if (heartbeatRaw && this.generation > 0) {
+				const heartbeatRaw = ipcValidate.tryReadIpcJson(control.heartbeat);
+				if (heartbeatRaw) {
 					const heartbeat = validateHeartbeat(heartbeatRaw, {
 						runId: controlRunId(this.generation),
 						workerId: this.workerId,
@@ -256,9 +289,32 @@ class AssignmentProxy implements ChildSession {
 					if (Number.isFinite(age) && age > this.runtime.heartbeatStaleMs) {
 						await this.stopAndSettleFailure("Worker heartbeat went stale");
 					}
+				} else if (
+					this.heartbeatExpectedAt !== undefined &&
+					this.runtime.now() - this.heartbeatExpectedAt > this.runtime.heartbeatStaleMs
+				) {
+					// Missing heartbeat after dispatch/readiness fails like a stale one.
+					await this.stopAndSettleFailure("Worker heartbeat went stale");
 				}
 			}
 		} catch (error) {
+			// Close the check/read race: a result may have landed after the first
+			// result check and before/during event parse failure.
+			try {
+				const raced = ipcValidate.tryReadIpcJson(paths.result);
+				if (raced && !this.settled) {
+					this.settle(validateResult(raced, assignmentIdentity(this.assignmentId, this.workerId)));
+					return;
+				}
+			} catch (resultError) {
+				const message =
+					resultError instanceof IpcValidationError || resultError instanceof Error
+						? resultError.message
+						: String(resultError);
+				this.diagnosticFailure = message;
+				await this.stopAndSettleFailure(message);
+				return;
+			}
 			const message =
 				error instanceof IpcValidationError || error instanceof Error
 					? error.message
@@ -612,6 +668,8 @@ class AssignmentProxy implements ChildSession {
 			dispatchedAt: new Date(this.runtime.now()).toISOString(),
 		};
 		atomicWriteJson(control.active, active);
+		// After durable dispatch, this prompted assignment should expect heartbeats.
+		this.heartbeatExpectedAt = this.runtime.now();
 	}
 
 	private async provisionPhysicalWorker(generation: number, agentName: string): Promise<string> {
@@ -709,7 +767,7 @@ class AssignmentProxy implements ChildSession {
 		const deadline = this.runtime.now() + this.runtime.readyTimeoutMs;
 		while (this.runtime.now() < deadline) {
 			try {
-				const readyRaw = tryReadIpcJson(control.ready);
+				const readyRaw = ipcValidate.tryReadIpcJson(control.ready);
 				if (readyRaw) {
 					validateReady(readyRaw, {
 						runId: controlRunId(this.generation),

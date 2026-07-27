@@ -14,7 +14,7 @@ import { installMomoParent, reconcileRegistry } from "../src/extensions/parent.j
 import { installMomoWorker } from "../src/extensions/worker-runtime.js";
 import { HerdrClient } from "../src/herdr/client.js";
 import { PaneRegistry, selectClosablePanes } from "../src/herdr/registry.js";
-import { PoolRegistry } from "../src/herdr/pool-registry.js";
+import { isArchivalTombstone, PoolRegistry } from "../src/herdr/pool-registry.js";
 import { resolvePoolIdentity } from "../src/herdr/pool-identity.js";
 import {
 	appendEvent,
@@ -380,13 +380,94 @@ describe("NDJSON fail-closed", () => {
 		const session = await factory({ cwd, role: getRole("scout") });
 		const proxy = session as unknown as { paths: { events: string; result: string; cancel: string }; assignmentId: string; workerId: string };
 		await session.prompt("x");
+		// Pre-result event corruption remains fail-closed.
 		writeFileSync(proxy.paths.events, "{broken\n", { mode: 0o600 });
-		// Valid result must not override prior event corruption settlement.
-		atomicWriteJson(proxy.paths.result, baseResult({ workerId: proxy.workerId, runId: proxy.assignmentId }));
 		await expect(session.agent!.waitForIdle()).rejects.toThrow(/Malformed|event/i);
 		expect(pool.list()[0]?.status).toBe("unhealthy");
 		expect(tryReadIpcJson(proxy.paths.cancel)).toBeTruthy();
 		expect(calls.some((args) => args[0] === "agent" && args[1] === "send-keys")).toBe(false);
+	});
+
+	it("accepts a valid result even when events.ndjson is corrupt", async () => {
+		installFakeHerdrExtension();
+		const cacheRoot = tempDir("momo-evt-ok-cache-");
+		const cwd = tempDir("momo-evt-ok-cwd-");
+		const client = new HerdrClient({
+			runCommand: async (_file, args) => {
+				if (args[0] === "pane" && args[1] === "split") {
+					const envArgs = args.filter((_a, i) => args[i - 1] === "--env");
+					const ipc =
+						envArgs.find((v) => v.startsWith("MOMO_CONTROL_DIR="))?.slice("MOMO_CONTROL_DIR=".length) ??
+						envArgs.find((v) => v.startsWith("MOMO_IPC_DIR="))?.slice("MOMO_IPC_DIR=".length) ??
+						"";
+					const workerId =
+						envArgs.find((v) => v.startsWith("MOMO_WORKER_ID="))?.slice("MOMO_WORKER_ID=".length) ?? "";
+					const runId =
+						envArgs.find((v) => v.startsWith("MOMO_RUN_ID="))?.slice("MOMO_RUN_ID=".length) ?? "";
+					atomicWriteJson(path.join(ipc, "ready.json"), {
+						version: 1,
+						runId,
+						workerId,
+						readyAt: new Date().toISOString(),
+					});
+					atomicWriteJson(path.join(ipc, "heartbeat.json"), {
+						version: 1,
+						runId,
+						workerId,
+						at: new Date().toISOString(),
+						seq: 1,
+					});
+					return {
+						code: 0,
+						stdout: JSON.stringify({ id: "s", result: { pane: { pane_id: "w1:p5" } } }),
+						stderr: "",
+					};
+				}
+				if (args[0] === "agent" && args[1] === "start") {
+					return {
+						code: 0,
+						stdout: JSON.stringify({
+							id: "s",
+							result: {
+								pane_id: "w1:p5",
+								name: args[2],
+								agent: "pi",
+								interactive_ready: true,
+							},
+						}),
+						stderr: "",
+					};
+				}
+				return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+			},
+		});
+		const identity = resolvePoolIdentity({ cwd, canonicalRoot: cwd, workspaceId: "test-ws", socketPath: "test-sock" });
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const factory = createHerdrChildSessionFactory({
+			cwd,
+			parentPaneId: "w1:p1",
+			parentId: "parent-evt-ok",
+			client,
+			poolRegistry: pool,
+			cacheRoot,
+			canonicalRoot: cwd,
+			workspaceId: "test-ws",
+			socketPath: "test-sock",
+			pollIntervalMs: 20,
+			readyTimeoutMs: 2_000,
+			sleep: async (ms) => new Promise((r) => setTimeout(r, ms)),
+		});
+		const session = await factory({ cwd, role: getRole("scout") });
+		const proxy = session as unknown as {
+			paths: { events: string; result: string };
+			assignmentId: string;
+			workerId: string;
+		};
+		const wait = session.prompt("x").then(() => session.agent!.waitForIdle());
+		// Write durable result first, then corrupt events — result remains authoritative.
+		atomicWriteJson(proxy.paths.result, baseResult({ workerId: proxy.workerId, runId: proxy.assignmentId }));
+		writeFileSync(proxy.paths.events, "{broken\n", { mode: 0o600 });
+		await expect(wait).resolves.toBeUndefined();
 	});
 
 	it("supervises and stops a worker before a result-timeout returns", async () => {
@@ -744,6 +825,302 @@ describe("force cleanup recovery retention", () => {
 		const retained = pool.getByRole("implementer");
 		expect(retained?.status).toBe("uncertain");
 		expect(retained?.paneClosed).not.toBe(true);
+	});
+
+	it("force cleanup: transient agentGet refuses; agent_not_found/idle proceed", async () => {
+		async function runCleanup(options: {
+			agentGet: () => Promise<{ code: number; stdout: string; stderr: string }>;
+			label: string;
+		}): Promise<{
+			notifies: string[];
+			closed: string[];
+			pool: PoolRegistry;
+			leases: WriterLeaseManager;
+			workerId: string;
+			cwd: string;
+		}> {
+			const cwd = tempDir(`momo-force-${options.label}-cwd-`);
+			const cacheRoot = tempDir(`momo-force-${options.label}-cache-`);
+			const fixture = setupPoolWorkerFixture({
+				cacheRoot,
+				cwd,
+				role: "implementer",
+			});
+			const pool = fixture.pool;
+			pool.upsert({
+				workerId: fixture.workerId,
+				generation: fixture.generation,
+				generationTombstone: fixture.generation,
+				role: "implementer",
+				paneId: "w1:p9",
+				agentName: "momo_implementer",
+				cwd: fixture.identity.canonicalRoot,
+				status: "uncertain",
+				uncertainWrite: true,
+				updatedAt: new Date().toISOString(),
+			});
+			const leases = new WriterLeaseManager({
+				cacheRoot,
+				now: () => 1_000,
+			});
+			leases.acquire(fixture.identity.canonicalRoot, fixture.workerId, createLeaseToken());
+			const closed: string[] = [];
+			const notifies: string[] = [];
+			const pi = createFakePi();
+			installMomoParent(pi as unknown as ExtensionAPI, {
+				cwd: fixture.identity.canonicalRoot,
+				env: {
+					MOMO_PARENT: "1",
+					MOMO_PARENT_ID: `parent-${options.label}`,
+					HERDR_ENV: "1",
+					HERDR_PANE_ID: "w1:p1",
+					HERDR_WORKSPACE_ID: "test-ws",
+					HERDR_SOCKET_PATH: "test-sock",
+				},
+				client: new HerdrClient({
+					runCommand: async (_file, args) => {
+						if (args[0] === "pane" && args[1] === "close") {
+							closed.push(String(args[2]));
+							return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+						}
+						if (args[0] === "agent" && args[1] === "get") {
+							return options.agentGet();
+						}
+						return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+					},
+				}),
+				poolRegistry: pool,
+				leaseManager: leases,
+			});
+			const command = pi.commands.get("momo-cleanup");
+			await command!.handler("--force", {
+				ui: {
+					confirm: async () => true,
+					notify: (m: string) => notifies.push(m),
+				},
+			} as never);
+			return {
+				notifies,
+				closed,
+				pool,
+				leases,
+				workerId: fixture.workerId,
+				cwd: fixture.identity.canonicalRoot,
+			};
+		}
+
+		const transient = await runCleanup({
+			label: "transient",
+			agentGet: async () => ({
+				code: 1,
+				stdout: JSON.stringify({
+					id: "g",
+					error: { code: "timeout", message: "agent get timed out" },
+				}),
+				stderr: "",
+			}),
+		});
+		expect(transient.closed).toEqual(["w1:p9"]);
+		expect(transient.notifies.join("\n")).toMatch(/refused .*agent lookup failed|timeout/i);
+		expect(transient.pool.getByRole("implementer")?.status).toBe("uncertain");
+		expect(transient.pool.getByRole("implementer")?.paneClosed).toBe(true);
+		expect(transient.pool.getByRole("implementer")?.recoveryRequired).not.toBe(true);
+		expect(transient.leases.peekOwner(transient.cwd)?.ownerId).toBe(transient.workerId);
+
+		const notFound = await runCleanup({
+			label: "notfound",
+			agentGet: async () => ({
+				code: 1,
+				stdout: JSON.stringify({
+					id: "g",
+					error: { code: "agent_not_found", message: "no such agent" },
+				}),
+				stderr: "",
+			}),
+		});
+		expect(notFound.closed).toEqual(["w1:p9"]);
+		expect(isArchivalTombstone(notFound.pool.getByRole("implementer")!)).toBe(true);
+		expect(notFound.leases.peekOwner(notFound.cwd)).toBeUndefined();
+
+		const idle = await runCleanup({
+			label: "idle",
+			agentGet: async () => ({
+				code: 0,
+				stdout: JSON.stringify({
+					id: "g",
+					result: {
+						type: "agent_info",
+						agent: { agent_status: "idle", name: "momo_implementer" },
+					},
+				}),
+				stderr: "",
+			}),
+		});
+		expect(idle.closed).toEqual(["w1:p9"]);
+		expect(isArchivalTombstone(idle.pool.getByRole("implementer")!)).toBe(true);
+	});
+
+	it("retries confirmation after paneClosed without re-closing (transient then not-found)", async () => {
+		const cwd = tempDir("momo-force-retry-cwd-");
+		const cacheRoot = tempDir("momo-force-retry-cache-");
+		const fixture = setupPoolWorkerFixture({ cacheRoot, cwd, role: "implementer" });
+		const pool = fixture.pool;
+		pool.upsert({
+			workerId: fixture.workerId,
+			generation: fixture.generation,
+			generationTombstone: fixture.generation,
+			role: "implementer",
+			paneId: "w1:p9",
+			agentName: "momo_implementer",
+			cwd: fixture.identity.canonicalRoot,
+			status: "uncertain",
+			uncertainWrite: true,
+			updatedAt: new Date().toISOString(),
+		});
+		const leases = new WriterLeaseManager({ cacheRoot, now: () => 1_000 });
+		leases.acquire(fixture.identity.canonicalRoot, fixture.workerId, createLeaseToken());
+		const closed: string[] = [];
+		let agentGets = 0;
+		const notifies: string[] = [];
+		const pi = createFakePi();
+		installMomoParent(pi as unknown as ExtensionAPI, {
+			cwd: fixture.identity.canonicalRoot,
+			env: {
+				MOMO_PARENT: "1",
+				MOMO_PARENT_ID: "parent-retry",
+				HERDR_ENV: "1",
+				HERDR_PANE_ID: "w1:p1",
+				HERDR_WORKSPACE_ID: "test-ws",
+				HERDR_SOCKET_PATH: "test-sock",
+			},
+			client: new HerdrClient({
+				runCommand: async (_file, args) => {
+					if (args[0] === "pane" && args[1] === "close") {
+						closed.push(String(args[2]));
+						return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+					}
+					if (args[0] === "agent" && args[1] === "get") {
+						agentGets += 1;
+						if (agentGets === 1) {
+							return {
+								code: 1,
+								stdout: JSON.stringify({
+									id: "g",
+									error: { code: "timeout", message: "transient" },
+								}),
+								stderr: "",
+							};
+						}
+						return {
+							code: 1,
+							stdout: JSON.stringify({
+								id: "g",
+								error: { code: "agent_not_found", message: "gone" },
+							}),
+							stderr: "",
+						};
+					}
+					return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+				},
+			}),
+			poolRegistry: pool,
+			leaseManager: leases,
+		});
+		const command = pi.commands.get("momo-cleanup");
+		const ui = {
+			confirm: async () => true,
+			notify: (m: string) => notifies.push(m),
+		};
+		await command!.handler("--force", { ui } as never);
+		expect(closed).toEqual(["w1:p9"]);
+		expect(pool.getByRole("implementer")?.paneClosed).toBe(true);
+		expect(pool.getByRole("implementer")?.status).toBe("uncertain");
+		expect(leases.peekOwner(fixture.identity.canonicalRoot)?.ownerId).toBe(fixture.workerId);
+
+		await command!.handler("--force", { ui } as never);
+		expect(closed).toEqual(["w1:p9"]); // no second close
+		expect(agentGets).toBe(2);
+		expect(isArchivalTombstone(pool.getByRole("implementer")!)).toBe(true);
+		expect(leases.peekOwner(fixture.identity.canonicalRoot)).toBeUndefined();
+	});
+
+	it("retains paneClosed+recoveryRequired when force-release fails after confirmed close", async () => {
+		const cwd = tempDir("momo-force-ev-cwd-");
+		const cacheRoot = tempDir("momo-force-ev-cache-");
+		const fixture = setupPoolWorkerFixture({ cacheRoot, cwd, role: "implementer" });
+		const pool = fixture.pool;
+		pool.upsert({
+			workerId: fixture.workerId,
+			generation: fixture.generation,
+			generationTombstone: fixture.generation,
+			role: "implementer",
+			paneId: "w1:p9",
+			agentName: "momo_implementer",
+			cwd: fixture.identity.canonicalRoot,
+			status: "uncertain",
+			uncertainWrite: true,
+			updatedAt: new Date().toISOString(),
+		});
+		const base = new WriterLeaseManager({ cacheRoot, now: () => 1_000 });
+		base.acquire(fixture.identity.canonicalRoot, fixture.workerId, createLeaseToken());
+		const leases = Object.create(base) as WriterLeaseManager;
+		leases.forceReleaseIfOwner = () => ({
+			released: false,
+			reason: "injected_release_failure",
+		});
+		leases.peekOwner = (c: string) => base.peekOwner(c);
+		const closed: string[] = [];
+		const notifies: string[] = [];
+		const pi = createFakePi();
+		installMomoParent(pi as unknown as ExtensionAPI, {
+			cwd: fixture.identity.canonicalRoot,
+			env: {
+				MOMO_PARENT: "1",
+				MOMO_PARENT_ID: "parent-ev",
+				HERDR_ENV: "1",
+				HERDR_PANE_ID: "w1:p1",
+				HERDR_WORKSPACE_ID: "test-ws",
+				HERDR_SOCKET_PATH: "test-sock",
+			},
+			client: new HerdrClient({
+				runCommand: async (_file, args) => {
+					if (args[0] === "pane" && args[1] === "close") {
+						closed.push(String(args[2]));
+						return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+					}
+					if (args[0] === "agent" && args[1] === "get") {
+						return {
+							code: 0,
+							stdout: JSON.stringify({
+								id: "g",
+								result: {
+									type: "agent_info",
+									agent: { agent_status: "done", name: "momo_implementer" },
+								},
+							}),
+							stderr: "",
+						};
+					}
+					return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+				},
+			}),
+			poolRegistry: pool,
+			leaseManager: leases,
+		});
+		const command = pi.commands.get("momo-cleanup");
+		await command!.handler("--force", {
+			ui: {
+				confirm: async () => true,
+				notify: (m: string) => notifies.push(m),
+			},
+		} as never);
+		expect(closed).toEqual(["w1:p9"]);
+		expect(notifies.join("\n")).toMatch(/lease not released|injected_release_failure/i);
+		const retained = pool.getByRole("implementer");
+		expect(retained?.status).toBe("uncertain");
+		expect(retained?.paneClosed).toBe(true);
+		expect(retained?.recoveryRequired).toBe(true);
+		expect(isArchivalTombstone(retained!)).toBe(false);
 	});
 });
 

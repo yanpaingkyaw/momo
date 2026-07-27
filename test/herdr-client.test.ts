@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+	AGENT_NOT_FOUND_CODE,
 	AGENT_PANE_BUSY_CODE,
 	HerdrCliError,
 	HerdrClient,
+	isAgentNotFoundError,
 	parseAgentStartResult,
 	parseHerdrJson,
 	parsePaneSplitResult,
@@ -37,6 +39,35 @@ describe("Herdr JSON validation", () => {
 			expect((error as HerdrCliError).code).toBe("agent_not_ready");
 			expect((error as HerdrCliError).message).toMatch(/not ready/);
 		}
+	});
+
+	it("isAgentNotFoundError recognizes only structured not-found codes", () => {
+		expect(
+			isAgentNotFoundError(
+				new HerdrCliError("herdr agent get", {
+					code: AGENT_NOT_FOUND_CODE,
+					message: "no such agent",
+				}),
+			),
+		).toBe(true);
+		expect(
+			isAgentNotFoundError(
+				new HerdrCliError("herdr agent get", {
+					code: "not_found",
+					message: "missing",
+				}),
+			),
+		).toBe(true);
+		expect(
+			isAgentNotFoundError(
+				new HerdrCliError("herdr agent get", {
+					code: "timeout",
+					message: "transient timeout",
+				}),
+			),
+		).toBe(false);
+		expect(isAgentNotFoundError(new Error("agent not found"))).toBe(false);
+		expect(isAgentNotFoundError(new Error("agent_not_found"))).toBe(false);
 	});
 
 	it("rejects agent.start {ok:true} mocks without real AgentInfo fields", () => {

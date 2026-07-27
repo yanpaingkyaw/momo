@@ -1,11 +1,11 @@
-import { mkdtempSync, mkdirSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { installMomoWorker } from "../src/extensions/worker-runtime.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { WriterLeaseManager } from "../src/lease/writer-lease.js";
-import { MAX_IPC_JSON_BYTES, atomicWriteJson, readJsonFile } from "../src/ipc/spool.js";
+import { MAX_IPC_JSON_BYTES, MAX_EVENTS_FILE_BYTES, atomicWriteJson, readJsonFile } from "../src/ipc/spool.js";
 import { sanitizeAssistantMessages } from "../src/ipc/validate.js";
 import { PoolRegistry } from "../src/herdr/pool-registry.js";
 import { resolvePoolIdentity, stableWorkerId } from "../src/herdr/pool-identity.js";
@@ -535,5 +535,119 @@ describe("worker runtime (persistent pool)", () => {
 		await pi.emit("agent_settled", {}, ctx);
 		const result = readJsonFile(paths.result) as { status: string };
 		expect(result.status).toBe("aborted");
+	});
+
+	it("terminal event size-cap failure still advances FIFO successor", async () => {
+		vi.useFakeTimers();
+		const cacheRoot = tempDir("momo-evt-cap-");
+		const cwd = tempDir("momo-evt-cap-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const workerId = stableWorkerId(identity.poolKey, "scout");
+		const control = workerControlPaths(pool.poolRoot, "scout");
+		mkdirSync(control.root, { recursive: true, mode: 0o700 });
+		const assignmentA = "aaaaaaaaaaaaaaaa";
+		const assignmentB = "bbbbbbbbbbbbbbbb";
+		const pathsA = assignmentSpoolPaths(pool.poolRoot, "scout", assignmentA);
+		const pathsB = assignmentSpoolPaths(pool.poolRoot, "scout", assignmentB);
+		mkdirSync(pathsA.root, { recursive: true, mode: 0o700 });
+		mkdirSync(pathsB.root, { recursive: true, mode: 0o700 });
+		pool.upsert({
+			workerId,
+			generation: 1,
+			generationTombstone: 1,
+			role: "scout",
+			paneId: "w1:p2",
+			agentName: "momo_scout",
+			status: "idle",
+			updatedAt: new Date().toISOString(),
+		});
+
+		const pi = createFakePi();
+		installMomoWorker(pi as unknown as ExtensionAPI, {
+			env: {
+				MOMO_WORKER: "1",
+				MOMO_ROLE: "scout",
+				MOMO_IPC_DIR: control.root,
+				MOMO_CONTROL_DIR: control.root,
+				MOMO_WORKER_ID: workerId,
+				MOMO_WORKER_GENERATION: "1",
+				MOMO_POOL_KEY: identity.poolKey,
+				MOMO_POOL_ROOT: pool.poolRoot,
+				MOMO_RUN_ID: "g1",
+				MOMO_CWD: cwd,
+			},
+			poolRegistry: pool,
+			now: () => 1_700_000_000_000,
+			sleep: async () => {},
+		});
+		const ctx = {
+			hasUI: true,
+			isIdle: () => true,
+			abort: vi.fn(),
+			cwd,
+		} as unknown as ExtensionContext;
+		await pi.emit("session_start", {}, ctx);
+		atomicWriteJson(pathsA.command, {
+			version: 1,
+			type: "prompt",
+			task: "first",
+			issuedAt: new Date().toISOString(),
+			runId: assignmentA,
+			workerId,
+			generation: 1,
+			parentEpoch: "epoch1",
+		});
+		atomicWriteJson(control.active, {
+			version: 1,
+			assignmentId: assignmentA,
+			generation: 1,
+			parentEpoch: "epoch1",
+			dispatchedAt: new Date().toISOString(),
+		});
+		pool.upsert({
+			...pool.getByRole("scout")!,
+			status: "busy",
+			activeAssignmentId: assignmentA,
+			activeParentEpoch: "epoch1",
+			updatedAt: new Date().toISOString(),
+		});
+		enqueueAssignment(pool.poolRoot, "scout", {
+			assignmentId: assignmentB,
+			workerId,
+			generation: 1,
+			parentEpoch: "epoch1",
+			task: "successor",
+		});
+		await vi.advanceTimersByTimeAsync(150);
+		expect(pi.sendUserMessage).toHaveBeenCalledWith("first");
+		// After started events land, blow the size cap so only the terminal emit fails.
+		writeFileSync(pathsA.events, "x".repeat(MAX_EVENTS_FILE_BYTES + 1), { mode: 0o600 });
+		await pi.emit(
+			"message_end",
+			{
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "done-a" }],
+					stopReason: "stop",
+				},
+			},
+			ctx,
+		);
+		await pi.emit("agent_settled", {}, ctx);
+
+		const resultA = readJsonFile(pathsA.result) as { status: string };
+		expect(resultA.status).toBe("completed");
+		expect(pool.getByRole("scout")?.activeAssignmentId).toBe(assignmentB);
+		expect(pool.getByRole("scout")?.status).toBe("busy");
+		expect(queueCount(pool.poolRoot, "scout")).toBe(0);
+		await vi.advanceTimersByTimeAsync(150);
+		expect(pi.sendUserMessage).toHaveBeenCalledWith("successor");
+		void pathsB;
 	});
 });

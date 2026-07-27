@@ -118,7 +118,10 @@ pane-per-task candidate:
    `/momo-workers` should show at most one row per role.
 4. For uncertain pool workers, `/momo-cleanup --force` verifies the **exact**
    writer-lease owner first and refuses missing/mismatched leases (does **not**
-   treat `no_lease` as safe). Idle/unhealthy cleanup clears control ephemerals
+   treat `no_lease` as safe). After pane close succeeds, `paneClosed` is
+   persisted before agent-stop confirmation so a transient lookup can retry
+   without re-closing; force-release failure retains `paneClosed` +
+   `recoveryRequired`. Idle/unhealthy cleanup clears control ephemerals
    but retains the monotonic generation tombstone.
 5. After cleanup/recreate, generations must advance (no stale g1 reuse).
 
@@ -133,13 +136,16 @@ re-smoke for reuse/FIFO/context isolation:
 **Automated coverage (credential-free):** sequential same-pane assignments + queued
 claim, lock token-safe release / fail-closed stale locks (no automatic takeover),
 durable claim recovery, result-write failure
-stops queue, cancel→aborted, stale heartbeat adoption refusal, generation
-tombstone, lease-first uncertain cleanup refusal. See `npm test`.
+stops queue, cancel→aborted, stale/missing heartbeat grace, generation
+tombstone, lease-first uncertain cleanup refusal, epoch shutdown queue/claiming
+cleanup. See `npm test`.
 
 **Explicitly still pending live:** pool reuse across repeated implementer/reviewer
 tasks under real Herdr, queued-task cancellation without active interrupt in a
 live pane, cross-parent queue contention on a real socket, Linux. Process death
-without `session_shutdown` cannot guarantee cancel IPC.
+without `session_shutdown` cannot guarantee cancel IPC (matching-epoch queued
+entries are removed, non-active claiming removed, exact active/claiming gets
+cancel IPC when shutdown does run).
 
 ## Roles
 

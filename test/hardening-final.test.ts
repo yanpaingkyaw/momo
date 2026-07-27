@@ -17,6 +17,7 @@ import { HerdrClient, parseAgentGetResult, AGENT_PANE_BUSY_CODE } from "../src/h
 import { PaneRegistry, RegistryCorruptionError } from "../src/herdr/registry.js";
 import { PoolRegistry } from "../src/herdr/pool-registry.js";
 import { resolvePoolIdentity } from "../src/herdr/pool-identity.js";
+import { beginClaimHead, enqueueAssignment, listClaiming, listQueue } from "../src/herdr/role-queue.js";
 import { atomicWriteJson } from "../src/ipc/spool.js";
 import {
 	IpcValidationError,
@@ -638,6 +639,136 @@ describe("parent identity and quit", () => {
 		expect(tryReadIpcJson(missing.paths.cancel)).toBeUndefined();
 		expect(tryReadIpcJson(foreign.paths.cancel)).toBeUndefined();
 		expect(keys).toHaveLength(0);
+	});
+
+	it("removes matching-epoch queue/claiming; leaves foreign FIFO; cancels active epoch", async () => {
+		const cwd = tempDir("momo-quit-queue-cwd-");
+		const cacheRoot = tempDir("momo-quit-queue-cache-");
+		const fixture = setupPoolWorkerFixture({
+			cacheRoot,
+			cwd,
+			role: "implementer",
+			assignmentId: "activeepoch001",
+		});
+		const exitingEpoch = "shutdown-epoch";
+		const foreignEpoch = "other-parent-epoch";
+		fixture.pool.upsert({
+			workerId: fixture.workerId,
+			generation: fixture.generation,
+			generationTombstone: fixture.generation,
+			role: "implementer",
+			paneId: "w1:p2",
+			agentName: "momo_implementer",
+			status: "busy",
+			activeAssignmentId: fixture.assignmentId,
+			activeParentEpoch: foreignEpoch,
+			updatedAt: new Date().toISOString(),
+		});
+
+		// Non-active claiming entry owned by exiting epoch — must be removed.
+		enqueueAssignment(fixture.pool.poolRoot, "implementer", {
+			assignmentId: "claimours000001",
+			workerId: fixture.workerId,
+			generation: fixture.generation,
+			parentEpoch: exitingEpoch,
+			task: "ours-claiming-not-active",
+		});
+		beginClaimHead(fixture.pool.poolRoot, "implementer", fixture.generation);
+
+		// Mixed FIFO: ours / foreign / ours / foreign — only ours removed.
+		enqueueAssignment(fixture.pool.poolRoot, "implementer", {
+			assignmentId: "queuedours00001",
+			workerId: fixture.workerId,
+			generation: fixture.generation,
+			parentEpoch: exitingEpoch,
+			task: "ours-queued",
+		});
+		enqueueAssignment(fixture.pool.poolRoot, "implementer", {
+			assignmentId: "queuedforeign01",
+			workerId: fixture.workerId,
+			generation: fixture.generation,
+			parentEpoch: foreignEpoch,
+			task: "foreign-queued",
+		});
+		enqueueAssignment(fixture.pool.poolRoot, "implementer", {
+			assignmentId: "queuedours00002",
+			workerId: fixture.workerId,
+			generation: fixture.generation,
+			parentEpoch: exitingEpoch,
+			task: "ours-queued-tail",
+		});
+		enqueueAssignment(fixture.pool.poolRoot, "implementer", {
+			assignmentId: "claimforeign001",
+			workerId: fixture.workerId,
+			generation: fixture.generation,
+			parentEpoch: foreignEpoch,
+			task: "foreign-still-queued",
+		});
+
+		const client = new HerdrClient({
+			runCommand: async () => ({
+				code: 0,
+				stdout: JSON.stringify({ id: "ok", result: {} }),
+				stderr: "",
+			}),
+		});
+		const { cancelEpochAssignmentsOnQuit } = await import("../src/extensions/parent.js");
+		await cancelEpochAssignmentsOnQuit(fixture.pool, exitingEpoch, client);
+
+		expect(listQueue(fixture.pool.poolRoot, "implementer").map((e) => e.assignmentId)).toEqual([
+			"queuedforeign01",
+			"claimforeign001",
+		]);
+		expect(listClaiming(fixture.pool.poolRoot, "implementer")).toHaveLength(0);
+		// Active belongs to foreign epoch — no cancel written for it.
+		expect(tryReadIpcJson(fixture.paths.cancel)).toBeUndefined();
+	});
+
+	it("claiming entry that is the active epoch assignment receives cancel IPC", async () => {
+		const cwd = tempDir("momo-quit-claim-cwd-");
+		const cacheRoot = tempDir("momo-quit-claim-cache-");
+		const fixture = setupPoolWorkerFixture({
+			cacheRoot,
+			cwd,
+			role: "implementer",
+			assignmentId: "claimactive0001",
+		});
+		const exitingEpoch = "shutdown-epoch";
+		enqueueAssignment(fixture.pool.poolRoot, "implementer", {
+			assignmentId: fixture.assignmentId,
+			workerId: fixture.workerId,
+			generation: fixture.generation,
+			parentEpoch: exitingEpoch,
+			task: "active-claiming",
+		});
+		beginClaimHead(fixture.pool.poolRoot, "implementer", fixture.generation);
+		fixture.pool.upsert({
+			workerId: fixture.workerId,
+			generation: fixture.generation,
+			generationTombstone: fixture.generation,
+			role: "implementer",
+			paneId: "w1:p2",
+			agentName: "momo_implementer",
+			status: "busy",
+			activeAssignmentId: fixture.assignmentId,
+			activeParentEpoch: exitingEpoch,
+			updatedAt: new Date().toISOString(),
+		});
+		const client = new HerdrClient({
+			runCommand: async () => ({
+				code: 0,
+				stdout: JSON.stringify({ id: "ok", result: {} }),
+				stderr: "",
+			}),
+		});
+		const { cancelEpochAssignmentsOnQuit } = await import("../src/extensions/parent.js");
+		await cancelEpochAssignmentsOnQuit(fixture.pool, exitingEpoch, client);
+		expect(tryReadIpcJson(fixture.paths.cancel)).toMatchObject({
+			reason: "parent_session_shutdown",
+			runId: fixture.assignmentId,
+		});
+		// Active claiming entry is canceled, not removed (recovery evidence).
+		expect(listClaiming(fixture.pool.poolRoot, "implementer")).toHaveLength(1);
 	});
 });
 

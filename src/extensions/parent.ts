@@ -15,7 +15,7 @@ import {
 	createParentEpoch,
 	createStableParentId,
 } from "../delegation/herdr-factory.js";
-import { HerdrClient } from "../herdr/client.js";
+import { HerdrClient, HerdrCliError, isAgentNotFoundError } from "../herdr/client.js";
 import {
 	formatWorkerStatusLine,
 	PoolRegistry,
@@ -43,7 +43,14 @@ import {
 	validateResult,
 	validateStarted,
 } from "../ipc/validate.js";
-import { queueCount, withRoleLockAsync } from "../herdr/role-queue.js";
+import {
+	cancelQueuedAssignment,
+	commitClaim,
+	listClaiming,
+	listQueue,
+	queueCount,
+	withRoleLockAsync,
+} from "../herdr/role-queue.js";
 
 export const PARENT_ACTIVE_TOOLS = ["read", "grep", "find", "ls", "delegate"] as const;
 
@@ -240,25 +247,70 @@ export function installMomoParent(pi: ExtensionAPI, options: InstallMomoParentOp
 								return;
 							}
 						}
-						if (current.paneId && !current.paneClosed) {
-							await herdrClient.closePane(current.paneId);
-							// Agent lookup is the confirmation boundary before a
-							// forced lease release/archive.
-							const info = current.agentName ? await herdrClient.agentGet(current.agentName).catch(() => undefined) : undefined;
-							if (info && info.agentStatus !== "done" && info.agentStatus !== "idle") {
-								throw new Error("worker did not stop after pane close");
+
+						let record = current;
+						// Close pane once, then generation-fence paneClosed before agentGet so a
+						// transient confirmation failure can retry without re-closing.
+						if (record.paneId && !record.paneClosed) {
+							await herdrClient.closePane(record.paneId);
+							const afterClose = pool.getByRole(worker.role);
+							if (
+								!afterClose ||
+								afterClose.generation !== worker.generation ||
+								afterClose.workerId !== worker.workerId
+							) {
+								notes.push(
+									`refused ${worker.workerId}: generation/worker changed after pane close`,
+								);
+								return;
 							}
+							pool.upsert({
+								...afterClose,
+								paneClosed: true,
+								updatedAt: new Date().toISOString(),
+							});
+							record = pool.getByRole(worker.role) ?? afterClose;
 						}
-						if (current.status === "uncertain") {
-							const leaseCwd = current.cwd ?? identity.canonicalRoot;
-							const release = leases.forceReleaseIfOwner(leaseCwd, current.workerId);
-							if (!release.released) {
-								notes.push(`lease not released for ${current.workerId}: ${release.reason ?? "unknown"}`);
+
+						// paneClosed or uncertain: only definitive done/idle or structured
+						// agent_not_found may proceed. Transient lookup failures retain
+						// paneClosed + lease for a later --force retry.
+						if (record.paneClosed || record.status === "uncertain") {
+							const confirm = await confirmAgentStoppedForCleanup(
+								herdrClient,
+								record.agentName,
+							);
+							if (!confirm.ok) {
+								notes.push(`refused ${record.workerId}: ${confirm.reason}`);
 								return;
 							}
 						}
-						clearControlEphemerals(pool.poolRoot, current.role);
-						pool.archiveRoleKeepingTombstone(current.role, new Date().toISOString());
+
+						if (record.status === "uncertain") {
+							const leaseCwd = record.cwd ?? identity.canonicalRoot;
+							const release = leases.forceReleaseIfOwner(leaseCwd, record.workerId);
+							if (!release.released) {
+								const latest = pool.getByRole(worker.role);
+								if (
+									latest &&
+									latest.generation === worker.generation &&
+									latest.workerId === worker.workerId
+								) {
+									pool.upsert({
+										...latest,
+										paneClosed: true,
+										recoveryRequired: true,
+										updatedAt: new Date().toISOString(),
+									});
+								}
+								notes.push(
+									`lease not released for ${record.workerId}: ${release.reason ?? "unknown"}`,
+								);
+								return;
+							}
+						}
+						clearControlEphemerals(pool.poolRoot, record.role);
+						pool.archiveRoleKeepingTombstone(record.role, new Date().toISOString());
 						closed += 1;
 					});
 				} catch (error) {
@@ -625,7 +677,72 @@ function markImplementerUncertainIfCrashedEvidence(options: {
 	// No lease + no started + fresh heartbeat => retain busy (pre-start).
 }
 
-/** Shutdown cancels only assignments owned by this parent epoch. */
+function writeAssignmentCancelIpc(options: {
+	poolRoot: string;
+	role: PoolWorkerRecord["role"];
+	assignmentId: string;
+	workerId: string;
+	generation: number;
+}): void {
+	try {
+		const paths = assignmentSpoolPaths(options.poolRoot, options.role, options.assignmentId);
+		atomicWriteJson(paths.cancel, {
+			version: 1,
+			runId: options.assignmentId,
+			workerId: options.workerId,
+			generation: options.generation,
+			reason: "parent_session_shutdown",
+			issuedAt: new Date().toISOString(),
+		});
+	} catch {
+		// best effort cancel IPC only — never terminal keys on shared panes
+	}
+}
+
+/**
+ * Confirm an agent is definitively stopped (done/idle) or structurally gone.
+ * Never treats transient/unknown agentGet failures as stop confirmation.
+ */
+export async function confirmAgentStoppedForCleanup(
+	client: HerdrClient,
+	agentName: string | undefined,
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+	if (!agentName) {
+		return {
+			ok: false,
+			reason: "missing agentName; cannot confirm agent stopped",
+		};
+	}
+	try {
+		const info = await client.agentGet(agentName);
+		if (info.agentStatus === "done" || info.agentStatus === "idle") {
+			return { ok: true };
+		}
+		return {
+			ok: false,
+			reason: `agent still ${info.agentStatus}; refusing cleanup`,
+		};
+	} catch (error) {
+		if (isAgentNotFoundError(error)) {
+			return { ok: true };
+		}
+		const detail =
+			error instanceof HerdrCliError
+				? `${error.code ?? "unknown"}: ${error.message}`
+				: error instanceof Error
+					? error.message
+					: String(error);
+		return {
+			ok: false,
+			reason: `agent lookup failed after pane close (refusing cleanup): ${detail}`,
+		};
+	}
+}
+
+/**
+ * Shutdown cancels only assignments owned by this parent epoch.
+ * Under each role lock: drop matching FIFO/claiming entries, cancel exact active.
+ */
 export async function cancelEpochAssignmentsOnQuit(
 	pool: PoolRegistry,
 	parentEpoch: string,
@@ -637,32 +754,51 @@ export async function cancelEpochAssignmentsOnQuit(
 		await withRoleLockAsync(pool.poolRoot, role, () => {
 			const current = pool.getByRole(role);
 			if (!current) return;
-			if (
-				current.status !== "busy" &&
-				current.status !== "blocked" &&
-				current.status !== "starting"
-			) {
-				return;
+
+			// Remove every queued entry owned by this epoch; leave foreign FIFO order untouched.
+			for (const entry of listQueue(pool.poolRoot, role)) {
+				if (entry.parentEpoch === parentEpoch) {
+					cancelQueuedAssignment(pool.poolRoot, role, entry.assignmentId);
+				}
 			}
-			// Require exact epoch ownership — missing/foreign epoch writes nothing.
-			if (current.activeParentEpoch !== parentEpoch) return;
-			if (!current.activeAssignmentId) return;
-			try {
-				const paths = assignmentSpoolPaths(
-					pool.poolRoot,
+
+			const activeBusy =
+				current.status === "busy" ||
+				current.status === "blocked" ||
+				current.status === "starting";
+			const activeMatchesEpoch =
+				activeBusy &&
+				current.activeParentEpoch === parentEpoch &&
+				Boolean(current.activeAssignmentId);
+
+			// Claiming entries for this epoch: cancel if they are the live active
+			// assignment; otherwise remove so they cannot recover/run after quit.
+			for (const entry of listClaiming(pool.poolRoot, role)) {
+				if (entry.parentEpoch !== parentEpoch) continue;
+				const isActiveAssignment =
+					activeMatchesEpoch && current.activeAssignmentId === entry.assignmentId;
+				if (isActiveAssignment) {
+					writeAssignmentCancelIpc({
+						poolRoot: pool.poolRoot,
+						role,
+						assignmentId: entry.assignmentId,
+						workerId: current.workerId,
+						generation: current.generation,
+					});
+				} else {
+					commitClaim(pool.poolRoot, role, entry);
+				}
+			}
+
+			// Exact active assignment cancel when this epoch owns the busy pointer.
+			if (activeMatchesEpoch && current.activeAssignmentId) {
+				writeAssignmentCancelIpc({
+					poolRoot: pool.poolRoot,
 					role,
-					current.activeAssignmentId,
-				);
-				atomicWriteJson(paths.cancel, {
-					version: 1,
-					runId: current.activeAssignmentId,
+					assignmentId: current.activeAssignmentId,
 					workerId: current.workerId,
 					generation: current.generation,
-					reason: "parent_session_shutdown",
-					issuedAt: new Date().toISOString(),
 				});
-			} catch {
-				// best effort cancel IPC only — never terminal keys on shared panes
 			}
 		});
 	}

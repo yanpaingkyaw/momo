@@ -791,7 +791,13 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 			});
 			return;
 		}
-		emitAssignment(assignment, eventType, eventType);
+		// Durable result is authoritative. Terminal event append is best-effort
+		// and must never prevent completeCleanAssignment / queue advancement.
+		try {
+			emitAssignment(assignment, eventType, eventType);
+		} catch {
+			// ignore event-log size/I/O failures after durable result
+		}
 		if (protocolUnhealthy || partial.uncertainWrite) return;
 		// Task failure returns idle (or next queued); protocol failure stays unhealthy.
 		claimNextOrIdle("after-finish", assignment.assignmentId);

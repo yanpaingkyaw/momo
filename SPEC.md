@@ -1245,7 +1245,10 @@ cannot add tools or widen permissions.
    wait for shutdown, and mark tasks `aborted` or `skipped` per baseline status
    rules.
 2. Workers must renew an IPC heartbeat while running. A stale heartbeat must be
-   treated as worker failure/unresponsiveness.
+   treated as worker failure/unresponsiveness. After an assignment is
+   dispatched/ready, a still-missing control heartbeat beyond the configured
+   heartbeat grace (`heartbeatStaleMs`) must fail the same way as a stale
+   heartbeat (not wait for the full result timeout).
 3. A crash or exit without a valid result record must not be reported as
    successful completion.
 4. If an implementer held the writer lease and ends without a clean successful
@@ -1263,14 +1266,22 @@ cannot add tools or widen permissions.
 4. `/momo-cleanup` must close `idle`/`unhealthy` (clear control ephemerals, retain
    monotonic generation tombstone), refuse `busy`/`blocked`, and for `--force`
    uncertain must verify exact lease owner **before** close (refuse missing/
-   mismatched; never treat `no_lease` as safe).
+   mismatched; never treat `no_lease` as safe). After a successful pane close,
+   persist generation-fenced `paneClosed:true` before agent-stop confirmation;
+   transient confirmation failure retains `paneClosed` + lease for a later
+   `--force` retry without re-closing. Force-release failure after confirmed
+   close retains `paneClosed:true` and `recoveryRequired:true`.
 5. Parent relaunch may adopt a pool worker only when registry + v2 manifest +
    heartbeat freshness + Herdr identity match. Momo must not adopt arbitrary or
    legacy v1 workers.
 6. One-time migration must close terminal/ready legacy pane-per-task duplicates
    safely; active/uncertain legacy panes must fail clearly for operator cleanup.
-7. Parent shutdown must cancel only assignments owned by the current parent
-   epoch and must not leave unmanaged worker processes running.
+7. Parent shutdown must, under each role lock: remove every queued entry whose
+   `parentEpoch` matches the exiting epoch; remove non-active matching claiming
+   entries; write assignment-specific cancel for the exact active/claiming
+   assignment when `activeParentEpoch` matches; leave foreign-epoch FIFO and
+   claiming entries untouched; and must not leave unmanaged worker processes
+   running.
 8. Ready timeout / start failure must generation-fence rollback to
    unhealthy/closable (no stale generation reuse).
 
