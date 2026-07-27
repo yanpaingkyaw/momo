@@ -135,6 +135,7 @@ export function installMomoParent(pi: ExtensionAPI, options: InstallMomoParentOp
 		parentEpoch,
 		client: herdrClient,
 		poolRegistry: pool,
+		leaseManager: leases,
 		...(env.HERDR_WORKSPACE_ID ? { workspaceId: env.HERDR_WORKSPACE_ID } : {}),
 		...(env.HERDR_SOCKET_PATH ? { socketPath: env.HERDR_SOCKET_PATH } : {}),
 	});

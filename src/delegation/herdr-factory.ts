@@ -50,11 +50,17 @@ import {
 	IpcValidationError,
 	assertHeartbeatFreshness,
 	tryReadIpcJson as tryReadIpcJsonImpl,
+	validateActivePointer,
 	validateEvent,
 	validateHeartbeat,
 	validateReady,
 	validateResult,
+	validateStarted,
 } from "../ipc/validate.js";
+import {
+	LeaseCorruptionError,
+	WriterLeaseManager,
+} from "../lease/writer-lease.js";
 
 /** Namespace handles so tests can inject result/event races deterministically. */
 const ipcSpool = {
@@ -142,6 +148,7 @@ export interface HerdrFactoryOptions {
 	now?: () => number;
 	sleep?: (ms: number) => Promise<void>;
 	splitDirection?: "right" | "down";
+	leaseManager?: WriterLeaseManager;
 	/** @deprecated Legacy pane registry ignored by pool factory. */
 	registry?: unknown;
 	/** @deprecated Per-run id unused; pool uses stable workers. */
@@ -167,6 +174,7 @@ interface FactoryRuntime {
 	pool: PoolRegistry;
 	identity: PoolIdentity;
 	cacheRoot: string;
+	leases: WriterLeaseManager;
 	heartbeatStaleMs: number;
 	pollIntervalMs: number;
 	readyTimeoutMs: number;
@@ -219,6 +227,11 @@ class AssignmentProxy implements ChildSession {
 	private diagnosticFailure: string | undefined;
 	private stoppingAfterFailure = false;
 	private pollTimer: ReturnType<typeof setInterval> | undefined;
+	/** Set by abort(); prompt/dispatch check this and stop without publishing. */
+	private cancelRequested = false;
+	private readonly cancelWaiters: Array<() => void> = [];
+	/** Supervised background dispatch/provision; must not become unhandled. */
+	private backgroundDispatch: Promise<void> | undefined;
 	uncertainWrite = false;
 
 	readonly assignmentId: string;
@@ -286,6 +299,40 @@ class AssignmentProxy implements ChildSession {
 		}
 	}
 
+	private notifyCancelled(): void {
+		for (const waiter of this.cancelWaiters.splice(0)) {
+			try {
+				waiter();
+			} catch {
+				// ignore
+			}
+		}
+	}
+
+	private whenCancelled(): Promise<void> {
+		if (this.cancelRequested) return Promise.resolve();
+		return new Promise<void>((resolve) => {
+			this.cancelWaiters.push(resolve);
+		});
+	}
+
+	private throwIfCancelled(): void {
+		if (!this.cancelRequested) return;
+		throw Object.assign(new Error("Assignment cancelled"), {
+			stopReason: "aborted" as const,
+			cancelled: true as const,
+		});
+	}
+
+	private isCancelledError(error: unknown): boolean {
+		return (
+			typeof error === "object" &&
+			error !== null &&
+			"cancelled" in error &&
+			(error as { cancelled?: unknown }).cancelled === true
+		);
+	}
+
 	/**
 	 * Authoritative result.json settle helper shared by the initial poll read,
 	 * event-parse race recovery, and heartbeat pre-failure checks.
@@ -299,6 +346,85 @@ class AssignmentProxy implements ChildSession {
 		if (!resultRaw) return false;
 		this.settle(validateResult(resultRaw, assignmentIdentity(this.assignmentId, this.workerId)));
 		return true;
+	}
+
+	/**
+	 * Active implementer failure: started valid OR same-worker lease OR
+	 * corrupt/missing-owner lease ambiguity ⇒ uncertain. No started + no lease,
+	 * or no started + foreign lease ⇒ unhealthy. Never touches leases.
+	 */
+	private classifyImplementerActiveFailure(record: PoolWorkerRecord): {
+		status: "uncertain" | "unhealthy";
+		uncertainWrite?: true;
+	} {
+		const assignmentId = record.activeAssignmentId ?? this.assignmentId;
+		const paths = assignmentSpoolPaths(
+			this.runtime.pool.poolRoot,
+			this.role.name,
+			assignmentId,
+		);
+		const control = workerControlPaths(this.runtime.pool.poolRoot, this.role.name);
+		let parentEpoch = record.activeParentEpoch ?? this.runtime.parentEpoch;
+		try {
+			const activeRaw = ipcValidate.tryReadIpcJson(control.active);
+			if (activeRaw) {
+				const ptr = validateActivePointer(activeRaw, {
+					generation: record.generation,
+					assignmentId,
+				});
+				parentEpoch = ptr.parentEpoch;
+			}
+		} catch {
+			// Ambiguous active pointer — treat as uncertain (may have started).
+			return { status: "uncertain", uncertainWrite: true };
+		}
+
+		let hasValidStarted = false;
+		if (existsSync(paths.started)) {
+			try {
+				const startedRaw = ipcValidate.tryReadIpcJson(paths.started);
+				validateStarted(startedRaw, {
+					runId: assignmentId,
+					workerId: this.workerId,
+					generation: record.generation,
+					parentEpoch,
+				});
+				hasValidStarted = true;
+			} catch {
+				return { status: "uncertain", uncertainWrite: true };
+			}
+		}
+
+		const cwd = record.cwd ?? this.runtime.cwd;
+		const lockDir = this.runtime.leases.dirFor(cwd);
+		if (existsSync(lockDir)) {
+			try {
+				const owner = this.runtime.leases.peekOwner(cwd);
+				if (!owner) {
+					// Lock dir without readable owner metadata ⇒ ambiguity.
+					return { status: "uncertain", uncertainWrite: true };
+				}
+				if (owner.ownerId === this.workerId) {
+					return { status: "uncertain", uncertainWrite: true };
+				}
+				// Foreign lease + no valid started ⇒ provably no mutation capability.
+				if (!hasValidStarted) {
+					return { status: "unhealthy" };
+				}
+				return { status: "uncertain", uncertainWrite: true };
+			} catch (error) {
+				if (error instanceof LeaseCorruptionError) {
+					return { status: "uncertain", uncertainWrite: true };
+				}
+				throw error;
+			}
+		}
+
+		if (hasValidStarted) {
+			return { status: "uncertain", uncertainWrite: true };
+		}
+		// No started + no lease ⇒ unhealthy (pre-start, no mutation capability).
+		return { status: "unhealthy" };
 	}
 
 	private async poll(): Promise<void> {
@@ -424,13 +550,25 @@ class AssignmentProxy implements ChildSession {
 					record.activeAssignmentId === this.assignmentId;
 				if (isActive && record) {
 					activeFailure = true;
-					this.runtime.pool.upsert({
-						...record,
-						status: this.role.canWrite ? "uncertain" : "unhealthy",
-						...(this.role.canWrite ? { uncertainWrite: true } : {}),
-						generationTombstone: Math.max(record.generationTombstone, this.generation),
-						updatedAt: new Date(this.runtime.now()).toISOString(),
-					});
+					if (this.role.canWrite) {
+						const classified = this.classifyImplementerActiveFailure(record);
+						this.runtime.pool.upsert({
+							...record,
+							status: classified.status,
+							...(classified.uncertainWrite ? { uncertainWrite: true } : {}),
+							generationTombstone: Math.max(record.generationTombstone, this.generation),
+							updatedAt: new Date(this.runtime.now()).toISOString(),
+						});
+						activeFailure = classified.status === "uncertain";
+					} else {
+						this.runtime.pool.upsert({
+							...record,
+							status: "unhealthy",
+							generationTombstone: Math.max(record.generationTombstone, this.generation),
+							updatedAt: new Date(this.runtime.now()).toISOString(),
+						});
+						activeFailure = false;
+					}
 					return;
 				}
 				// Queued / non-active claiming: remove exact entry so it cannot later run.
@@ -477,7 +615,7 @@ class AssignmentProxy implements ChildSession {
 				status: "failed",
 				messages: this.messagesInternal,
 				errorMessage: message,
-				uncertainWrite: this.role.canWrite && activeFailure,
+				...(activeFailure ? { uncertainWrite: true } : {}),
 				finishedAt: new Date(this.runtime.now()).toISOString(),
 			});
 		} finally {
@@ -491,11 +629,34 @@ class AssignmentProxy implements ChildSession {
 		if (this.promptStarted) throw new Error("Assignment already prompted");
 		this.promptStarted = true;
 		ensureAssignmentSpool(this.runtime.pool.poolRoot, this.role.name, this.assignmentId);
-		await this.dispatchOrEnqueue(text);
-		this.startPolling();
+
+		const work = this.runDispatchSupervised(text);
+		this.backgroundDispatch = work;
+		await Promise.race([work, this.whenCancelled()]);
+		if (this.cancelRequested) {
+			// Abort already settled; keep background work supervised.
+			void work.catch(() => undefined);
+			return;
+		}
+		await work;
+		if (!this.settled && !this.cancelRequested) {
+			this.startPolling();
+		}
+	}
+
+	private async runDispatchSupervised(task: string): Promise<void> {
+		try {
+			await this.dispatchOrEnqueue(task);
+		} catch (error) {
+			if (this.cancelRequested || this.isCancelledError(error)) {
+				return;
+			}
+			throw error;
+		}
 	}
 
 	private async dispatchOrEnqueue(task: string): Promise<void> {
+		this.throwIfCancelled();
 		type Plan =
 			| { kind: "provision"; generation: number; agentName: string }
 			| {
@@ -511,6 +672,7 @@ class AssignmentProxy implements ChildSession {
 			this.runtime.pool.poolRoot,
 			this.role.name,
 			async (): Promise<Plan> => {
+				this.throwIfCancelled();
 				const existing = this.runtime.pool.getByRole(this.role.name);
 				// Genuinely unhealthy/uncertain live workers refuse reuse.
 				if (existing && isNonReusableLiveWorker(existing)) {
@@ -548,6 +710,7 @@ class AssignmentProxy implements ChildSession {
 				}
 
 				// Only absent records or true generation-0 archival tombstones may provision.
+				this.throwIfCancelled();
 				if (!existing || isArchivalTombstone(existing)) {
 					const generation = this.runtime.pool.nextGeneration(this.role.name);
 					const agentName = herdrAgentNameForWorker(this.workerId);
@@ -579,12 +742,14 @@ class AssignmentProxy implements ChildSession {
 				this.agentName = existing.agentName;
 				this.physicalEnsured = true;
 
+				this.throwIfCancelled();
 				if (existing.status === "idle") {
 					this.dispatchActiveLocked(task, existing);
 					return { kind: "done" };
 				}
 
 				if (existing.status === "busy" || existing.status === "blocked") {
+					this.throwIfCancelled();
 					enqueueAssignment(this.runtime.pool.poolRoot, this.role.name, {
 						assignmentId: this.assignmentId,
 						workerId: this.workerId,
@@ -603,16 +768,34 @@ class AssignmentProxy implements ChildSession {
 		);
 
 		if (plan.kind === "done") return;
+		this.throwIfCancelled();
 
 		if (plan.kind === "provision") {
 			this.generation = plan.generation;
 			this.agentName = plan.agentName;
 			try {
+				this.throwIfCancelled();
 				const paneId = await this.provisionPhysicalWorker(plan.generation, plan.agentName);
+				if (this.cancelRequested) {
+					let closePaneSucceeded = false;
+					try {
+						await this.runtime.client.closePane(paneId);
+						closePaneSucceeded = true;
+					} catch {
+						closePaneSucceeded = false;
+					}
+					throw new ProvisioningFailure({
+						message: "Assignment cancelled during provisioning",
+						agentName: plan.agentName,
+						paneId,
+						closePaneSucceeded,
+					});
+				}
 				const finalized = await withRoleLockAsync(
 					this.runtime.pool.poolRoot,
 					this.role.name,
 					() => {
+						this.throwIfCancelled();
 						const record = this.runtime.pool.getByRole(this.role.name);
 						if (
 							!record ||
@@ -641,8 +824,30 @@ class AssignmentProxy implements ChildSession {
 				}
 				this.paneId = paneId;
 				this.physicalEnsured = true;
+				this.throwIfCancelled();
 				await this.waitForWorkerReady();
+				this.throwIfCancelled();
 			} catch (error) {
+				let failError: unknown = error;
+				if (
+					this.cancelRequested &&
+					!(error instanceof ProvisioningFailure) &&
+					this.paneId
+				) {
+					let closePaneSucceeded = false;
+					try {
+						await this.runtime.client.closePane(this.paneId);
+						closePaneSucceeded = true;
+					} catch {
+						closePaneSucceeded = false;
+					}
+					failError = new ProvisioningFailure({
+						message: "Assignment cancelled during provisioning",
+						agentName: plan.agentName,
+						paneId: this.paneId,
+						closePaneSucceeded,
+					});
+				}
 				await withRoleLockAsync(
 					this.runtime.pool.poolRoot,
 					this.role.name,
@@ -656,8 +861,9 @@ class AssignmentProxy implements ChildSession {
 						}
 						const nowIso = new Date(this.runtime.now()).toISOString();
 						const provisionFail =
-							error instanceof ProvisioningFailure ? error : undefined;
-						const paneId = provisionFail?.paneId ?? record.paneId;
+							failError instanceof ProvisioningFailure ? failError : undefined;
+						const paneId =
+							provisionFail?.paneId ?? this.paneId ?? record.paneId;
 						const agentName =
 							provisionFail?.agentName ?? record.agentName ?? plan.agentName;
 
@@ -709,8 +915,12 @@ class AssignmentProxy implements ChildSession {
 					},
 					{ now: this.runtime.now, sleep: this.runtime.sleep },
 				);
-				throw error;
+				if (this.cancelRequested || this.isCancelledError(error)) {
+					return;
+				}
+				throw failError;
 			}
+			this.throwIfCancelled();
 			await this.dispatchOrEnqueue(task);
 			return;
 		}
@@ -719,11 +929,14 @@ class AssignmentProxy implements ChildSession {
 		this.generation = plan.generation;
 		if (plan.paneId) this.paneId = plan.paneId;
 		if (plan.agentName) this.agentName = plan.agentName;
+		this.throwIfCancelled();
 		await this.waitForWorkerReady();
+		this.throwIfCancelled();
 		await withRoleLockAsync(
 			this.runtime.pool.poolRoot,
 			this.role.name,
 			async () => {
+				this.throwIfCancelled();
 				const record = this.runtime.pool.getByRole(this.role.name);
 				if (
 					!record ||
@@ -739,11 +952,13 @@ class AssignmentProxy implements ChildSession {
 				this.paneId = record.paneId;
 				this.agentName = record.agentName;
 				this.physicalEnsured = true;
+				this.throwIfCancelled();
 				if (record.status === "idle") {
 					this.dispatchActiveLocked(task, record);
 					return;
 				}
 				if (record.status === "busy" || record.status === "blocked") {
+					this.throwIfCancelled();
 					enqueueAssignment(this.runtime.pool.poolRoot, this.role.name, {
 						assignmentId: this.assignmentId,
 						workerId: this.workerId,
@@ -852,6 +1067,7 @@ class AssignmentProxy implements ChildSession {
 			});
 			paneId = split.paneId;
 			this.paneId = paneId;
+			this.throwIfCancelled();
 
 			await this.runtime.client.renamePane(paneId, `Momo ${this.role.name}`);
 			await this.runtime.client.reportMetadata(paneId, {
@@ -860,6 +1076,7 @@ class AssignmentProxy implements ChildSession {
 				title: `Momo ${this.role.name}`,
 				agent: "pi",
 			});
+			this.throwIfCancelled();
 
 			const agentArgs = [
 				"--name",
@@ -884,6 +1101,7 @@ class AssignmentProxy implements ChildSession {
 				timeoutMs: 60_000,
 				agentArgs,
 			});
+			this.throwIfCancelled();
 			const manifest: WorkerManifest = {
 				version: 2, poolKey: this.runtime.identity.poolKey, workerId: this.workerId,
 				generation, role: this.role.name, cwd: this.runtime.cwd, paneId, agentName,
@@ -916,6 +1134,7 @@ class AssignmentProxy implements ChildSession {
 		const control = workerControlPaths(this.runtime.pool.poolRoot, this.role.name);
 		const deadline = this.runtime.now() + this.runtime.readyTimeoutMs;
 		while (this.runtime.now() < deadline) {
+			this.throwIfCancelled();
 			try {
 				const readyRaw = ipcValidate.tryReadIpcJson(control.ready);
 				if (readyRaw) {
@@ -924,6 +1143,7 @@ class AssignmentProxy implements ChildSession {
 						workerId: this.workerId,
 					});
 					const promoted = withRoleLock(this.runtime.pool.poolRoot, this.role.name, () => {
+						this.throwIfCancelled();
 						const record = this.runtime.pool.getByRole(this.role.name);
 						if (
 							!record ||
@@ -1016,11 +1236,14 @@ class AssignmentProxy implements ChildSession {
 	}
 
 	async abort(): Promise<void> {
-		if (this.settled) return;
+		if (this.settled && !this.cancelRequested) return;
 		if (!this.promptStarted) {
 			await this.skip("cancelled_before_prompt");
 			return;
 		}
+
+		this.cancelRequested = true;
+		this.notifyCancelled();
 
 		const cancelledQueued = withRoleLock(this.runtime.pool.poolRoot, this.role.name, () => {
 			const record = this.runtime.pool.getByRole(this.role.name);
@@ -1032,15 +1255,58 @@ class AssignmentProxy implements ChildSession {
 
 		if (cancelledQueued) {
 			ensureAssignmentSpool(this.runtime.pool.poolRoot, this.role.name, this.assignmentId);
-			this.settle({
-				version: 1,
-				runId: this.assignmentId,
-				workerId: this.workerId,
-				status: "aborted",
-				messages: [],
-				errorMessage: "cancelled_while_queued",
-				finishedAt: new Date(this.runtime.now()).toISOString(),
-			});
+			if (!this.settled) {
+				this.settle({
+					version: 1,
+					runId: this.assignmentId,
+					workerId: this.workerId,
+					status: "aborted",
+					messages: [],
+					errorMessage: "cancelled_while_queued",
+					finishedAt: new Date(this.runtime.now()).toISOString(),
+				});
+			}
+			return;
+		}
+
+		const record = this.runtime.pool.getByRole(this.role.name);
+		const isActive =
+			record?.generation === this.generation &&
+			record.workerId === this.workerId &&
+			record.activeAssignmentId === this.assignmentId;
+
+		// Mid-provision / wait-ready / pre-dispatch: settle aborted immediately so
+		// prompt() unblocks; background work rolls back without publishing.
+		if (!isActive) {
+			const midProvision =
+				!this.physicalEnsured && this.heartbeatExpectedAt === undefined;
+			if (!midProvision) {
+				// Previously dispatched (or superseded after A→B): assignment-specific
+				// cancel IPC only — never terminal keys on the shared pane.
+				try {
+					atomicWriteJson(this.paths.cancel, {
+						version: 1,
+						runId: this.assignmentId,
+						workerId: this.workerId,
+						generation: this.generation,
+						reason: "parent_abort",
+						issuedAt: new Date(this.runtime.now()).toISOString(),
+					});
+				} catch {
+					// best effort
+				}
+			}
+			if (!this.settled) {
+				this.settle({
+					version: 1,
+					runId: this.assignmentId,
+					workerId: this.workerId,
+					status: "aborted",
+					messages: [],
+					errorMessage: "parent_abort",
+					finishedAt: new Date(this.runtime.now()).toISOString(),
+				});
+			}
 			return;
 		}
 
@@ -1061,32 +1327,13 @@ class AssignmentProxy implements ChildSession {
 			await this.runtime.sleep(50);
 		}
 
+		// Final durable-result poll before synthesizing unresolved-cancel failure.
 		await this.poll();
 		if (this.settled) return;
 
-		if (this.role.canWrite) {
-			this.settle({
-				version: 1,
-				runId: this.assignmentId,
-				workerId: this.workerId,
-				status: "failed",
-				messages: this.messagesInternal,
-				errorMessage: "Worker cancel unresolved after cancel IPC",
-				uncertainWrite: true,
-				finishedAt: new Date(this.runtime.now()).toISOString(),
-			});
-			return;
-		}
-		this.settle({
-			version: 1,
-			runId: this.assignmentId,
-			workerId: this.workerId,
-			status: "aborted",
-			messages: this.messagesInternal,
-			errorMessage: "Worker cancel unresolved after cancel IPC",
-			stopReason: "aborted",
-			finishedAt: new Date(this.runtime.now()).toISOString(),
-		});
+		// Fenced registry transition: unhealthy/uncertain via classifyImplementerActiveFailure,
+		// queue/claim cleanup for non-active, parent settlement matches classification.
+		await this.stopAndSettleFailure("Worker cancel unresolved after cancel IPC");
 	}
 
 	async dispose(): Promise<void> {
@@ -1130,6 +1377,13 @@ export function createHerdrChildSessionFactory(options: HerdrFactoryOptions): Ch
 		pool,
 		identity,
 		cacheRoot,
+		leases:
+			options.leaseManager ??
+			new WriterLeaseManager({
+				cacheRoot,
+				now,
+				sleep,
+			}),
 		heartbeatStaleMs: options.heartbeatStaleMs ?? DEFAULT_HEARTBEAT_STALE_MS,
 		pollIntervalMs: options.pollIntervalMs ?? 100,
 		readyTimeoutMs: options.readyTimeoutMs ?? 60_000,

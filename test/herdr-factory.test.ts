@@ -1465,4 +1465,538 @@ describe("herdr factory + runner integration", () => {
 		expect(stableWorkerId(identity.poolKey, "scout")).toBe(proxy.workerId);
 	});
 
+	async function expectAbortDuringProvisionPause(options: {
+		label: string;
+		pause: "split" | "agentStart" | "ready";
+	}): Promise<void> {
+		installFakeHerdrExtension();
+		const cacheRoot = tempDir(`momo-abort-${options.label}-cache-`);
+		const cwd = tempDir(`momo-abort-${options.label}-cwd-`);
+		const closed: string[] = [];
+		let releaseGate!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			releaseGate = resolve;
+		});
+		let splitEntered = 0;
+		let agentStartEntered = 0;
+		const client = new HerdrClient({
+			runCommand: async (_file, args) => {
+				if (args[0] === "pane" && args[1] === "split") {
+					splitEntered += 1;
+					const envArgs = args.filter((_a, i) => args[i - 1] === "--env");
+					const control =
+						envArgs.find((v) => v.startsWith("MOMO_CONTROL_DIR="))?.slice("MOMO_CONTROL_DIR=".length) ??
+						envArgs.find((v) => v.startsWith("MOMO_IPC_DIR="))?.slice("MOMO_IPC_DIR=".length);
+					const workerId =
+						envArgs.find((v) => v.startsWith("MOMO_WORKER_ID="))?.slice("MOMO_WORKER_ID=".length) ?? "";
+					const runId =
+						envArgs.find((v) => v.startsWith("MOMO_RUN_ID="))?.slice("MOMO_RUN_ID=".length) ?? "";
+					if (options.pause === "split") await gate;
+					if (control && options.pause !== "ready") {
+						mkdirSync(control, { recursive: true, mode: 0o700 });
+						atomicWriteJson(path.join(control, "ready.json"), {
+							version: 1,
+							runId,
+							workerId,
+							readyAt: new Date().toISOString(),
+						});
+					}
+					return {
+						code: 0,
+						stdout: JSON.stringify({ id: "s", result: { pane: { pane_id: "w1:p-abort" } } }),
+						stderr: "",
+					};
+				}
+				if (args[0] === "agent" && args[1] === "start") {
+					agentStartEntered += 1;
+					if (options.pause === "agentStart") await gate;
+					return {
+						code: 0,
+						stdout: agentStartStdout("w1:p-abort", String(args[2])),
+						stderr: "",
+					};
+				}
+				if (args[0] === "pane" && args[1] === "close") {
+					closed.push(String(args[2] ?? ""));
+					return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+				}
+				return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+			},
+		});
+		const { PoolRegistry } = await import("../src/herdr/pool-registry.js");
+		const { resolvePoolIdentity } = await import("../src/herdr/pool-identity.js");
+		const { queueCount, listQueue } = await import("../src/herdr/role-queue.js");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const factory = createHerdrChildSessionFactory({
+			cwd,
+			parentPaneId: "w1:p0",
+			parentId: `parent-abort-${options.label}`,
+			client,
+			poolRegistry: pool,
+			cacheRoot,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+			pollIntervalMs: 20,
+			readyTimeoutMs: 5_000,
+			sleep: async (ms) => new Promise((r) => setTimeout(r, ms)),
+		});
+		const session = await factory({ cwd, role: getRole("scout") });
+		const proxy = session as unknown as { assignmentId: string };
+		const promptPromise = session.prompt("task");
+
+		for (let i = 0; i < 80; i += 1) {
+			if (options.pause === "split" && splitEntered >= 1) break;
+			if (options.pause === "agentStart" && agentStartEntered >= 1) break;
+			if (options.pause === "ready" && pool.getByRole("scout")?.paneId) break;
+			await new Promise((r) => setTimeout(r, 20));
+		}
+
+		const abortPromise = session.abort();
+		await expect(abortPromise).resolves.toBeUndefined();
+		await expect(promptPromise).resolves.toBeUndefined();
+
+		expect(pool.getByRole("scout")?.activeAssignmentId).not.toBe(proxy.assignmentId);
+		expect(queueCount(pool.poolRoot, "scout")).toBe(0);
+		expect(listQueue(pool.poolRoot, "scout")).toHaveLength(0);
+
+		releaseGate();
+		// Supervised background continuation: eventual close/rollback, no orphan.
+		for (let i = 0; i < 50; i += 1) {
+			const record = pool.getByRole("scout");
+			const archivedOrClosed =
+				!record ||
+				record.generation === 0 ||
+				record.paneClosed === true ||
+				(record.status === "unhealthy" && closed.includes("w1:p-abort")) ||
+				(options.pause === "split" && (!record.paneId || record.generation === 0));
+			if (archivedOrClosed && (options.pause === "split" || closed.includes("w1:p-abort") || record?.paneClosed)) {
+				break;
+			}
+			await new Promise((r) => setTimeout(r, 20));
+		}
+
+		expect(queueCount(pool.poolRoot, "scout")).toBe(0);
+		expect(pool.getByRole("scout")?.activeAssignmentId).not.toBe(proxy.assignmentId);
+		if (options.pause !== "split") {
+			expect(closed).toContain("w1:p-abort");
+		}
+		const final = pool.getByRole("scout");
+		if (final?.activeAssignmentId === proxy.assignmentId) {
+			throw new Error("canceled assignment must not remain active");
+		}
+	}
+
+	it("abort during paused split returns bounded and rolls back without publish", async () => {
+		await expectAbortDuringProvisionPause({ label: "split", pause: "split" });
+	});
+
+	it("abort during paused agentStart returns bounded and closes pane", async () => {
+		await expectAbortDuringProvisionPause({ label: "agent-start", pause: "agentStart" });
+	});
+
+	it("abort during ready wait returns bounded and closes pane", async () => {
+		await expectAbortDuringProvisionPause({ label: "ready", pause: "ready" });
+	});
+
+	describe("unresolved active abort registry fencing", () => {
+		async function provisionAndAbort(options: {
+			label: string;
+			role: "scout" | "implementer";
+			beforeAbort?: (ctx: {
+				pool: import("../src/herdr/pool-registry.js").PoolRegistry;
+				paths: { result: string; started: string; cancel: string };
+				assignmentId: string;
+				workerId: string;
+				cwd: string;
+				leases: import("../src/lease/writer-lease.js").WriterLeaseManager;
+				controlDir: string;
+				now: () => number;
+			}) => void | Promise<void>;
+		}) {
+			installFakeHerdrExtension();
+			const cacheRoot = tempDir(`momo-unresolved-abort-${options.label}-cache-`);
+			const cwd = tempDir(`momo-unresolved-abort-${options.label}-cwd-`);
+			let now = 1_000_000;
+			let controlDir = "";
+			const client = new HerdrClient({
+				runCommand: async (_file, args) => {
+					if (args[0] === "pane" && args[1] === "split") {
+						const envArgs = args.filter((_a, i) => args[i - 1] === "--env");
+						controlDir =
+							envArgs.find((v) => v.startsWith("MOMO_CONTROL_DIR="))?.slice("MOMO_CONTROL_DIR=".length) ??
+							envArgs.find((v) => v.startsWith("MOMO_IPC_DIR="))?.slice("MOMO_IPC_DIR=".length) ??
+							"";
+						const workerId =
+							envArgs.find((v) => v.startsWith("MOMO_WORKER_ID="))?.slice("MOMO_WORKER_ID=".length) ?? "";
+						const runId =
+							envArgs.find((v) => v.startsWith("MOMO_RUN_ID="))?.slice("MOMO_RUN_ID=".length) ?? "";
+						if (controlDir) {
+							mkdirSync(controlDir, { recursive: true, mode: 0o700 });
+							atomicWriteJson(path.join(controlDir, "ready.json"), {
+								version: 1,
+								runId,
+								workerId,
+								readyAt: new Date(now).toISOString(),
+							});
+							atomicWriteJson(path.join(controlDir, "heartbeat.json"), {
+								version: 1,
+								runId,
+								workerId,
+								at: new Date(now).toISOString(),
+								seq: 1,
+							});
+						}
+						return {
+							code: 0,
+							stdout: JSON.stringify({ id: "s", result: { pane: { pane_id: "w1:p-ua" } } }),
+							stderr: "",
+						};
+					}
+					if (args[0] === "agent" && args[1] === "start") {
+						return {
+							code: 0,
+							stdout: agentStartStdout("w1:p-ua", String(args[2])),
+							stderr: "",
+						};
+					}
+					if (args[0] === "agent" && args[1] === "send-keys") {
+						throw new Error("terminal keys must not be used");
+					}
+					return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+				},
+			});
+			const { PoolRegistry } = await import("../src/herdr/pool-registry.js");
+			const { resolvePoolIdentity } = await import("../src/herdr/pool-identity.js");
+			const { WriterLeaseManager } = await import("../src/lease/writer-lease.js");
+			const identity = resolvePoolIdentity({
+				cwd,
+				canonicalRoot: cwd,
+				workspaceId: "ws",
+				socketPath: "s",
+			});
+			const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+			const leases = new WriterLeaseManager({ cacheRoot, now: () => now });
+			const factory = createHerdrChildSessionFactory({
+				cwd,
+				parentPaneId: "w1:p0",
+				parentId: `parent-ua-${options.label}`,
+				client,
+				poolRegistry: pool,
+				leaseManager: leases,
+				cacheRoot,
+				canonicalRoot: cwd,
+				workspaceId: "ws",
+				socketPath: "s",
+				pollIntervalMs: 20,
+				readyTimeoutMs: 2_000,
+				heartbeatStaleMs: 60_000,
+				now: () => now,
+				sleep: async (ms) => {
+					now += ms;
+				},
+			});
+			const session = await factory({ cwd, role: getRole(options.role) });
+			const proxy = session as unknown as {
+				assignmentId: string;
+				workerId: string;
+				generation: number;
+				paths: { result: string; started: string; cancel: string };
+				uncertainWrite: boolean;
+			};
+			await session.prompt("task");
+			expect(pool.getByRole(options.role)?.activeAssignmentId).toBe(proxy.assignmentId);
+			await options.beforeAbort?.({
+				pool,
+				paths: proxy.paths,
+				assignmentId: proxy.assignmentId,
+				workerId: proxy.workerId,
+				cwd,
+				leases,
+				controlDir,
+				now: () => now,
+			});
+			await session.abort();
+			return { pool, proxy, leases, cwd };
+		}
+
+		it("unresolved read-only abort => registry unhealthy", async () => {
+			const { tryReadIpcJson } = await import("../src/ipc/validate.js");
+			const { pool, proxy } = await provisionAndAbort({ label: "scout", role: "scout" });
+			const after = pool.getByRole("scout")!;
+			expect(after.status).toBe("unhealthy");
+			expect(after.uncertainWrite).toBeUndefined();
+			expect(after.activeAssignmentId).toBe(proxy.assignmentId);
+			expect(proxy.uncertainWrite).toBeFalsy();
+			expect(tryReadIpcJson(proxy.paths.cancel)).toBeTruthy();
+		});
+
+		it("pre-lease implementer abort => unhealthy not uncertain", async () => {
+			const { pool, proxy } = await provisionAndAbort({
+				label: "impl-prelease",
+				role: "implementer",
+			});
+			const after = pool.getByRole("implementer")!;
+			expect(after.status).toBe("unhealthy");
+			expect(after.uncertainWrite).toBeUndefined();
+			expect(proxy.uncertainWrite).toBe(false);
+		});
+
+		it("same-worker lease implementer abort => uncertain", async () => {
+			const { createLeaseToken } = await import("../src/lease/writer-lease.js");
+			const { pool, proxy } = await provisionAndAbort({
+				label: "impl-lease",
+				role: "implementer",
+				beforeAbort: ({ leases, cwd, workerId }) => {
+					leases.acquire(cwd, workerId, createLeaseToken());
+				},
+			});
+			const after = pool.getByRole("implementer")!;
+			expect(after.status).toBe("uncertain");
+			expect(after.uncertainWrite).toBe(true);
+			expect(proxy.uncertainWrite).toBe(true);
+		});
+
+		it("started implementer abort => uncertain", async () => {
+			const { pool, proxy } = await provisionAndAbort({
+				label: "impl-started",
+				role: "implementer",
+				beforeAbort: ({ paths, assignmentId, workerId, pool: p }) => {
+					const record = p.getByRole("implementer")!;
+					atomicWriteJson(paths.started, {
+						version: 1,
+						runId: assignmentId,
+						workerId,
+						generation: record.generation,
+						parentEpoch: record.activeParentEpoch ?? "epoch",
+						startedAt: new Date().toISOString(),
+					});
+				},
+			});
+			const after = pool.getByRole("implementer")!;
+			expect(after.status).toBe("uncertain");
+			expect(after.uncertainWrite).toBe(true);
+			expect(proxy.uncertainWrite).toBe(true);
+		});
+
+		it("durable result still wins over unresolved abort timeout", async () => {
+			const { tryReadIpcJson } = await import("../src/ipc/validate.js");
+			const { pool, proxy } = await provisionAndAbort({
+				label: "result-wins",
+				role: "scout",
+				beforeAbort: async ({ paths, assignmentId, workerId }) => {
+					atomicWriteJson(paths.result, {
+						version: 1,
+						runId: assignmentId,
+						workerId,
+						status: "completed",
+						messages: [{ role: "assistant", content: [{ type: "text", text: "ok" }] }],
+						finishedAt: new Date().toISOString(),
+					});
+				},
+			});
+			expect(proxy.uncertainWrite).toBeFalsy();
+			expect(tryReadIpcJson(proxy.paths.result)).toMatchObject({ status: "completed" });
+			const after = pool.getByRole("scout");
+			expect(after?.status).not.toBe("unhealthy");
+			expect(after?.uncertainWrite).toBeUndefined();
+		});
+	});
+
+	describe("implementer pre-lease heartbeat failure classification", () => {
+		async function setupActiveImplementer(options: {
+			label: string;
+			started?: boolean;
+			lease?: "same" | "foreign" | "corrupt" | "missing-owner" | "none";
+		}) {
+			installFakeHerdrExtension();
+			const cacheRoot = tempDir(`momo-impl-hb-${options.label}-cache-`);
+			const cwd = tempDir(`momo-impl-hb-${options.label}-cwd-`);
+			const { PoolRegistry, selectClosablePoolWorkers } = await import(
+				"../src/herdr/pool-registry.js"
+			);
+			const { resolvePoolIdentity, stableWorkerId } = await import(
+				"../src/herdr/pool-identity.js"
+			);
+			const { workerControlPaths, assignmentSpoolPaths } = await import(
+				"../src/herdr/assignment-spool.js"
+			);
+			const { WriterLeaseManager, createLeaseToken } = await import(
+				"../src/lease/writer-lease.js"
+			);
+			const { mkdirSync, writeFileSync, rmSync } = await import("node:fs");
+			const identity = resolvePoolIdentity({
+				cwd,
+				canonicalRoot: cwd,
+				workspaceId: "ws",
+				socketPath: "s",
+			});
+			const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+			const leases = new WriterLeaseManager({ cacheRoot, now: () => 1_700_000_000_000 });
+			const workerId = stableWorkerId(identity.poolKey, "implementer");
+			const control = workerControlPaths(pool.poolRoot, "implementer");
+			mkdirSync(control.root, { recursive: true, mode: 0o700 });
+
+			const client = new HerdrClient({
+				runCommand: async () => ({
+					code: 0,
+					stdout: JSON.stringify({ id: "ok", result: {} }),
+					stderr: "",
+				}),
+			});
+			const factory = createHerdrChildSessionFactory({
+				cwd,
+				parentPaneId: "w1:p0",
+				parentId: `parent-impl-hb-${options.label}`,
+				client,
+				poolRegistry: pool,
+				leaseManager: leases,
+				cacheRoot,
+				canonicalRoot: cwd,
+				workspaceId: "ws",
+				socketPath: "s",
+			});
+			const session = await factory({ cwd, role: getRole("implementer") });
+			const proxy = session as unknown as {
+				assignmentId: string;
+				workerId: string;
+				generation: number;
+				promptStarted: boolean;
+				physicalEnsured: boolean;
+				stopAndSettleFailure: (message: string) => Promise<void>;
+			};
+			const assignmentId = proxy.assignmentId;
+			expect(proxy.workerId).toBe(workerId);
+			const paths = assignmentSpoolPaths(pool.poolRoot, "implementer", assignmentId);
+			mkdirSync(paths.root, { recursive: true, mode: 0o700 });
+			pool.upsert({
+				workerId,
+				generation: 1,
+				generationTombstone: 1,
+				role: "implementer",
+				paneId: "w1:p-impl",
+				agentName: "momo_implementer",
+				cwd,
+				status: "busy",
+				activeAssignmentId: assignmentId,
+				activeParentEpoch: "epoch1",
+				updatedAt: new Date().toISOString(),
+			});
+			atomicWriteJson(control.active, {
+				version: 1,
+				assignmentId,
+				generation: 1,
+				parentEpoch: "epoch1",
+				dispatchedAt: new Date().toISOString(),
+			});
+			if (options.started) {
+				atomicWriteJson(paths.started, {
+					version: 1,
+					runId: assignmentId,
+					workerId,
+					generation: 1,
+					parentEpoch: "epoch1",
+					startedAt: new Date().toISOString(),
+				});
+			}
+			if (options.lease === "same") {
+				leases.acquire(cwd, workerId, createLeaseToken());
+			} else if (options.lease === "foreign") {
+				leases.acquire(cwd, "other_worker_id", createLeaseToken());
+			} else if (options.lease === "corrupt") {
+				leases.acquire(cwd, workerId, createLeaseToken());
+				writeFileSync(path.join(leases.dirFor(cwd), "owner.json"), "{bad", { mode: 0o600 });
+			} else if (options.lease === "missing-owner") {
+				leases.acquire(cwd, workerId, createLeaseToken());
+				rmSync(path.join(leases.dirFor(cwd), "owner.json"), { force: true });
+			}
+
+			proxy.generation = 1;
+			proxy.promptStarted = true;
+			proxy.physicalEnsured = true;
+
+			return { pool, leases, cwd, workerId, assignmentId, proxy, selectClosablePoolWorkers };
+		}
+
+		it("foreign-lease waiting crash => unhealthy, cleanable, lease untouched", async () => {
+			const { pool, leases, cwd, assignmentId, proxy, selectClosablePoolWorkers } =
+				await setupActiveImplementer({
+					label: "foreign",
+					lease: "foreign",
+				});
+			const before = leases.peekOwner(cwd)!;
+			await proxy.stopAndSettleFailure("Worker heartbeat went stale");
+			const after = pool.getByRole("implementer")!;
+			expect(after.status).toBe("unhealthy");
+			expect(after.uncertainWrite).toBeUndefined();
+			expect(after.activeAssignmentId).toBe(assignmentId);
+			expect(selectClosablePoolWorkers([after]).closable).toHaveLength(1);
+			expect(leases.peekOwner(cwd)?.ownerId).toBe(before.ownerId);
+		});
+
+		it("no-lease prestart crash => unhealthy and cleanable", async () => {
+			const { pool, proxy, selectClosablePoolWorkers } = await setupActiveImplementer({
+				label: "nolease",
+				lease: "none",
+			});
+			await proxy.stopAndSettleFailure("Worker heartbeat went stale");
+			const after = pool.getByRole("implementer")!;
+			expect(after.status).toBe("unhealthy");
+			expect(after.uncertainWrite).toBeUndefined();
+			expect(selectClosablePoolWorkers([after]).closable).toHaveLength(1);
+		});
+
+		it("same-worker lease crash => uncertain", async () => {
+			const { pool, leases, cwd, workerId, proxy } = await setupActiveImplementer({
+				label: "same",
+				lease: "same",
+			});
+			await proxy.stopAndSettleFailure("Worker heartbeat went stale");
+			const after = pool.getByRole("implementer")!;
+			expect(after.status).toBe("uncertain");
+			expect(after.uncertainWrite).toBe(true);
+			expect(leases.peekOwner(cwd)?.ownerId).toBe(workerId);
+		});
+
+		it("valid started crash => uncertain", async () => {
+			const { pool, proxy } = await setupActiveImplementer({
+				label: "started",
+				started: true,
+				lease: "none",
+			});
+			await proxy.stopAndSettleFailure("Worker heartbeat went stale");
+			const after = pool.getByRole("implementer")!;
+			expect(after.status).toBe("uncertain");
+			expect(after.uncertainWrite).toBe(true);
+		});
+
+		it("corrupt lease crash => uncertain", async () => {
+			const { pool, proxy } = await setupActiveImplementer({
+				label: "corrupt",
+				lease: "corrupt",
+			});
+			await proxy.stopAndSettleFailure("Worker heartbeat went stale");
+			const after = pool.getByRole("implementer")!;
+			expect(after.status).toBe("uncertain");
+			expect(after.uncertainWrite).toBe(true);
+		});
+
+		it("missing-owner lease crash => uncertain", async () => {
+			const { pool, proxy } = await setupActiveImplementer({
+				label: "missing-owner",
+				lease: "missing-owner",
+			});
+			await proxy.stopAndSettleFailure("Worker heartbeat went stale");
+			const after = pool.getByRole("implementer")!;
+			expect(after.status).toBe("uncertain");
+			expect(after.uncertainWrite).toBe(true);
+		});
+	});
+
 });

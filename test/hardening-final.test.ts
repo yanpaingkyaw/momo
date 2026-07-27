@@ -697,11 +697,12 @@ describe("agent get / cancel statuses", () => {
 		expect(info.name).toBe("momo_x");
 	});
 
-	it("read-only unresolved cancel => failed; implementer => uncertain", async () => {
+	it("read-only unresolved cancel => unhealthy; pre-lease implementer => unhealthy not uncertain", async () => {
 		installFakeHerdrExtension();
 		const cacheRoot = tempDir("momo-cancel-cache-");
 		const cwd = tempDir("momo-cancel-cwd-");
 		let gets = 0;
+		let now = 1_000_000;
 		const client = new HerdrClient({
 			agentStartBusyRetryMs: 0,
 			runCommand: async (_file, args) => {
@@ -718,7 +719,14 @@ describe("agent get / cancel statuses", () => {
 						version: 1,
 						runId,
 						workerId,
-						readyAt: new Date().toISOString(),
+						readyAt: new Date(now).toISOString(),
+					});
+					atomicWriteJson(path.join(ipc, "heartbeat.json"), {
+						version: 1,
+						runId,
+						workerId,
+						at: new Date(now).toISOString(),
+						seq: 1,
 					});
 					return {
 						code: 0,
@@ -780,14 +788,19 @@ describe("agent get / cancel statuses", () => {
 			socketPath: "test-sock",
 			pollIntervalMs: 20,
 			readyTimeoutMs: 2_000,
-			sleep: async (ms) => new Promise((r) => setTimeout(r, ms)),
+			heartbeatStaleMs: 60_000,
+			now: () => now,
+			sleep: async (ms) => {
+				now += ms;
+			},
 		});
 		const scout = await factory({ cwd, role: getRole("scout") });
 		const scoutProxy = scout as unknown as { paths: { cancel: string }; uncertainWrite?: boolean };
 		await scout.prompt("x");
 		await scout.abort();
-		expect(pool.list().find((p) => p.role === "scout")?.status).toBe("busy");
+		expect(pool.list().find((p) => p.role === "scout")?.status).toBe("unhealthy");
 		expect(pool.list().find((p) => p.role === "scout")?.uncertainWrite).toBeUndefined();
+		expect(scoutProxy.uncertainWrite).toBeFalsy();
 		expect(tryReadIpcJson(scoutProxy.paths.cancel)).toBeTruthy();
 
 		const impl = await factory({ cwd, role: getRole("implementer") });
@@ -797,9 +810,10 @@ describe("agent get / cancel statuses", () => {
 		};
 		await impl.prompt("y");
 		await impl.abort();
-		expect(pool.list().find((p) => p.role === "implementer")?.status).toBe("busy");
+		expect(pool.list().find((p) => p.role === "implementer")?.status).toBe("unhealthy");
+		expect(pool.list().find((p) => p.role === "implementer")?.uncertainWrite).toBeUndefined();
 		expect(tryReadIpcJson(implProxy.paths.cancel)).toBeTruthy();
-		expect(implProxy.uncertainWrite).toBe(true);
+		expect(implProxy.uncertainWrite).toBe(false);
 		// No terminal-key / agentWait escalation on shared panes.
 		expect(gets).toBe(0);
 		void AGENT_PANE_BUSY_CODE;

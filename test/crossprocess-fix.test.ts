@@ -514,12 +514,17 @@ describe("NDJSON fail-closed", () => {
 			sleep: async (ms) => new Promise((r) => setTimeout(r, ms)),
 		});
 		const session = await factory({ cwd, role: getRole("implementer") });
-		const proxy = session as unknown as { paths: { cancel: string } };
+		const proxy = session as unknown as { paths: { cancel: string }; uncertainWrite: boolean };
 		await session.prompt("wait then edit");
-		await expect(session.agent!.waitForIdle()).rejects.toMatchObject({ uncertainWrite: true });
+		await expect(session.agent!.waitForIdle()).rejects.toMatchObject({
+			message: expect.stringMatching(/Timed out waiting for worker result/i),
+			stopReason: "error",
+		});
+		// Pre-lease / no started: heartbeat/result timeout is unhealthy (not uncertain).
+		expect(proxy.uncertainWrite).toBe(false);
+		expect(pool.getByRole("implementer")?.status).toBe("unhealthy");
 		expect(tryReadIpcJson(proxy.paths.cancel)).toBeTruthy();
 		expect(calls.some((args) => args[0] === "agent" && args[1] === "send-keys")).toBe(false);
-		expect((session as unknown as { uncertainWrite: boolean }).uncertainWrite).toBe(true);
 	});
 });
 
