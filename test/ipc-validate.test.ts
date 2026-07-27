@@ -10,6 +10,7 @@ import {
 } from "../src/ipc/spool.js";
 import {
 	assertSafeEnvValue,
+	assertHeartbeatFreshness,
 	parseJsonFile,
 	validateCommand,
 	validateEvent,
@@ -17,6 +18,7 @@ import {
 	validateReady,
 	validateResult,
 	IpcValidationError,
+	DEFAULT_HEARTBEAT_CLOCK_SKEW_MS,
 } from "../src/ipc/validate.js";
 
 describe("IPC validators", () => {
@@ -135,5 +137,33 @@ describe("IPC validators", () => {
 		expect(() => assertSafeEnvValue("MOMO_ROLE", "scout\n")).toThrow(/Unsafe env value/);
 		expect(() => assertSafeEnvValue("bad-key", "x")).toThrow(/Unsafe env key/);
 		assertSafeEnvValue("MOMO_ROLE", "scout");
+	});
+
+	it("assertHeartbeatFreshness fails closed on malformed and far-future at", () => {
+		const now = Date.parse("2026-07-27T12:00:00.000Z");
+		expect(() =>
+			assertHeartbeatFreshness("not-a-date", { now, staleMs: 15_000 }),
+		).toThrow(/not a valid date/i);
+		expect(() =>
+			assertHeartbeatFreshness("2026-07-27T12:10:00.000Z", {
+				now,
+				staleMs: 15_000,
+				maxFutureSkewMs: DEFAULT_HEARTBEAT_CLOCK_SKEW_MS,
+			}),
+		).toThrow(/implausibly in the future/i);
+		expect(() =>
+			assertHeartbeatFreshness("2026-07-27T11:00:00.000Z", { now, staleMs: 15_000 }),
+		).toThrow(/went stale/i);
+		// Within skew tolerance: slightly ahead is ok.
+		expect(
+			assertHeartbeatFreshness("2026-07-27T12:00:03.000Z", {
+				now,
+				staleMs: 15_000,
+				maxFutureSkewMs: DEFAULT_HEARTBEAT_CLOCK_SKEW_MS,
+			}).ageMs,
+		).toBeLessThan(0);
+		expect(
+			assertHeartbeatFreshness("2026-07-27T11:59:50.000Z", { now, staleMs: 15_000 }).ageMs,
+		).toBe(10_000);
 	});
 });

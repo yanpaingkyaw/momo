@@ -31,7 +31,9 @@ import {
 } from "../herdr/pool-registry.js";
 import {
 	cancelQueuedAssignment,
+	commitClaim,
 	enqueueAssignment,
+	listClaiming,
 	withRoleLock,
 	withRoleLockAsync,
 } from "../herdr/role-queue.js";
@@ -46,6 +48,7 @@ import {
 } from "../ipc/spool.js";
 import {
 	IpcValidationError,
+	assertHeartbeatFreshness,
 	tryReadIpcJson as tryReadIpcJsonImpl,
 	validateEvent,
 	validateHeartbeat,
@@ -285,10 +288,10 @@ class AssignmentProxy implements ChildSession {
 						runId: controlRunId(this.generation),
 						workerId: this.workerId,
 					});
-					const age = this.runtime.now() - Date.parse(heartbeat.at);
-					if (Number.isFinite(age) && age > this.runtime.heartbeatStaleMs) {
-						await this.stopAndSettleFailure("Worker heartbeat went stale");
-					}
+					assertHeartbeatFreshness(heartbeat.at, {
+						now: this.runtime.now(),
+						staleMs: this.runtime.heartbeatStaleMs,
+					});
 				} else if (
 					this.heartbeatExpectedAt !== undefined &&
 					this.runtime.now() - this.heartbeatExpectedAt > this.runtime.heartbeatStaleMs
@@ -353,46 +356,89 @@ class AssignmentProxy implements ChildSession {
 		if (this.settled || this.stoppingAfterFailure) return;
 		this.stoppingAfterFailure = true;
 		this.stopPolling();
-		// Assignment-specific cancel IPC only — never send terminal keys on a shared pane.
+		let activeFailure = false;
 		try {
-			atomicWriteJson(this.paths.cancel, {
+			// Assignment-specific cancel IPC only — never send terminal keys on a shared pane.
+			try {
+				atomicWriteJson(this.paths.cancel, {
+					version: 1,
+					runId: this.assignmentId,
+					workerId: this.workerId,
+					generation: this.generation,
+					reason: message.slice(0, 1024),
+					issuedAt: new Date(this.runtime.now()).toISOString(),
+				});
+			} catch {
+				// continue
+			}
+			await withRoleLockAsync(this.runtime.pool.poolRoot, this.role.name, () => {
+				const record = this.runtime.pool.getByRole(this.role.name);
+				const isActive =
+					record?.generation === this.generation &&
+					record.workerId === this.workerId &&
+					record.activeAssignmentId === this.assignmentId;
+				if (isActive && record) {
+					activeFailure = true;
+					this.runtime.pool.upsert({
+						...record,
+						status: this.role.canWrite ? "uncertain" : "unhealthy",
+						...(this.role.canWrite ? { uncertainWrite: true } : {}),
+						generationTombstone: Math.max(record.generationTombstone, this.generation),
+						updatedAt: new Date(this.runtime.now()).toISOString(),
+					});
+					return;
+				}
+				// Queued / non-active claiming: remove exact entry so it cannot later run.
+				cancelQueuedAssignment(
+					this.runtime.pool.poolRoot,
+					this.role.name,
+					this.assignmentId,
+				);
+				const claiming = listClaiming(this.runtime.pool.poolRoot, this.role.name).find(
+					(entry) => entry.assignmentId === this.assignmentId,
+				);
+				if (
+					claiming &&
+					record?.activeAssignmentId !== claiming.assignmentId
+				) {
+					commitClaim(this.runtime.pool.poolRoot, this.role.name, claiming);
+				}
+				// Durable failed result for waiting proxies / cleanup observers.
+				try {
+					const paths = ensureAssignmentSpool(
+						this.runtime.pool.poolRoot,
+						this.role.name,
+						this.assignmentId,
+					);
+					if (!ipcValidate.tryReadIpcJson(paths.result)) {
+						atomicWriteJson(paths.result, {
+							version: 1,
+							runId: this.assignmentId,
+							workerId: this.workerId,
+							status: "failed",
+							messages: this.messagesInternal,
+							errorMessage: message.slice(0, 1024),
+							finishedAt: new Date(this.runtime.now()).toISOString(),
+						});
+					}
+				} catch {
+					// settle in-memory regardless
+				}
+			}, { now: this.runtime.now, sleep: this.runtime.sleep });
+			this.settle({
 				version: 1,
 				runId: this.assignmentId,
 				workerId: this.workerId,
-				generation: this.generation,
-				reason: message.slice(0, 1024),
-				issuedAt: new Date(this.runtime.now()).toISOString(),
+				status: "failed",
+				messages: this.messagesInternal,
+				errorMessage: message,
+				uncertainWrite: this.role.canWrite && activeFailure,
+				finishedAt: new Date(this.runtime.now()).toISOString(),
 			});
-		} catch {
-			// continue
+		} finally {
+			// Keep the reentrancy gate until lock cleanup + settle complete.
+			this.stoppingAfterFailure = false;
 		}
-		this.stoppingAfterFailure = false;
-		await withRoleLockAsync(this.runtime.pool.poolRoot, this.role.name, () => {
-			const record = this.runtime.pool.getByRole(this.role.name);
-			if (
-				record?.generation === this.generation &&
-				record.workerId === this.workerId &&
-				record.activeAssignmentId === this.assignmentId
-			) {
-				this.runtime.pool.upsert({
-					...record,
-					status: this.role.canWrite ? "uncertain" : "unhealthy",
-					...(this.role.canWrite ? { uncertainWrite: true } : {}),
-					generationTombstone: Math.max(record.generationTombstone, this.generation),
-					updatedAt: new Date(this.runtime.now()).toISOString(),
-				});
-			}
-		}, { now: this.runtime.now, sleep: this.runtime.sleep });
-		this.settle({
-			version: 1,
-			runId: this.assignmentId,
-			workerId: this.workerId,
-			status: "failed",
-			messages: this.messagesInternal,
-			errorMessage: message,
-			uncertainWrite: this.role.canWrite,
-			finishedAt: new Date(this.runtime.now()).toISOString(),
-		});
 	}
 
 	async prompt(text: string): Promise<void> {
@@ -501,6 +547,8 @@ class AssignmentProxy implements ChildSession {
 						parentEpoch: this.runtime.parentEpoch,
 						task,
 					});
+					// Queued behind a ready physical worker still expects heartbeats.
+					this.heartbeatExpectedAt = this.runtime.now();
 					return { kind: "done" };
 				}
 
@@ -611,6 +659,7 @@ class AssignmentProxy implements ChildSession {
 						parentEpoch: this.runtime.parentEpoch,
 						task,
 					});
+					this.heartbeatExpectedAt = this.runtime.now();
 					return;
 				}
 				if (record.status === "starting") {

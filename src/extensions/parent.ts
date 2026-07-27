@@ -33,10 +33,12 @@ import { PaneRegistry } from "../herdr/registry.js";
 import { resolvePoolIdentity } from "../herdr/pool-identity.js";
 import { assignmentSpoolPaths, workerControlPaths } from "../herdr/assignment-spool.js";
 import { completeCleanAssignmentLocked } from "../herdr/terminal-transition.js";
+import { terminalizeAndClearRoleAssignmentsLocked } from "../herdr/cleanup-terminalize.js";
 import { WriterLeaseManager, LeaseCorruptionError } from "../lease/writer-lease.js";
 import { atomicWriteJson, DEFAULT_HEARTBEAT_STALE_MS } from "../ipc/spool.js";
 import {
 	IpcValidationError,
+	assertHeartbeatFreshness,
 	tryReadIpcJson,
 	validateActivePointer,
 	validateHeartbeat,
@@ -286,9 +288,35 @@ export function installMomoParent(pi: ExtensionAPI, options: InstallMomoParentOp
 							}
 						}
 
-						if (record.status === "uncertain") {
-							const leaseCwd = record.cwd ?? identity.canonicalRoot;
-							const release = leases.forceReleaseIfOwner(leaseCwd, record.workerId);
+						// Terminalize AFTER stop confirmation and BEFORE lease release so a
+						// terminalization failure retains paneClosed + original lease/evidence.
+						const latestForQueue = pool.getByRole(worker.role);
+						if (
+							!latestForQueue ||
+							latestForQueue.generation !== worker.generation ||
+							latestForQueue.workerId !== worker.workerId
+						) {
+							notes.push(
+								`refused ${worker.workerId}: generation/worker changed before queue terminalize`,
+							);
+							return;
+						}
+						const cleared = terminalizeAndClearRoleAssignmentsLocked({
+							pool,
+							role: latestForQueue.role,
+							worker: latestForQueue,
+							reason: "role_worker_cleanup_before_archive",
+						});
+						if (!cleared.ok) {
+							notes.push(
+								`refused ${latestForQueue.workerId}: could not terminalize prior assignments (${cleared.reason})`,
+							);
+							return;
+						}
+
+						if (latestForQueue.status === "uncertain") {
+							const leaseCwd = latestForQueue.cwd ?? identity.canonicalRoot;
+							const release = leases.forceReleaseIfOwner(leaseCwd, latestForQueue.workerId);
 							if (!release.released) {
 								const latest = pool.getByRole(worker.role);
 								if (
@@ -304,13 +332,14 @@ export function installMomoParent(pi: ExtensionAPI, options: InstallMomoParentOp
 									});
 								}
 								notes.push(
-									`lease not released for ${record.workerId}: ${release.reason ?? "unknown"}`,
+									`lease not released for ${latestForQueue.workerId}: ${release.reason ?? "unknown"}`,
 								);
 								return;
 							}
 						}
-						clearControlEphemerals(pool.poolRoot, record.role);
-						pool.archiveRoleKeepingTombstone(record.role, new Date().toISOString());
+
+						clearControlEphemerals(pool.poolRoot, latestForQueue.role);
+						pool.archiveRoleKeepingTombstone(latestForQueue.role, new Date().toISOString());
 						closed += 1;
 					});
 				} catch (error) {
@@ -429,14 +458,14 @@ export async function adoptPoolWorkers(
 			if (!heartbeatRaw) {
 				throw new Error("missing heartbeat");
 			}
-			validateHeartbeat(heartbeatRaw, {
+			const heartbeat = validateHeartbeat(heartbeatRaw, {
 				runId: `g${worker.generation}`,
 				workerId: worker.workerId,
 			});
-			const heartbeatAt = Date.parse((heartbeatRaw as { at?: string }).at ?? "");
-			if (!Number.isFinite(heartbeatAt) || Date.now() - heartbeatAt > DEFAULT_HEARTBEAT_STALE_MS) {
-				throw new Error("stale heartbeat");
-			}
+			assertHeartbeatFreshness(heartbeat.at, {
+				now: Date.now(),
+				staleMs: DEFAULT_HEARTBEAT_STALE_MS,
+			});
 
 			const info = await client.agentGet(worker.agentName);
 			if (info.paneId !== worker.paneId) {
@@ -810,6 +839,7 @@ export default function (pi: ExtensionAPI): void {
 
 // Re-export for tests that still import reconcile helpers.
 export { queueCount, formatWorkerStatusLine };
+export { terminalizeAndClearRoleAssignmentsLocked } from "../herdr/cleanup-terminalize.js";
 
 /** @deprecated Legacy v1 reconciliation retained for migration-era tests only. */
 export async function reconcileRegistry(

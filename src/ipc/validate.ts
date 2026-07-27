@@ -3,6 +3,7 @@ import type { AgentName } from "../roles.js";
 import { isAgentName } from "../roles.js";
 import { IpcValidationError } from "./errors.js";
 import {
+	DEFAULT_HEARTBEAT_CLOCK_SKEW_MS,
 	IPC_VERSION,
 	MAX_IPC_JSON_BYTES,
 	type IpcActivePointer,
@@ -18,7 +19,7 @@ import {
 } from "./spool.js";
 
 export { IpcValidationError } from "./errors.js";
-export { MAX_EVENTS_FILE_BYTES } from "./spool.js";
+export { DEFAULT_HEARTBEAT_CLOCK_SKEW_MS, MAX_EVENTS_FILE_BYTES } from "./spool.js";
 export const MAX_EVENT_MESSAGE_CHARS = 8_192;
 export const MAX_TASK_CHARS = 100_000;
 
@@ -346,6 +347,34 @@ export function validateHeartbeat(
 		at: requireString(record, "at", "heartbeat", 64),
 		seq,
 	};
+}
+
+/**
+ * Shared strict freshness check for control heartbeats (parent adoption + proxy poll).
+ * Fail closed on non-date `at`, age beyond staleMs, or implausibly future timestamps
+ * beyond the allowed clock-skew grace.
+ */
+export function assertHeartbeatFreshness(
+	at: string,
+	options: {
+		now: number;
+		staleMs: number;
+		maxFutureSkewMs?: number;
+	},
+): { ageMs: number } {
+	const parsed = Date.parse(at);
+	if (!Number.isFinite(parsed)) {
+		throw new IpcValidationError("heartbeat.at is not a valid date");
+	}
+	const ageMs = options.now - parsed;
+	const maxFutureSkewMs = options.maxFutureSkewMs ?? DEFAULT_HEARTBEAT_CLOCK_SKEW_MS;
+	if (ageMs < -maxFutureSkewMs) {
+		throw new IpcValidationError("heartbeat.at is implausibly in the future");
+	}
+	if (ageMs > options.staleMs) {
+		throw new IpcValidationError("heartbeat went stale");
+	}
+	return { ageMs };
 }
 
 export function validateEvent(

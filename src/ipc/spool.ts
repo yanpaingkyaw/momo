@@ -21,6 +21,8 @@ export const IPC_VERSION = 1;
 export const MAX_IPC_JSON_BYTES = 256 * 1024;
 export const MAX_EVENTS_FILE_BYTES = 2 * 1024 * 1024;
 export const DEFAULT_HEARTBEAT_STALE_MS = 15_000;
+/** Allowed clock skew: heartbeat.at may be slightly ahead of local now. */
+export const DEFAULT_HEARTBEAT_CLOCK_SKEW_MS = 5_000;
 
 export type IpcEventType =
 	| "queued"

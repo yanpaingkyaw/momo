@@ -14,8 +14,13 @@ import { installMomoParent, reconcileRegistry } from "../src/extensions/parent.j
 import { installMomoWorker } from "../src/extensions/worker-runtime.js";
 import { HerdrClient } from "../src/herdr/client.js";
 import { PaneRegistry, selectClosablePanes } from "../src/herdr/registry.js";
-import { isArchivalTombstone, PoolRegistry } from "../src/herdr/pool-registry.js";
+import {
+	isArchivalTombstone,
+	PoolRegistry,
+	selectClosablePoolWorkers,
+} from "../src/herdr/pool-registry.js";
 import { resolvePoolIdentity } from "../src/herdr/pool-identity.js";
+import { assignmentSpoolPaths } from "../src/herdr/assignment-spool.js";
 import {
 	appendEvent,
 	atomicWriteJson,
@@ -1121,6 +1126,100 @@ describe("force cleanup recovery retention", () => {
 		expect(retained?.paneClosed).toBe(true);
 		expect(retained?.recoveryRequired).toBe(true);
 		expect(isArchivalTombstone(retained!)).toBe(false);
+	});
+
+	it("retains paneClosed + exact lease when terminalization fails after confirmed stop", async () => {
+		const cwd = tempDir("momo-force-termfail-cwd-");
+		const cacheRoot = tempDir("momo-force-termfail-cache-");
+		const fixture = setupPoolWorkerFixture({
+			cacheRoot,
+			cwd,
+			role: "implementer",
+			assignmentId: "termfailactive01",
+		});
+		const pool = fixture.pool;
+		pool.upsert({
+			workerId: fixture.workerId,
+			generation: fixture.generation,
+			generationTombstone: fixture.generation,
+			role: "implementer",
+			paneId: "w1:p9",
+			agentName: "momo_implementer",
+			cwd: fixture.identity.canonicalRoot,
+			status: "uncertain",
+			uncertainWrite: true,
+			activeAssignmentId: fixture.assignmentId,
+			updatedAt: new Date().toISOString(),
+		});
+		const paths = assignmentSpoolPaths(
+			pool.poolRoot,
+			"implementer",
+			fixture.assignmentId,
+		);
+		mkdirSync(paths.result, { recursive: true, mode: 0o700 }); // blocks durable terminal result
+		const leaseToken = createLeaseToken();
+		const leases = new WriterLeaseManager({ cacheRoot, now: () => 1_000 });
+		leases.acquire(fixture.identity.canonicalRoot, fixture.workerId, leaseToken);
+		const closed: string[] = [];
+		const notifies: string[] = [];
+		const pi = createFakePi();
+		installMomoParent(pi as unknown as ExtensionAPI, {
+			cwd: fixture.identity.canonicalRoot,
+			env: {
+				MOMO_PARENT: "1",
+				MOMO_PARENT_ID: "parent-termfail",
+				HERDR_ENV: "1",
+				HERDR_PANE_ID: "w1:p1",
+				HERDR_WORKSPACE_ID: "test-ws",
+				HERDR_SOCKET_PATH: "test-sock",
+			},
+			client: new HerdrClient({
+				runCommand: async (_file, args) => {
+					if (args[0] === "pane" && args[1] === "close") {
+						closed.push(String(args[2]));
+						return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+					}
+					if (args[0] === "agent" && args[1] === "get") {
+						return {
+							code: 1,
+							stdout: JSON.stringify({
+								id: "g",
+								error: { code: "agent_not_found", message: "gone" },
+							}),
+							stderr: "",
+						};
+					}
+					return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+				},
+			}),
+			poolRegistry: pool,
+			leaseManager: leases,
+		});
+		const command = pi.commands.get("momo-cleanup");
+		const ui = {
+			confirm: async () => true,
+			notify: (m: string) => notifies.push(m),
+		};
+		await command!.handler("--force", { ui } as never);
+
+		expect(closed).toEqual(["w1:p9"]);
+		expect(notifies.join("\n")).toMatch(/could not terminalize prior assignments/i);
+		const retained = pool.getByRole("implementer");
+		expect(retained?.status).toBe("uncertain");
+		expect(retained?.paneClosed).toBe(true);
+		expect(retained?.recoveryRequired).not.toBe(true);
+		expect(isArchivalTombstone(retained!)).toBe(false);
+		const owner = leases.peekOwner(fixture.identity.canonicalRoot);
+		expect(owner?.ownerId).toBe(fixture.workerId);
+		expect(owner?.token).toBe(leaseToken);
+		expect(selectClosablePoolWorkers([retained!], { force: true }).closable).toHaveLength(1);
+
+		// After repairing the blocked result path, --force retry can proceed to release+archive.
+		rmSync(paths.result, { recursive: true, force: true });
+		await command!.handler("--force", { ui } as never);
+		expect(closed).toEqual(["w1:p9"]); // no second pane close
+		expect(isArchivalTombstone(pool.getByRole("implementer")!)).toBe(true);
+		expect(leases.peekOwner(fixture.identity.canonicalRoot)).toBeUndefined();
 	});
 });
 

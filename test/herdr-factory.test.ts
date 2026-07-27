@@ -838,4 +838,153 @@ describe("herdr factory + runner integration", () => {
 		}
 	});
 
+
+	it("queued missing-heartbeat fails and removes queue entry without later execution", async () => {
+		installFakeHerdrExtension();
+		vi.useFakeTimers({ shouldAdvanceTime: true });
+		const cacheRoot = tempDir("momo-q-hb-cache-");
+		const cwd = tempDir("momo-q-hb-cwd-");
+		let now = 1_000_000;
+		const { PoolRegistry } = await import("../src/herdr/pool-registry.js");
+		const { resolvePoolIdentity, stableWorkerId } = await import("../src/herdr/pool-identity.js");
+		const { workerControlPaths } = await import("../src/herdr/assignment-spool.js");
+		const { listQueue, queueCount } = await import("../src/herdr/role-queue.js");
+		const { mkdirSync } = await import("node:fs");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const workerId = stableWorkerId(identity.poolKey, "scout");
+		const control = workerControlPaths(pool.poolRoot, "scout");
+		mkdirSync(control.root, { recursive: true, mode: 0o700 });
+		// Pre-seed a busy ready worker with no heartbeat — active proxy is not ours.
+		pool.upsert({
+			workerId,
+			generation: 1,
+			generationTombstone: 1,
+			role: "scout",
+			paneId: "w1:p2",
+			agentName: "momo_scout",
+			cwd: identity.canonicalRoot,
+			status: "busy",
+			activeAssignmentId: "foreignactive001",
+			activeParentEpoch: "other-epoch",
+			updatedAt: new Date(now).toISOString(),
+		});
+		const client = new HerdrClient({
+			runCommand: async () => ({
+				code: 0,
+				stdout: JSON.stringify({ id: "ok", result: {} }),
+				stderr: "",
+			}),
+		});
+		const factory = createHerdrChildSessionFactory({
+			cwd,
+			parentPaneId: "w1:p1",
+			parentId: "parent-q-hb",
+			client,
+			poolRegistry: pool,
+			cacheRoot,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+			heartbeatStaleMs: 200,
+			pollIntervalMs: 20,
+			readyTimeoutMs: 2_000,
+			resultTimeoutMs: 60_000,
+			now: () => now,
+			sleep: async (ms) => {
+				now += ms;
+				await vi.advanceTimersByTimeAsync(ms);
+			},
+		});
+		const session = await factory({ cwd, role: getRole("scout") });
+		const proxy = session as unknown as { assignmentId: string; paths: { result: string } };
+		const wait = session.prompt("queued-behind").then(() => session.agent!.waitForIdle());
+		await vi.advanceTimersByTimeAsync(30);
+		expect(queueCount(pool.poolRoot, "scout")).toBe(1);
+		expect(listQueue(pool.poolRoot, "scout")[0]?.assignmentId).toBe(proxy.assignmentId);
+		await expect(wait).rejects.toThrow(/heartbeat went stale/i);
+		expect(queueCount(pool.poolRoot, "scout")).toBe(0);
+		expect(listQueue(pool.poolRoot, "scout")).toHaveLength(0);
+		// Must not later become the active assignment.
+		expect(pool.getByRole("scout")?.activeAssignmentId).toBe("foreignactive001");
+		const { tryReadIpcJson, validateResult } = await import("../src/ipc/validate.js");
+		const result = validateResult(tryReadIpcJson(proxy.paths.result), {
+			runId: proxy.assignmentId,
+			workerId,
+		});
+		expect(result.status).toBe("failed");
+		vi.useRealTimers();
+	});
+
+	it("stopAndSettleFailure keeps reentrancy gate until lock+settle finish", async () => {
+		installFakeHerdrExtension();
+		const cacheRoot = tempDir("momo-reenter-cache-");
+		const cwd = tempDir("momo-reenter-cwd-");
+		const client = new HerdrClient({
+			runCommand: async () => ({
+				code: 0,
+				stdout: JSON.stringify({ id: "ok", result: {} }),
+				stderr: "",
+			}),
+		});
+		const { PoolRegistry } = await import("../src/herdr/pool-registry.js");
+		const { resolvePoolIdentity, stableWorkerId } = await import("../src/herdr/pool-identity.js");
+		const { withRoleLockAsync } = await import("../src/herdr/role-queue.js");
+		const { tryReadIpcJson } = await import("../src/ipc/validate.js");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const factory = createHerdrChildSessionFactory({
+			cwd,
+			parentPaneId: "w1:p1",
+			parentId: "parent-reenter",
+			client,
+			poolRegistry: pool,
+			cacheRoot,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const session = await factory({ cwd, role: getRole("scout") });
+		const proxy = session as unknown as {
+			stopAndSettleFailure: (message: string) => Promise<void>;
+			paths: { cancel: string; result: string };
+			assignmentId: string;
+			workerId: string;
+		};
+
+		let releaseHold!: () => void;
+		const holdGate = new Promise<void>((resolve) => {
+			releaseHold = resolve;
+		});
+		const hold = withRoleLockAsync(pool.poolRoot, "scout", async () => {
+			await holdGate;
+		});
+		await Promise.resolve();
+		await Promise.resolve();
+
+		const first = proxy.stopAndSettleFailure("first-failure");
+		for (let i = 0; i < 30; i++) await Promise.resolve();
+		const second = proxy.stopAndSettleFailure("second-failure");
+		await Promise.resolve();
+
+		releaseHold();
+		await hold;
+		await Promise.all([first, second]);
+
+		const cancel = tryReadIpcJson(proxy.paths.cancel) as { reason?: string } | undefined;
+		expect(cancel?.reason).toBe("first-failure");
+		await expect(session.agent!.waitForIdle()).rejects.toThrow(/first-failure/);
+		expect(stableWorkerId(identity.poolKey, "scout")).toBe(proxy.workerId);
+	});
+
 });
