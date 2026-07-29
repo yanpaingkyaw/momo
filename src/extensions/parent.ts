@@ -9,7 +9,7 @@ import path from "node:path";
 import { MOMO_SYSTEM_PROMPT } from "../prompts.js";
 import { createDelegateTool } from "../delegation/tool.js";
 import { createDelegationRunner } from "../delegation/runner.js";
-import { getRole, ROLE_LIST } from "../roles.js";
+import { AGENT_NAMES, getRole, ROLE_LIST } from "../roles.js";
 import {
 	createHerdrChildSessionFactory,
 	createParentEpoch,
@@ -35,6 +35,11 @@ import { resolvePoolIdentity } from "../herdr/pool-identity.js";
 import { assignmentSpoolPaths, workerControlPaths } from "../herdr/assignment-spool.js";
 import { completeCleanAssignmentLocked } from "../herdr/terminal-transition.js";
 import { terminalizeAndClearRoleAssignmentsLocked } from "../herdr/cleanup-terminalize.js";
+import {
+	listOrphanPaneEvidence,
+	removeOrphanPaneEvidence,
+	roleHasOrphanPaneEvidence,
+} from "../herdr/orphan-panes.js";
 import { WriterLeaseManager, LeaseCorruptionError } from "../lease/writer-lease.js";
 import { atomicWriteJson, DEFAULT_HEARTBEAT_STALE_MS, DEFAULT_HEARTBEAT_CLOCK_SKEW_MS } from "../ipc/spool.js";
 import {
@@ -246,7 +251,7 @@ export function installMomoParent(pi: ExtensionAPI, options: InstallMomoParentOp
 
 	pi.registerCommand("momo-cleanup", {
 		description:
-			"Close idle/unhealthy role-pool workers. Use --force for uncertain (exact lease owner). Refuses busy/blocked.",
+			"Close idle/unhealthy role-pool workers and retry orphan panes from supersession close failures. Use --force for uncertain (exact lease owner). Refuses busy/blocked.",
 		handler: async (args, ctx) => {
 			const force = String(args || "")
 				.split(/\s+/)
@@ -452,9 +457,70 @@ export function installMomoParent(pi: ExtensionAPI, options: InstallMomoParentOp
 					);
 				}
 			}
+
+			// Role-scoped orphan panes from superseded provision close failures.
+			// Close only the evidenced paneId — never touch successor registry/lease/agent.
+			let orphanClosed = 0;
+			for (const roleName of AGENT_NAMES) {
+				if (!roleHasOrphanPaneEvidence(pool.poolRoot, roleName)) continue;
+				try {
+					await withRoleLockAsync(pool.poolRoot, roleName, async () => {
+						const listed = listOrphanPaneEvidence(pool.poolRoot, roleName);
+						const live = pool.getByRole(roleName);
+						for (const entry of listed) {
+							if (!entry.ok) {
+								notes.push(
+									`retained orphan evidence ${entry.filePath}: ${entry.reason}`,
+								);
+								continue;
+							}
+							const { evidence } = entry;
+							// Refuse closing any paneId still registered for this role
+							// (any generation/status) so stale evidence cannot hit the successor.
+							if (live?.paneId && live.paneId === evidence.paneId) {
+								notes.push(
+									`retained orphan evidence for ${evidence.paneId}: paneId collides with live registry pane (status=${live.status} gen=${live.generation})`,
+								);
+								continue;
+							}
+							// Evidence is advisory identity only; never mutate the live registry.
+							try {
+								await herdrClient.closePane(evidence.paneId);
+								removeOrphanPaneEvidence(pool.poolRoot, roleName, evidence.paneId);
+								orphanClosed += 1;
+							} catch (closeError) {
+								if (isPaneNotFoundError(closeError)) {
+									removeOrphanPaneEvidence(
+										pool.poolRoot,
+										roleName,
+										evidence.paneId,
+									);
+									orphanClosed += 1;
+									continue;
+								}
+								notes.push(
+									`retained orphan pane ${evidence.paneId} (gen=${evidence.generation}): ${
+										closeError instanceof Error
+											? closeError.message
+											: String(closeError)
+									}`,
+								);
+							}
+						}
+					});
+				} catch (error) {
+					notes.push(
+						`orphan cleanup ${roleName} failed: ${
+							error instanceof Error ? error.message : String(error)
+						}`,
+					);
+				}
+			}
+
 			ctx.ui?.notify?.(
 				[
 					`Closed ${closed} worker pane(s).`,
+					orphanClosed > 0 ? `Closed ${orphanClosed} orphan pane(s).` : "",
 					refused.length
 						? `Refused ${refused.length} busy/blocked/starting${force ? "" : "/uncertain"} worker(s).`
 						: "",

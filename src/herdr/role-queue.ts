@@ -51,9 +51,20 @@ export interface LockOwnerRecord {
 }
 
 export class QueueLockError extends Error {
-	constructor(message: string) {
-		super(message);
+	readonly initError?: unknown;
+	readonly rollbackError?: unknown;
+
+	constructor(
+		message: string,
+		options?: { cause?: unknown; initError?: unknown; rollbackError?: unknown },
+	) {
+		super(
+			message,
+			options?.cause !== undefined ? { cause: options.cause } : undefined,
+		);
 		this.name = "QueueLockError";
+		if (options?.initError !== undefined) this.initError = options.initError;
+		if (options?.rollbackError !== undefined) this.rollbackError = options.rollbackError;
 	}
 }
 
@@ -81,7 +92,7 @@ function ownerPath(lockDir: string): string {
 	return path.join(lockDir, "owner.json");
 }
 
-function writeOwnerAtomic(lockDir: string, owner: LockOwnerRecord): void {
+function writeOwnerAtomicDefault(lockDir: string, owner: LockOwnerRecord): void {
 	const filePath = ownerPath(lockDir);
 	const tmp = `${filePath}.${process.pid}.${Date.now()}.tmp`;
 	const fd = openSync(tmp, "wx", 0o600);
@@ -96,6 +107,36 @@ function writeOwnerAtomic(lockDir: string, owner: LockOwnerRecord): void {
 	} catch {
 		// ignore
 	}
+}
+
+function removeLockDirDefault(lockDir: string): void {
+	rmSync(lockDir, { recursive: true, force: true });
+}
+
+function formatLockError(error: unknown): string {
+	if (error instanceof Error) return error.message;
+	return String(error);
+}
+
+/** @internal test-only: injectable acquire init / rollback primitives. */
+let writeOwnerAtomicForAcquire = writeOwnerAtomicDefault;
+let removeLockDirForAcquireRollback = removeLockDirDefault;
+let afterLockOwnerInitializedForTest: ((lockDir: string) => void) | undefined;
+
+/** @internal test-only: inject owner-write / heartbeat-init / rollback-rm faults. */
+export function __setLockAcquireHooksForTest(hooks?: {
+	writeOwnerAtomic?: (lockDir: string, owner: LockOwnerRecord) => void;
+	removeLockDir?: (lockDir: string) => void;
+	/** Runs after owner.json + heartbeat timer start (heartbeat-init fault point). */
+	afterOwnerInitialized?: (lockDir: string) => void;
+}): void {
+	writeOwnerAtomicForAcquire = hooks?.writeOwnerAtomic ?? writeOwnerAtomicDefault;
+	removeLockDirForAcquireRollback = hooks?.removeLockDir ?? removeLockDirDefault;
+	afterLockOwnerInitializedForTest = hooks?.afterOwnerInitialized;
+}
+
+function writeOwnerAtomic(lockDir: string, owner: LockOwnerRecord): void {
+	writeOwnerAtomicForAcquire(lockDir, owner);
 }
 
 export function readLockOwnerForTest(lockDir: string): LockOwnerRecord | undefined {
@@ -184,8 +225,11 @@ export class RoleTransactionLock {
 	}
 
 	private tryAcquireOnce(nowMs: number): boolean {
+		/** True only when this call's mkdirSync created tx.lock (never EEXIST peers). */
+		let createdByThisCall = false;
 		try {
 			mkdirSync(this.lockDir, { mode: 0o700 });
+			createdByThisCall = true;
 			const token = createLockToken();
 			const at = new Date(nowMs).toISOString();
 			writeOwnerAtomic(this.lockDir, {
@@ -198,11 +242,30 @@ export class RoleTransactionLock {
 			this.token = token;
 			this.held = true;
 			this.startHeartbeat();
+			afterLockOwnerInitializedForTest?.(this.lockDir);
 			return true;
 		} catch (error) {
 			const code = (error as NodeJS.ErrnoException).code;
-			if (code !== "EEXIST") throw error;
-			return false;
+			if (code === "EEXIST") {
+				// Peer (or pre-existing) lock — never remove.
+				return false;
+			}
+			// Owner atomic creation / heartbeat init failed after mkdir: reset local
+			// state and remove only the directory this call created.
+			this.stopHeartbeat();
+			this.held = false;
+			this.token = undefined;
+			if (createdByThisCall) {
+				try {
+					removeLockDirForAcquireRollback(this.lockDir);
+				} catch (rollbackError) {
+					throw new QueueLockError(
+						`Failed to initialize role lock at ${this.lockDir}; rollback remove failed — lock directory may remain. init=${formatLockError(error)}; rollback=${formatLockError(rollbackError)}`,
+						{ cause: error, initError: error, rollbackError },
+					);
+				}
+			}
+			throw error;
 		}
 	}
 

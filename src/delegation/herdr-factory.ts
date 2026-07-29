@@ -40,6 +40,11 @@ import {
 } from "../herdr/role-queue.js";
 import { completeCleanAssignmentLocked } from "../herdr/terminal-transition.js";
 import {
+	assertNoOrphanPaneEvidence,
+	OrphanPaneEvidencePersistenceError,
+	writeOrphanPaneEvidence,
+} from "../herdr/orphan-panes.js";
+import {
 	atomicWriteJson,
 	DEFAULT_HEARTBEAT_STALE_MS,
 	ensurePrivateDir,
@@ -202,6 +207,28 @@ export class WorkerReadyTimeoutError extends Error {
 	}
 }
 
+/** Detached background protocol/cleanup failure after prompt/abort already returned. */
+export type HerdrDiagnosticReport = {
+	kind: "detached_protocol_failure";
+	message: string;
+	error: unknown;
+	paneId?: string;
+	reason?: string;
+	assignmentId: string;
+	workerId: string;
+	role: string;
+};
+
+export type HerdrDiagnosticReporter = (report: HerdrDiagnosticReport) => void;
+
+function defaultDiagnosticReporter(report: HerdrDiagnosticReport): void {
+	const pane = report.paneId ? ` pane=${report.paneId}` : "";
+	const reason = report.reason ? ` reason=${report.reason}` : "";
+	console.error(
+		`[momo] Detached protocol cleanup failure (${report.role}/${report.workerId}): ${report.message}.${pane}${reason}. Run /momo-cleanup if orphan panes remain.`,
+	);
+}
+
 export interface HerdrFactoryOptions {
 	cwd: string;
 	parentPaneId: string;
@@ -221,6 +248,11 @@ export interface HerdrFactoryOptions {
 	sleep?: (ms: number) => Promise<void>;
 	splitDirection?: "right" | "down";
 	leaseManager?: WriterLeaseManager;
+	/**
+	 * Surfaces non-cancellation protocol/cleanup failures from detached background
+	 * dispatch after cancel won the prompt race. Defaults to console.error.
+	 */
+	reportDiagnostic?: HerdrDiagnosticReporter;
 	/** @deprecated Legacy pane registry ignored by pool factory. */
 	registry?: unknown;
 	/** @deprecated Per-run id unused; pool uses stable workers. */
@@ -254,6 +286,7 @@ interface FactoryRuntime {
 	now: () => number;
 	sleep: (ms: number) => Promise<void>;
 	direction: "right" | "down";
+	reportDiagnostic: HerdrDiagnosticReporter;
 }
 
 function controlRunId(generation: number): string {
@@ -412,6 +445,35 @@ class AssignmentProxy implements ChildSession {
 			!!this.provisioningOwnerId &&
 			record.provisioningOwnerId === this.provisioningOwnerId
 		);
+	}
+
+	/**
+	 * Durable orphan-pane evidence when close fails after supersession / ownership
+	 * loss. Never mutates the current registry successor. Persistence failure is a
+	 * protocol error (never silent).
+	 */
+	private recordOrphanPaneCloseFailure(options: {
+		generation: number;
+		paneId: string;
+		agentName: string;
+		reason: string;
+	}): void {
+		try {
+			writeOrphanPaneEvidence(this.runtime.pool.poolRoot, this.role.name, {
+				generation: options.generation,
+				workerId: this.workerId,
+				paneId: options.paneId,
+				agentName: options.agentName,
+				reason: options.reason,
+				createdAt: new Date(this.runtime.now()).toISOString(),
+			});
+		} catch (evidenceError) {
+			throw new OrphanPaneEvidencePersistenceError({
+				paneId: options.paneId,
+				reason: options.reason,
+				evidenceError,
+			});
+		}
 	}
 
 	/**
@@ -950,7 +1012,10 @@ class AssignmentProxy implements ChildSession {
 		await Promise.race([work, this.whenCancelled()]);
 		if (this.cancelRequested) {
 			// Abort already settled; keep background work supervised.
-			void work.catch(() => undefined);
+			// Protocol cleanup failures must not be silently dropped.
+			void work.catch((error: unknown) => {
+				this.handleDetachedBackgroundFailure(error);
+			});
 			return;
 		}
 		await work;
@@ -963,11 +1028,52 @@ class AssignmentProxy implements ChildSession {
 		try {
 			await this.dispatchOrEnqueue(task);
 		} catch (error) {
+			// Orphan evidence persistence (and similar protocol cleanup failures) must
+			// bypass cancellation swallowing so detached work can surface them.
+			if (error instanceof OrphanPaneEvidencePersistenceError) {
+				throw error;
+			}
 			if (this.cancelRequested || this.isCancelledError(error)) {
 				return;
 			}
 			throw error;
 		}
+	}
+
+	/**
+	 * After cancel won the prompt race, background dispatch must not unhandled-reject.
+	 * Ordinary cancellation stays quiet; protocol/cleanup failures are reported.
+	 */
+	private handleDetachedBackgroundFailure(error: unknown): void {
+		if (this.isCancelledError(error)) return;
+		this.reportDetachedProtocolFailure(error);
+	}
+
+	private reportDetachedProtocolFailure(error: unknown): void {
+		const message = error instanceof Error ? error.message : String(error);
+		this.diagnosticFailure = message;
+		const report: HerdrDiagnosticReport = {
+			kind: "detached_protocol_failure",
+			message,
+			error,
+			assignmentId: this.assignmentId,
+			workerId: this.workerId,
+			role: this.role.name,
+			...(error instanceof OrphanPaneEvidencePersistenceError
+				? { paneId: error.paneId, reason: error.reason }
+				: {}),
+		};
+		try {
+			this.runtime.reportDiagnostic(report);
+		} catch {
+			// Reporter must not break supervision; fall back to stderr.
+			defaultDiagnosticReporter(report);
+		}
+	}
+
+	/** @internal test-only */
+	getDiagnosticFailureForTest(): string | undefined {
+		return this.diagnosticFailure;
 	}
 
 	private async dispatchOrEnqueue(task: string): Promise<void> {
@@ -1032,6 +1138,7 @@ class AssignmentProxy implements ChildSession {
 				// Only absent records or true generation-0 archival tombstones may provision.
 				this.throwIfCancelled();
 				if (!existing || isArchivalTombstone(existing)) {
+					assertNoOrphanPaneEvidence(this.runtime.pool.poolRoot, this.role.name);
 					const generation = this.runtime.pool.nextGeneration(this.role.name);
 					const agentName = herdrAgentNameForWorker(this.workerId);
 					const provisioningOwnerId = randomUUID();
@@ -1150,7 +1257,21 @@ class AssignmentProxy implements ChildSession {
 				);
 				if (!finalized) {
 					this.stopProvisioningHeartbeat();
-					await this.runtime.client.closePane(paneId).catch(() => undefined);
+					let closePaneSucceeded = false;
+					try {
+						await this.runtime.client.closePane(paneId);
+						closePaneSucceeded = true;
+					} catch {
+						closePaneSucceeded = false;
+					}
+					if (!closePaneSucceeded) {
+						this.recordOrphanPaneCloseFailure({
+							generation: plan.generation,
+							paneId,
+							agentName: plan.agentName,
+							reason: "provision_superseded_after_finalize_close_failed",
+						});
+					}
 					throw new Error("Worker provision superseded by a newer generation");
 				}
 				this.paneId = paneId;
@@ -1161,7 +1282,10 @@ class AssignmentProxy implements ChildSession {
 			} catch (error) {
 				this.stopProvisioningHeartbeat();
 				let failError: unknown = error;
-				if (
+				if (error instanceof OrphanPaneEvidencePersistenceError) {
+					// Already a surfaced protocol failure from close+evidence write.
+					failError = error;
+				} else if (
 					this.cancelRequested &&
 					!(error instanceof ProvisioningFailure) &&
 					this.paneId
@@ -1180,49 +1304,83 @@ class AssignmentProxy implements ChildSession {
 						closePaneSucceeded,
 					});
 				}
-				await withRoleLockAsync(
-					this.runtime.pool.poolRoot,
-					this.role.name,
-					() => {
-						const record = this.runtime.pool.getByRole(this.role.name);
-						// Same-generation replacement owners must not be mutated by a stale owner.
-						if (!record || !this.matchesProvisioningOwnerLocked(record, plan.generation)) {
-							return;
-						}
-						const nowIso = new Date(this.runtime.now()).toISOString();
-						const provisionFail =
-							failError instanceof ProvisioningFailure ? failError : undefined;
-						const paneId =
-							provisionFail?.paneId ?? this.paneId ?? record.paneId;
-						const agentName =
-							provisionFail?.agentName ?? record.agentName ?? plan.agentName;
-
-						// Never leave a pane-less unhealthy live reservation — archive so
-						// generation N+1 can provision while retaining the monotonic tombstone.
-						if (!paneId) {
-							this.runtime.pool.archiveRoleKeepingTombstone(this.role.name, nowIso);
-							const archived = this.runtime.pool.getByRole(this.role.name);
+				let evidencePersistenceError: OrphanPaneEvidencePersistenceError | undefined;
+				try {
+					await withRoleLockAsync(
+						this.runtime.pool.poolRoot,
+						this.role.name,
+						() => {
+							const record = this.runtime.pool.getByRole(this.role.name);
+							const provisionFail =
+								failError instanceof ProvisioningFailure ? failError : undefined;
+							// Same-generation replacement owners must not be mutated by a stale owner.
+							// If close already failed for a superseded pane, persist orphan evidence.
 							if (
-								archived &&
-								archived.generationTombstone < plan.generation
+								!record ||
+								!this.matchesProvisioningOwnerLocked(record, plan.generation)
 							) {
-								this.runtime.pool.upsert({
-									...archived,
-									generationTombstone: plan.generation,
-									updatedAt: nowIso,
-								});
+								// Skip a second evidence write when the inner path already
+								// surfaced OrphanPaneEvidencePersistenceError (preserve first reason).
+								if (
+									!(failError instanceof OrphanPaneEvidencePersistenceError) &&
+									provisionFail?.paneId &&
+									provisionFail.closePaneSucceeded === false
+								) {
+									this.recordOrphanPaneCloseFailure({
+										generation: plan.generation,
+										paneId: provisionFail.paneId,
+										agentName: provisionFail.agentName,
+										reason: "provision_ownership_superseded_close_failed",
+									});
+								}
+								return;
 							}
-							return;
-						}
+							const nowIso = new Date(this.runtime.now()).toISOString();
+							const paneId =
+								provisionFail?.paneId ?? this.paneId ?? record.paneId;
+							const agentName =
+								provisionFail?.agentName ?? record.agentName ?? plan.agentName;
 
-						if (provisionFail?.paneId) {
-							const closeSucceeded = provisionFail.closePaneSucceeded === true;
+							// Never leave a pane-less unhealthy live reservation — archive so
+							// generation N+1 can provision while retaining the monotonic tombstone.
+							if (!paneId) {
+								this.runtime.pool.archiveRoleKeepingTombstone(this.role.name, nowIso);
+								const archived = this.runtime.pool.getByRole(this.role.name);
+								if (
+									archived &&
+									archived.generationTombstone < plan.generation
+								) {
+									this.runtime.pool.upsert({
+										...archived,
+										generationTombstone: plan.generation,
+										updatedAt: nowIso,
+									});
+								}
+								return;
+							}
+
+							if (provisionFail?.paneId) {
+								const closeSucceeded = provisionFail.closePaneSucceeded === true;
+								this.runtime.pool.upsert(
+									withoutProvisioningOwnership(record, {
+										paneId,
+										agentName,
+										status: "unhealthy",
+										paneClosed: closeSucceeded,
+										generationTombstone: Math.max(
+											record.generationTombstone,
+											plan.generation,
+										),
+										updatedAt: nowIso,
+									}),
+								);
+								return;
+							}
+
+							// Ready-timeout / post-finalization: keep pane/agent identity.
 							this.runtime.pool.upsert(
 								withoutProvisioningOwnership(record, {
-									paneId,
-									agentName,
 									status: "unhealthy",
-									paneClosed: closeSucceeded,
 									generationTombstone: Math.max(
 										record.generationTombstone,
 										plan.generation,
@@ -1230,23 +1388,25 @@ class AssignmentProxy implements ChildSession {
 									updatedAt: nowIso,
 								}),
 							);
-							return;
-						}
-
-						// Ready-timeout / post-finalization: keep pane/agent identity.
-						this.runtime.pool.upsert(
-							withoutProvisioningOwnership(record, {
-								status: "unhealthy",
-								generationTombstone: Math.max(
-									record.generationTombstone,
-									plan.generation,
-								),
-								updatedAt: nowIso,
-							}),
-						);
-					},
-					{ now: this.runtime.now, sleep: this.runtime.sleep },
-				);
+						},
+						{ now: this.runtime.now, sleep: this.runtime.sleep },
+					);
+				} catch (lockError) {
+					if (lockError instanceof OrphanPaneEvidencePersistenceError) {
+						evidencePersistenceError = lockError;
+					} else {
+						throw lockError;
+					}
+				}
+				// Evidence persistence failure is a non-cancellation protocol error —
+				// never swallow even when cancel settles the assignment. Prefer the
+				// earliest persistence error when both inner and lock paths failed.
+				if (failError instanceof OrphanPaneEvidencePersistenceError) {
+					throw failError;
+				}
+				if (evidencePersistenceError) {
+					throw evidencePersistenceError;
+				}
 				if (this.cancelRequested || this.isCancelledError(error)) {
 					return;
 				}
@@ -1473,6 +1633,14 @@ class AssignmentProxy implements ChildSession {
 				} catch {
 					closePaneSucceeded = false;
 				}
+				if (!closePaneSucceeded) {
+					this.recordOrphanPaneCloseFailure({
+						generation,
+						paneId: splitPaneId,
+						agentName,
+						reason: "provision_superseded_after_split_close_failed",
+					});
+				}
 				throw new ProvisioningFailure({
 					message: "Worker provision superseded after pane split",
 					agentName,
@@ -1525,6 +1693,10 @@ class AssignmentProxy implements ChildSession {
 			if (error instanceof ProvisioningFailure) {
 				// Superseded path already closed (or attempted close). Other
 				// ProvisioningFailures should not appear here yet.
+				throw error;
+			}
+			if (error instanceof OrphanPaneEvidencePersistenceError) {
+				// Close failed and evidence could not be persisted — surface as-is.
 				throw error;
 			}
 			let closePaneSucceeded: boolean | undefined;
@@ -1851,6 +2023,7 @@ export function createHerdrChildSessionFactory(options: HerdrFactoryOptions): Ch
 		now,
 		sleep,
 		direction: options.splitDirection ?? "right",
+		reportDiagnostic: options.reportDiagnostic ?? defaultDiagnosticReporter,
 	};
 
 	return async ({ cwd, role }: ChildSessionFactoryInput) => {

@@ -1,5 +1,12 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { mkdtempSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	rmSync,
+	symlinkSync,
+	writeFileSync,
+	mkdtempSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -17,6 +24,8 @@ import {
 	withRoleLockAsync,
 	QueueCorruptionError,
 	cancelQueuedAssignment,
+	QueueLockError,
+	__setLockAcquireHooksForTest,
 } from "../src/herdr/role-queue.js";
 import {
 	PoolRegistry,
@@ -26,9 +35,19 @@ import {
 	validatePoolWorkerRecord,
 } from "../src/herdr/pool-registry.js";
 import { resolvePoolIdentity, stableWorkerId } from "../src/herdr/pool-identity.js";
+import {
+	listOrphanPaneEvidence,
+	orphanEvidenceFileName,
+	orphanEvidencePath,
+	orphanPanesDir,
+	OrphanPaneEvidencePersistenceError,
+	roleHasOrphanPaneEvidence,
+	writeOrphanPaneEvidence,
+	__setOrphanEvidenceWriteForTest,
+} from "../src/herdr/orphan-panes.js";
 import { installMomoWorker } from "../src/extensions/worker-runtime.js";
 import { workerControlPaths, assignmentSpoolPaths } from "../src/herdr/assignment-spool.js";
-import { atomicWriteJson } from "../src/ipc/spool.js";
+import { atomicWriteJson, MAX_IPC_JSON_BYTES, DEFAULT_HEARTBEAT_CLOCK_SKEW_MS } from "../src/ipc/spool.js";
 import { tryReadIpcJson, validateResult } from "../src/ipc/validate.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
@@ -38,15 +57,22 @@ import {
 	__setJoinerReadyTimeoutLockHookForTest,
 	__setPostPlanPreBranchHookForTest,
 	__setProvisioningHeartbeatBeforeLockHookForTest,
+	type HerdrDiagnosticReport,
 } from "../src/delegation/herdr-factory.js";
 import { HerdrClient } from "../src/herdr/client.js";
 import { getRole } from "../src/roles.js";
-import { DEFAULT_HEARTBEAT_CLOCK_SKEW_MS } from "../src/ipc/spool.js";
+import {
+	installMomoParent,
+	__resetCleanupRoleLockEnteredHookForTest,
+} from "../src/extensions/parent.js";
 
 const tempDirs: string[] = [];
 
 afterEach(() => {
 	__resetProvisioningOwnershipHooksForTest();
+	__setLockAcquireHooksForTest();
+	__resetCleanupRoleLockEnteredHookForTest();
+	__setOrphanEvidenceWriteForTest();
 	while (tempDirs.length > 0) {
 		const dir = tempDirs.pop();
 		if (dir) rmSync(dir, { recursive: true, force: true });
@@ -172,6 +198,777 @@ describe("RoleTransactionLock", () => {
 		expect(successor.getTokenForTest()).not.toBe(firstToken);
 		successor.release();
 	});
+
+	it("owner temp write/rename failure removes only newly-created lock; next acquire succeeds", async () => {
+		const cacheRoot = tempDir("momo-lock-owner-fail-");
+		const cwd = tempDir("momo-lock-owner-fail-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		__setLockAcquireHooksForTest({
+			writeOwnerAtomic: () => {
+				throw Object.assign(new Error("injected owner rename failure"), { code: "EPERM" });
+			},
+		});
+		const failed = new RoleTransactionLock(pool.poolRoot, "scout");
+		await expect(failed.acquire(200)).rejects.toThrow(/injected owner rename failure/i);
+		expect(existsSync(failed.lockDir)).toBe(false);
+		__setLockAcquireHooksForTest();
+		const ok = new RoleTransactionLock(pool.poolRoot, "scout");
+		await ok.acquire(1_000);
+		expect(ok.getTokenForTest()).toBeTruthy();
+		ok.release();
+		expect(existsSync(ok.lockDir)).toBe(false);
+	});
+
+	it("heartbeat initialization failure rolls back newly-created lock; sync acquire succeeds after", () => {
+		const cacheRoot = tempDir("momo-lock-hb-fail-");
+		const cwd = tempDir("momo-lock-hb-fail-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		__setLockAcquireHooksForTest({
+			afterOwnerInitialized: () => {
+				throw new Error("injected heartbeat initialization failure");
+			},
+		});
+		const failed = new RoleTransactionLock(pool.poolRoot, "planner");
+		expect(() => failed.acquireSync(200)).toThrow(/injected heartbeat initialization failure/i);
+		expect(existsSync(failed.lockDir)).toBe(false);
+		__setLockAcquireHooksForTest();
+		const ok = new RoleTransactionLock(pool.poolRoot, "planner");
+		ok.acquireSync(1_000);
+		expect(ok.getTokenForTest()).toBeTruthy();
+		ok.release();
+	});
+
+	it("EEXIST peer lock is never removed on acquire init failure of a different call", async () => {
+		const cacheRoot = tempDir("momo-lock-eexist-");
+		const cwd = tempDir("momo-lock-eexist-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const peer = new RoleTransactionLock(pool.poolRoot, "reviewer");
+		await peer.acquire(1_000);
+		const peerToken = peer.getTokenForTest();
+		__setLockAcquireHooksForTest({
+			writeOwnerAtomic: () => {
+				throw new Error("should not write over peer");
+			},
+		});
+		const contender = new RoleTransactionLock(pool.poolRoot, "reviewer");
+		await expect(contender.acquire(150)).rejects.toThrow(/Timed out/);
+		expect(existsSync(peer.lockDir)).toBe(true);
+		expect(readLockOwnerForTest(peer.lockDir)?.token).toBe(peerToken);
+		__setLockAcquireHooksForTest();
+		peer.release();
+	});
+
+	it("rollback-rm failure throws QueueLockError preserving init and rollback", async () => {
+		const cacheRoot = tempDir("momo-lock-rollback-");
+		const cwd = tempDir("momo-lock-rollback-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		__setLockAcquireHooksForTest({
+			writeOwnerAtomic: () => {
+				throw new Error("init-owner-boom");
+			},
+			removeLockDir: () => {
+				throw new Error("rollback-rm-boom");
+			},
+		});
+		const lock = new RoleTransactionLock(pool.poolRoot, "implementer");
+		let caught: unknown;
+		try {
+			await lock.acquire(200);
+		} catch (error) {
+			caught = error;
+		}
+		expect(caught).toBeInstanceOf(QueueLockError);
+		const qe = caught as QueueLockError;
+		expect(qe.message).toMatch(/rollback remove failed|lock directory may remain/i);
+		expect(qe.message).toMatch(/init-owner-boom/);
+		expect(qe.message).toMatch(/rollback-rm-boom/);
+		expect(String(qe.initError)).toMatch(/init-owner-boom/);
+		expect(String(qe.rollbackError)).toMatch(/rollback-rm-boom/);
+		expect(existsSync(lock.lockDir)).toBe(true);
+		__setLockAcquireHooksForTest();
+		rmSync(lock.lockDir, { recursive: true, force: true });
+	});
+});
+
+describe("orphan pane cleanup evidence", () => {
+	function installFakeHerdrExtension(): void {
+		const agentDir = tempDir("momo-pi-agent-");
+		mkdirSync(path.join(agentDir, "extensions"), { recursive: true });
+		writeFileSync(path.join(agentDir, "extensions", "herdr-agent-state.ts"), "// fake\n", "utf8");
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+	}
+
+	function createFakePi() {
+		const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
+		return {
+			commands,
+			registerTool: vi.fn(),
+			setActiveTools: vi.fn(),
+			registerCommand: vi.fn(
+				(name: string, def: { handler: (args: string, ctx: unknown) => Promise<void> }) => {
+					commands.set(name, def);
+				},
+			),
+			on: vi.fn(),
+		};
+	}
+
+	it("close-fail after supersession persists across dispose; blocks provision; cleanup clears", async () => {
+		installFakeHerdrExtension();
+		const cacheRoot = tempDir("momo-orphan-persist-");
+		const cwd = tempDir("momo-orphan-persist-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		let releaseSplit!: () => void;
+		const splitGate = new Promise<void>((resolve) => {
+			releaseSplit = resolve;
+		});
+		let splitEntered = 0;
+		let closeCalls = 0;
+		const client = new HerdrClient({
+			runCommand: async (_file, args) => {
+				if (args[0] === "pane" && args[1] === "split") {
+					splitEntered += 1;
+					await splitGate;
+					return {
+						code: 0,
+						stdout: JSON.stringify({
+							id: "s",
+							result: { pane: { pane_id: "w1:p-orphan" } },
+						}),
+						stderr: "",
+					};
+				}
+				if (args[0] === "pane" && args[1] === "close") {
+					closeCalls += 1;
+					if (String(args[2]) === "w1:p-orphan" && closeCalls === 1) {
+						return {
+							code: 1,
+							stdout: JSON.stringify({
+								id: "c",
+								error: { code: "timeout", message: "close timed out" },
+							}),
+							stderr: "",
+						};
+					}
+					return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+				}
+				return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+			},
+		});
+		const sleep = async (ms: number) => {
+			await new Promise<void>((r) => setTimeout(r, Math.min(ms, 15)));
+		};
+		const factory = createHerdrChildSessionFactory({
+			cwd,
+			parentPaneId: "w1:p0",
+			parentId: "parent-orphan",
+			client,
+			poolRegistry: pool,
+			cacheRoot,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+			readyTimeoutMs: 2_000,
+			sleep,
+		});
+		const session = await factory({ cwd, role: getRole("scout") });
+		const prompt = session.prompt("task");
+		for (let i = 0; i < 80 && splitEntered < 1; i += 1) await sleep(10);
+		expect(splitEntered).toBe(1);
+		const original = pool.getByRole("scout")!;
+		const nowIso = new Date().toISOString();
+		pool.upsert({
+			...original,
+			provisioningOwnerId: "replacement-owner",
+			provisioningHeartbeatAt: nowIso,
+			updatedAt: nowIso,
+		});
+		releaseSplit();
+		await expect(prompt).rejects.toThrow(/superseded after pane split/i);
+		expect(roleHasOrphanPaneEvidence(pool.poolRoot, "scout")).toBe(true);
+		const listed = listOrphanPaneEvidence(pool.poolRoot, "scout");
+		expect(listed.some((e) => e.ok && e.evidence.paneId === "w1:p-orphan")).toBe(true);
+		const successorBefore = pool.getByRole("scout")!;
+		expect(successorBefore.provisioningOwnerId).toBe("replacement-owner");
+		expect(successorBefore.paneId).toBeUndefined();
+		await session.dispose();
+		expect(roleHasOrphanPaneEvidence(pool.poolRoot, "scout")).toBe(true);
+
+		// Archive so the next prompt attempts physical provisioning (blocked by orphan evidence).
+		pool.archiveRoleKeepingTombstone("scout", new Date().toISOString());
+		const blocked = await factory({ cwd, role: getRole("scout") });
+		await expect(blocked.prompt("blocked")).rejects.toThrow(/orphan pane cleanup evidence|momo-cleanup/i);
+		await blocked.dispose();
+		expect(roleHasOrphanPaneEvidence(pool.poolRoot, "scout")).toBe(true);
+
+		// Seed a live successor that must remain untouched by orphan cleanup.
+		const workerId = stableWorkerId(identity.poolKey, "scout");
+		pool.upsert({
+			workerId,
+			generation: 2,
+			generationTombstone: 2,
+			role: "scout",
+			paneId: "w1:p-successor",
+			agentName: "momo_scout",
+			cwd: identity.canonicalRoot,
+			status: "busy",
+			activeAssignmentId: "succbusyorphan01",
+			updatedAt: new Date().toISOString(),
+		});
+		const pi = createFakePi();
+		const notifies: string[] = [];
+		installMomoParent(pi as unknown as ExtensionAPI, {
+			cwd,
+			env: {
+				MOMO_PARENT: "1",
+				MOMO_PARENT_ID: "parent-orphan-clean",
+				HERDR_ENV: "1",
+				HERDR_PANE_ID: "w1:p0",
+				HERDR_WORKSPACE_ID: "ws",
+				HERDR_SOCKET_PATH: "s",
+			},
+			client,
+			poolRegistry: pool,
+		});
+		await pi.commands.get("momo-cleanup")!.handler("", {
+			ui: { notify: (m: string) => notifies.push(m) },
+		} as never);
+		expect(notifies.join("\n")).toMatch(/Closed 1 orphan pane/i);
+		expect(roleHasOrphanPaneEvidence(pool.poolRoot, "scout")).toBe(false);
+		const afterCleanup = pool.getByRole("scout")!;
+		expect(afterCleanup.status).toBe("busy");
+		expect(afterCleanup.paneId).toBe("w1:p-successor");
+		expect(afterCleanup.activeAssignmentId).toBe("succbusyorphan01");
+
+		// Provision allowed after cleanup once successor is archived.
+		pool.archiveRoleKeepingTombstone("scout", new Date().toISOString());
+		const client2 = new HerdrClient({
+			runCommand: async (_file, args) => {
+				if (args[0] === "pane" && args[1] === "split") {
+					const envArgs = args.filter((_a, i) => args[i - 1] === "--env");
+					const control =
+						envArgs.find((v) => v.startsWith("MOMO_CONTROL_DIR="))?.slice(
+							"MOMO_CONTROL_DIR=".length,
+						) ??
+						envArgs.find((v) => v.startsWith("MOMO_IPC_DIR="))?.slice("MOMO_IPC_DIR=".length);
+					const wid =
+						envArgs.find((v) => v.startsWith("MOMO_WORKER_ID="))?.slice("MOMO_WORKER_ID=".length) ??
+						"";
+					const runId =
+						envArgs.find((v) => v.startsWith("MOMO_RUN_ID="))?.slice("MOMO_RUN_ID=".length) ?? "";
+					if (control) {
+						mkdirSync(control, { recursive: true, mode: 0o700 });
+						atomicWriteJson(path.join(control, "ready.json"), {
+							version: 1,
+							runId,
+							workerId: wid,
+							readyAt: new Date().toISOString(),
+						});
+					}
+					return {
+						code: 0,
+						stdout: JSON.stringify({
+							id: "s",
+							result: { pane: { pane_id: "w1:p-next" } },
+						}),
+						stderr: "",
+					};
+				}
+				if (args[0] === "agent" && args[1] === "start") {
+					return {
+						code: 0,
+						stdout: JSON.stringify({
+							id: "s",
+							result: {
+								pane_id: "w1:p-next",
+								name: args[2],
+								agent: "pi",
+								interactive_ready: true,
+							},
+						}),
+						stderr: "",
+					};
+				}
+				return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+			},
+		});
+		const factory2 = createHerdrChildSessionFactory({
+			cwd,
+			parentPaneId: "w1:p0",
+			parentId: "parent-orphan-2",
+			client: client2,
+			poolRegistry: pool,
+			cacheRoot,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+			readyTimeoutMs: 2_000,
+			sleep,
+		});
+		const session2 = await factory2({ cwd, role: getRole("scout") });
+		await session2.prompt("after-cleanup");
+		expect(pool.getByRole("scout")?.paneId).toBe("w1:p-next");
+		expect(pool.getByRole("scout")?.status).toBe("busy");
+		await session2.dispose();
+	}, 20_000);
+
+	it("malformed/symlink/oversized/mismatched-name/group-mode orphan evidence fail closed", () => {
+		const cacheRoot = tempDir("momo-orphan-bad-");
+		const cwd = tempDir("momo-orphan-bad-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const dir = orphanPanesDir(pool.poolRoot, "scout");
+		mkdirSync(dir, { recursive: true, mode: 0o700 });
+		writeFileSync(path.join(dir, "bad.json"), "{not-json\n", { mode: 0o600 });
+		writeFileSync(path.join(dir, "huge.json"), "x".repeat(MAX_IPC_JSON_BYTES + 10), {
+			mode: 0o600,
+		});
+		// Valid JSON under a non-canonical filename must not be closable.
+		writeFileSync(
+			path.join(dir, "not-the-hash.json"),
+			`${JSON.stringify({
+				version: 1,
+				generation: 1,
+				workerId: "w".repeat(16),
+				paneId: "w1:p-mismatch",
+				agentName: "momo_scout",
+				reason: "test",
+				createdAt: new Date().toISOString(),
+			})}\n`,
+			{ mode: 0o600 },
+		);
+		writeOrphanPaneEvidence(pool.poolRoot, "scout", {
+			generation: 1,
+			workerId: "w".repeat(16),
+			paneId: "w1:p-real",
+			agentName: "momo_scout",
+			reason: "test",
+			createdAt: new Date().toISOString(),
+		});
+		const realPath = orphanEvidencePath(pool.poolRoot, "scout", "w1:p-real");
+		expect(path.basename(realPath)).toBe(orphanEvidenceFileName("w1:p-real"));
+		const groupy = path.join(dir, "groupy.json");
+		writeFileSync(groupy, '{"version":1}\n', { mode: 0o644 });
+		const linkPath = path.join(dir, "link.json");
+		try {
+			symlinkSync(realPath, linkPath);
+		} catch {
+			// Some CI FS may not allow symlinks; still cover other fail-closed cases.
+		}
+		expect(roleHasOrphanPaneEvidence(pool.poolRoot, "scout")).toBe(true);
+		const listed = listOrphanPaneEvidence(pool.poolRoot, "scout");
+		expect(
+			listed.some((e) => !e.ok && /invalid|JSON|oversized|symlink|canonical|group\/other/i.test(e.reason)),
+		).toBe(true);
+		expect(listed.some((e) => !e.ok && /canonical paneId hash/i.test(e.reason))).toBe(true);
+		expect(listed.some((e) => e.ok && e.evidence.paneId === "w1:p-real")).toBe(true);
+	});
+
+	it("cleanup pane-not-found removes orphan evidence without touching successor registry", async () => {
+		const cacheRoot = tempDir("momo-orphan-nf-");
+		const cwd = tempDir("momo-orphan-nf-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const workerId = stableWorkerId(identity.poolKey, "scout");
+		pool.upsert({
+			workerId,
+			generation: 2,
+			generationTombstone: 2,
+			role: "scout",
+			paneId: "w1:p-successor",
+			agentName: "momo_scout",
+			cwd: identity.canonicalRoot,
+			status: "busy",
+			activeAssignmentId: "succbusy00000001",
+			updatedAt: new Date().toISOString(),
+		});
+		writeOrphanPaneEvidence(pool.poolRoot, "scout", {
+			generation: 1,
+			workerId,
+			paneId: "w1:p-gone",
+			agentName: "momo_scout",
+			reason: "superseded_close_failed",
+			createdAt: new Date().toISOString(),
+		});
+		expect(existsSync(orphanEvidencePath(pool.poolRoot, "scout", "w1:p-gone"))).toBe(true);
+		const closed: string[] = [];
+		const agentGets: string[] = [];
+		const pi = createFakePi();
+		installMomoParent(pi as unknown as ExtensionAPI, {
+			cwd,
+			env: {
+				MOMO_PARENT: "1",
+				MOMO_PARENT_ID: "parent-orphan-nf",
+				HERDR_ENV: "1",
+				HERDR_PANE_ID: "w1:p0",
+				HERDR_WORKSPACE_ID: "ws",
+				HERDR_SOCKET_PATH: "s",
+			},
+			client: new HerdrClient({
+				runCommand: async (_file, args) => {
+					if (args[0] === "pane" && args[1] === "close") {
+						closed.push(String(args[2]));
+						return {
+							code: 1,
+							stdout: JSON.stringify({
+								id: "c",
+								error: { code: "pane_not_found", message: "gone" },
+							}),
+							stderr: "",
+						};
+					}
+					if (args[0] === "agent" && args[1] === "get") {
+						agentGets.push(String(args[2] ?? ""));
+						return {
+							code: 0,
+							stdout: JSON.stringify({
+								id: "g",
+								result: {
+									type: "agent_info",
+									agent: { agent_status: "working", name: "momo_scout" },
+								},
+							}),
+							stderr: "",
+						};
+					}
+					return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+				},
+			}),
+			poolRegistry: pool,
+		});
+		const notifies: string[] = [];
+		await pi.commands.get("momo-cleanup")!.handler("", {
+			ui: { notify: (m: string) => notifies.push(m) },
+		} as never);
+		expect(closed).toEqual(["w1:p-gone"]);
+		expect(closed).not.toContain("w1:p-successor");
+		expect(agentGets).toEqual([]);
+		expect(roleHasOrphanPaneEvidence(pool.poolRoot, "scout")).toBe(false);
+		const successor = pool.getByRole("scout")!;
+		expect(successor.status).toBe("busy");
+		expect(successor.paneId).toBe("w1:p-successor");
+		expect(successor.activeAssignmentId).toBe("succbusy00000001");
+		expect(notifies.join("\n")).toMatch(/Closed 1 orphan pane/i);
+	});
+
+	for (const status of ["busy", "idle"] as const) {
+		it(`refuses orphan paneId colliding with live ${status} successor (no close)`, async () => {
+			const cacheRoot = tempDir(`momo-orphan-collide-${status}-`);
+			const cwd = tempDir(`momo-orphan-collide-${status}-cwd-`);
+			const identity = resolvePoolIdentity({
+				cwd,
+				canonicalRoot: cwd,
+				workspaceId: "ws",
+				socketPath: "s",
+			});
+			const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+			const workerId = stableWorkerId(identity.poolKey, "scout");
+			const sharedPane = "w1:p-shared-live";
+			pool.upsert({
+				workerId,
+				generation: 2,
+				generationTombstone: 2,
+				role: "scout",
+				paneId: sharedPane,
+				agentName: "momo_scout",
+				cwd: identity.canonicalRoot,
+				status,
+				...(status === "busy"
+					? { activeAssignmentId: "collidebusy000001" }
+					: {
+							// Keep paneId registered but not normally closable so only orphan
+							// collision refusal is under test.
+							paneClosed: true,
+							recoveryRequired: true,
+						}),
+				updatedAt: new Date().toISOString(),
+			});
+			writeOrphanPaneEvidence(pool.poolRoot, "scout", {
+				generation: 1,
+				workerId,
+				paneId: sharedPane,
+				agentName: "momo_scout",
+				reason: "stale_evidence_same_pane",
+				createdAt: new Date().toISOString(),
+			});
+			const closed: string[] = [];
+			const pi = createFakePi();
+			installMomoParent(pi as unknown as ExtensionAPI, {
+				cwd,
+				env: {
+					MOMO_PARENT: "1",
+					MOMO_PARENT_ID: `parent-orphan-collide-${status}`,
+					HERDR_ENV: "1",
+					HERDR_PANE_ID: "w1:p0",
+					HERDR_WORKSPACE_ID: "ws",
+					HERDR_SOCKET_PATH: "s",
+				},
+				client: new HerdrClient({
+					runCommand: async (_file, args) => {
+						if (args[0] === "pane" && args[1] === "close") {
+							closed.push(String(args[2]));
+							return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+						}
+						return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+					},
+				}),
+				poolRegistry: pool,
+			});
+			const notifies: string[] = [];
+			await pi.commands.get("momo-cleanup")!.handler("", {
+				ui: { notify: (m: string) => notifies.push(m) },
+			} as never);
+			expect(closed).toEqual([]);
+			expect(roleHasOrphanPaneEvidence(pool.poolRoot, "scout")).toBe(true);
+			expect(notifies.join("\n")).toMatch(/collides with live registry pane/i);
+			const live = pool.getByRole("scout")!;
+			expect(live.paneId).toBe(sharedPane);
+			expect(live.status).toBe(status);
+		});
+	}
+
+	it("evidence atomic write failure is not silent success", async () => {
+		installFakeHerdrExtension();
+		const cacheRoot = tempDir("momo-orphan-writefail-");
+		const cwd = tempDir("momo-orphan-writefail-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		let releaseSplit!: () => void;
+		const splitGate = new Promise<void>((resolve) => {
+			releaseSplit = resolve;
+		});
+		let splitEntered = 0;
+		__setOrphanEvidenceWriteForTest(() => {
+			throw new Error("injected orphan evidence atomic write failure");
+		});
+		const client = new HerdrClient({
+			runCommand: async (_file, args) => {
+				if (args[0] === "pane" && args[1] === "split") {
+					splitEntered += 1;
+					await splitGate;
+					return {
+						code: 0,
+						stdout: JSON.stringify({
+							id: "s",
+							result: { pane: { pane_id: "w1:p-writefail" } },
+						}),
+						stderr: "",
+					};
+				}
+				if (args[0] === "pane" && args[1] === "close") {
+					return {
+						code: 1,
+						stdout: JSON.stringify({
+							id: "c",
+							error: { code: "timeout", message: "close timed out" },
+						}),
+						stderr: "",
+					};
+				}
+				return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+			},
+		});
+		const sleep = async (ms: number) => {
+			await new Promise<void>((r) => setTimeout(r, Math.min(ms, 15)));
+		};
+		const factory = createHerdrChildSessionFactory({
+			cwd,
+			parentPaneId: "w1:p0",
+			parentId: "parent-orphan-writefail",
+			client,
+			poolRegistry: pool,
+			cacheRoot,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+			readyTimeoutMs: 2_000,
+			sleep,
+		});
+		const session = await factory({ cwd, role: getRole("scout") });
+		const prompt = session.prompt("task");
+		for (let i = 0; i < 80 && splitEntered < 1; i += 1) await sleep(10);
+		const original = pool.getByRole("scout")!;
+		const nowIso = new Date().toISOString();
+		pool.upsert({
+			...original,
+			provisioningOwnerId: "replacement-owner",
+			provisioningHeartbeatAt: nowIso,
+			updatedAt: nowIso,
+		});
+		releaseSplit();
+		await expect(prompt).rejects.toBeInstanceOf(OrphanPaneEvidencePersistenceError);
+		await expect(prompt).rejects.toThrow(
+			/close failed|evidence persistence failed|injected orphan evidence atomic write/i,
+		);
+		expect(roleHasOrphanPaneEvidence(pool.poolRoot, "scout")).toBe(false);
+		await session.dispose();
+	}, 15_000);
+
+	it("cancel-wins then close+evidence fail reports protocol failure; normal cancel stays quiet", async () => {
+		installFakeHerdrExtension();
+		const cacheRoot = tempDir("momo-orphan-cancel-detach-");
+		const cwd = tempDir("momo-orphan-cancel-detach-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		let releaseSplit!: () => void;
+		const splitGate = new Promise<void>((resolve) => {
+			releaseSplit = resolve;
+		});
+		let splitEntered = 0;
+		const reports: HerdrDiagnosticReport[] = [];
+		__setOrphanEvidenceWriteForTest(() => {
+			throw new Error("injected orphan evidence atomic write failure");
+		});
+		const client = new HerdrClient({
+			runCommand: async (_file, args) => {
+				if (args[0] === "pane" && args[1] === "split") {
+					splitEntered += 1;
+					await splitGate;
+					return {
+						code: 0,
+						stdout: JSON.stringify({
+							id: "s",
+							result: { pane: { pane_id: "w1:p-cancel-orphan" } },
+						}),
+						stderr: "",
+					};
+				}
+				if (args[0] === "pane" && args[1] === "close") {
+					return {
+						code: 1,
+						stdout: JSON.stringify({
+							id: "c",
+							error: { code: "timeout", message: "close timed out" },
+						}),
+						stderr: "",
+					};
+				}
+				return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+			},
+		});
+		const sleep = async (ms: number) => {
+			await new Promise<void>((r) => setTimeout(r, Math.min(ms, 15)));
+		};
+		const factory = createHerdrChildSessionFactory({
+			cwd,
+			parentPaneId: "w1:p0",
+			parentId: "parent-orphan-cancel-detach",
+			client,
+			poolRegistry: pool,
+			cacheRoot,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+			readyTimeoutMs: 2_000,
+			sleep,
+			reportDiagnostic: (report) => {
+				reports.push(report);
+			},
+		});
+		const session = await factory({ cwd, role: getRole("scout") });
+		const promptStarted = Date.now();
+		const prompt = session.prompt("task");
+		for (let i = 0; i < 80 && splitEntered < 1; i += 1) await sleep(10);
+		expect(splitEntered).toBe(1);
+		const original = pool.getByRole("scout")!;
+		const nowIso = new Date().toISOString();
+		pool.upsert({
+			...original,
+			provisioningOwnerId: "replacement-owner",
+			provisioningHeartbeatAt: nowIso,
+			updatedAt: nowIso,
+		});
+		// Cancel wins the prompt race before close/evidence failure completes.
+		await session.abort();
+		await prompt;
+		expect(Date.now() - promptStarted).toBeLessThan(2_000);
+		releaseSplit();
+		for (let i = 0; i < 80 && reports.length === 0; i += 1) await sleep(20);
+		expect(reports).toHaveLength(1);
+		expect(reports[0]?.kind).toBe("detached_protocol_failure");
+		expect(reports[0]?.error).toBeInstanceOf(OrphanPaneEvidencePersistenceError);
+		expect(reports[0]?.paneId).toBe("w1:p-cancel-orphan");
+		// Cancel often hits throwIfCancelled after split (ownership path); supersession
+		// after failed persist uses the split reason. Either is a protocol failure.
+		expect(reports[0]?.reason).toMatch(
+			/provision_(ownership_superseded|superseded_after_split)_close_failed/,
+		);
+		expect(reports[0]?.message).toMatch(
+			/evidence persistence failed|injected orphan evidence atomic write/i,
+		);
+		const proxy = session as unknown as { getDiagnosticFailureForTest: () => string | undefined };
+		expect(proxy.getDiagnosticFailureForTest()).toMatch(/evidence persistence failed/i);
+		await session.dispose();
+
+		// Ordinary cancellation (no protocol cleanup failure) leaves reporter untouched.
+		__setOrphanEvidenceWriteForTest();
+		reports.length = 0;
+		pool.archiveRoleKeepingTombstone("scout", new Date().toISOString());
+		const quiet = await factory({ cwd, role: getRole("scout") });
+		__setPostPlanPreBranchHookForTest(async () => {
+			await quiet.abort();
+		});
+		const quietStarted = Date.now();
+		await quiet.prompt("quiet-cancel");
+		expect(Date.now() - quietStarted).toBeLessThan(2_000);
+		await sleep(80);
+		expect(reports).toHaveLength(0);
+		const quietProxy = quiet as unknown as {
+			getDiagnosticFailureForTest: () => string | undefined;
+		};
+		expect(quietProxy.getDiagnosticFailureForTest()).toBeUndefined();
+		await quiet.dispose();
+	}, 20_000);
 });
 
 describe("durable FIFO claim", () => {
