@@ -351,6 +351,49 @@ export function isArchivalTombstone(record: PoolWorkerRecord): boolean {
 	return record.generation === 0 && !record.paneId;
 }
 
+export type LivePaneIdCollision =
+	| {
+			kind: "collision";
+			role: AgentName;
+			status: PoolWorkerRecord["status"];
+			generation: number;
+	  }
+	| { kind: "clear" }
+	| { kind: "error"; reason: string };
+
+/**
+ * Fail-closed scan of every live pool role for a registered paneId match.
+ * Archival tombstones are ignored. Registry read/parse failures return `error`
+ * so callers retain orphan evidence instead of closing/removing.
+ */
+export function findLivePaneIdCollision(
+	pool: PoolRegistry,
+	paneId: string,
+): LivePaneIdCollision {
+	if (typeof paneId !== "string" || paneId.length === 0) {
+		return { kind: "error", reason: "paneId invalid for live collision scan" };
+	}
+	try {
+		for (const worker of pool.list()) {
+			if (isArchivalTombstone(worker)) continue;
+			if (worker.paneId && worker.paneId === paneId) {
+				return {
+					kind: "collision",
+					role: worker.role,
+					status: worker.status,
+					generation: worker.generation,
+				};
+			}
+		}
+		return { kind: "clear" };
+	} catch (error) {
+		return {
+			kind: "error",
+			reason: error instanceof Error ? error.message : String(error),
+		};
+	}
+}
+
 /** Live workers that must not be reused or auto-reprovisioned without cleanup. */
 export function isNonReusableLiveWorker(record: PoolWorkerRecord): boolean {
 	if (isArchivalTombstone(record)) return false;

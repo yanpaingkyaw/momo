@@ -66,6 +66,7 @@ import { getRole } from "../src/roles.js";
 import {
 	installMomoParent,
 	__resetCleanupRoleLockEnteredHookForTest,
+	__setOrphanPreCloseRecheckHookForTest,
 } from "../src/extensions/parent.js";
 
 const tempDirs: string[] = [];
@@ -780,6 +781,304 @@ describe("orphan pane cleanup evidence", () => {
 			expect(live.status).toBe(status);
 		});
 	}
+
+	for (const other of [
+		{ role: "implementer" as const, status: "busy" as const, agent: "momo_implementer" },
+		{ role: "implementer" as const, status: "idle" as const, agent: "momo_implementer" },
+		{ role: "reviewer" as const, status: "busy" as const, agent: "momo_reviewer" },
+		{ role: "reviewer" as const, status: "idle" as const, agent: "momo_reviewer" },
+	]) {
+		it(`refuses scout orphan paneId colliding with live ${other.status} ${other.role} (no close)`, async () => {
+			const { WriterLeaseManager, createLeaseToken } = await import(
+				"../src/lease/writer-lease.js"
+			);
+			const cacheRoot = tempDir(`momo-orphan-xrole-${other.role}-${other.status}-`);
+			const cwd = tempDir(`momo-orphan-xrole-${other.role}-${other.status}-cwd-`);
+			const identity = resolvePoolIdentity({
+				cwd,
+				canonicalRoot: cwd,
+				workspaceId: "ws",
+				socketPath: "s",
+			});
+			const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+			const scoutId = stableWorkerId(identity.poolKey, "scout");
+			const otherId = stableWorkerId(identity.poolKey, other.role);
+			const sharedPane = `w1:p-xrole-${other.role}-${other.status}`;
+			pool.upsert({
+				workerId: otherId,
+				generation: 2,
+				generationTombstone: 2,
+				role: other.role,
+				paneId: sharedPane,
+				agentName: other.agent,
+				cwd: identity.canonicalRoot,
+				status: other.status,
+				...(other.status === "busy"
+					? { activeAssignmentId: "xrolebusy00000001" }
+					: { paneClosed: true, recoveryRequired: true }),
+				updatedAt: new Date().toISOString(),
+			});
+			const leases = new WriterLeaseManager({ cacheRoot, now: () => 1_700_000_000_000 });
+			const token = createLeaseToken();
+			if (other.role === "implementer") {
+				leases.acquire(identity.canonicalRoot, otherId, token);
+			}
+			writeOrphanPaneEvidence(pool.poolRoot, "scout", {
+				generation: 1,
+				workerId: scoutId,
+				paneId: sharedPane,
+				agentName: "momo_scout",
+				reason: "cross_role_stale_evidence",
+				createdAt: new Date().toISOString(),
+			});
+			const closed: string[] = [];
+			const pi = createFakePi();
+			installMomoParent(pi as unknown as ExtensionAPI, {
+				cwd,
+				env: {
+					MOMO_PARENT: "1",
+					MOMO_PARENT_ID: `parent-orphan-xrole-${other.role}-${other.status}`,
+					HERDR_ENV: "1",
+					HERDR_PANE_ID: "w1:p0",
+					HERDR_WORKSPACE_ID: "ws",
+					HERDR_SOCKET_PATH: "s",
+				},
+				client: new HerdrClient({
+					runCommand: async (_file, args) => {
+						if (args[0] === "pane" && args[1] === "close") {
+							closed.push(String(args[2]));
+							return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+						}
+						return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+					},
+				}),
+				poolRegistry: pool,
+				leaseManager: leases,
+			});
+			const notifies: string[] = [];
+			await pi.commands.get("momo-cleanup")!.handler("", {
+				ui: { notify: (m: string) => notifies.push(m) },
+			} as never);
+			expect(closed).toEqual([]);
+			expect(roleHasOrphanPaneEvidence(pool.poolRoot, "scout")).toBe(true);
+			expect(notifies.join("\n")).toMatch(
+				new RegExp(
+					`collides with live registry pane \\(role=${other.role} status=${other.status}`,
+					"i",
+				),
+			);
+			const otherLive = pool.getByRole(other.role)!;
+			expect(otherLive.paneId).toBe(sharedPane);
+			expect(otherLive.status).toBe(other.status);
+			expect(otherLive.activeAssignmentId).toBe(
+				other.status === "busy" ? "xrolebusy00000001" : undefined,
+			);
+			if (other.role === "implementer") {
+				expect(leases.stillHeldBy(identity.canonicalRoot, otherId, token)).toBe(true);
+			}
+			const scout = pool.getByRole("scout");
+			expect(scout === undefined || scout.paneId !== sharedPane || isArchivalTombstone(scout)).toBe(
+				true,
+			);
+		});
+	}
+
+	it("cross-role collision after candidate snapshot refuses before close", async () => {
+		const cacheRoot = tempDir("momo-orphan-xrole-preclose-");
+		const cwd = tempDir("momo-orphan-xrole-preclose-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const scoutId = stableWorkerId(identity.poolKey, "scout");
+		const implId = stableWorkerId(identity.poolKey, "implementer");
+		const paneId = "w1:p-xrole-preclose";
+		writeOrphanPaneEvidence(pool.poolRoot, "scout", {
+			generation: 1,
+			workerId: scoutId,
+			paneId,
+			agentName: "momo_scout",
+			reason: "superseded_close_failed",
+			createdAt: new Date().toISOString(),
+		});
+		const closed: string[] = [];
+		__setOrphanPreCloseRecheckHookForTest(() => {
+			pool.upsert({
+				workerId: implId,
+				generation: 3,
+				generationTombstone: 3,
+				role: "implementer",
+				paneId,
+				agentName: "momo_implementer",
+				cwd: identity.canonicalRoot,
+				status: "busy",
+				activeAssignmentId: "preclosebusy00001",
+				updatedAt: new Date().toISOString(),
+			});
+		});
+		const pi = createFakePi();
+		installMomoParent(pi as unknown as ExtensionAPI, {
+			cwd,
+			env: {
+				MOMO_PARENT: "1",
+				MOMO_PARENT_ID: "parent-orphan-xrole-preclose",
+				HERDR_ENV: "1",
+				HERDR_PANE_ID: "w1:p0",
+				HERDR_WORKSPACE_ID: "ws",
+				HERDR_SOCKET_PATH: "s",
+			},
+			client: new HerdrClient({
+				runCommand: async (_file, args) => {
+					if (args[0] === "pane" && args[1] === "close") {
+						closed.push(String(args[2]));
+						return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+					}
+					return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+				},
+			}),
+			poolRegistry: pool,
+		});
+		const notifies: string[] = [];
+		await pi.commands.get("momo-cleanup")!.handler("", {
+			ui: { notify: (m: string) => notifies.push(m) },
+		} as never);
+		expect(closed).toEqual([]);
+		expect(roleHasOrphanPaneEvidence(pool.poolRoot, "scout")).toBe(true);
+		expect(notifies.join("\n")).toMatch(/collides with live registry pane before close/i);
+		expect(notifies.join("\n")).toMatch(/role=implementer status=busy/i);
+		const impl = pool.getByRole("implementer")!;
+		expect(impl.paneId).toBe(paneId);
+		expect(impl.activeAssignmentId).toBe("preclosebusy00001");
+	});
+
+	it("cross-role collision appearing during close retains evidence afterward", async () => {
+		const cacheRoot = tempDir("momo-orphan-xrole-during-");
+		const cwd = tempDir("momo-orphan-xrole-during-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const scoutId = stableWorkerId(identity.poolKey, "scout");
+		const reviewerId = stableWorkerId(identity.poolKey, "reviewer");
+		const paneId = "w1:p-xrole-during";
+		writeOrphanPaneEvidence(pool.poolRoot, "scout", {
+			generation: 1,
+			workerId: scoutId,
+			paneId,
+			agentName: "momo_scout",
+			reason: "superseded_close_failed",
+			createdAt: new Date().toISOString(),
+		});
+		const closed: string[] = [];
+		const pi = createFakePi();
+		installMomoParent(pi as unknown as ExtensionAPI, {
+			cwd,
+			env: {
+				MOMO_PARENT: "1",
+				MOMO_PARENT_ID: "parent-orphan-xrole-during",
+				HERDR_ENV: "1",
+				HERDR_PANE_ID: "w1:p0",
+				HERDR_WORKSPACE_ID: "ws",
+				HERDR_SOCKET_PATH: "s",
+			},
+			client: new HerdrClient({
+				runCommand: async (_file, args) => {
+					if (args[0] === "pane" && args[1] === "close") {
+						closed.push(String(args[2]));
+						pool.upsert({
+							workerId: reviewerId,
+							generation: 4,
+							generationTombstone: 4,
+							role: "reviewer",
+							paneId,
+							agentName: "momo_reviewer",
+							cwd: identity.canonicalRoot,
+							status: "idle",
+							updatedAt: new Date().toISOString(),
+						});
+						return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+					}
+					return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+				},
+			}),
+			poolRegistry: pool,
+		});
+		const notifies: string[] = [];
+		await pi.commands.get("momo-cleanup")!.handler("", {
+			ui: { notify: (m: string) => notifies.push(m) },
+		} as never);
+		expect(closed).toEqual([paneId]);
+		expect(roleHasOrphanPaneEvidence(pool.poolRoot, "scout")).toBe(true);
+		expect(notifies.join("\n")).toMatch(/collides with live registry pane after close/i);
+		expect(notifies.join("\n")).toMatch(/role=reviewer status=idle/i);
+		expect(notifies.join("\n")).not.toMatch(/Closed 1 orphan pane/i);
+		const reviewer = pool.getByRole("reviewer")!;
+		expect(reviewer.paneId).toBe(paneId);
+		expect(reviewer.status).toBe("idle");
+	});
+
+	it("malformed other-role registry fails closed for orphan collision scan", async () => {
+		const cacheRoot = tempDir("momo-orphan-xrole-corrupt-");
+		const cwd = tempDir("momo-orphan-xrole-corrupt-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const scoutId = stableWorkerId(identity.poolKey, "scout");
+		const paneId = "w1:p-xrole-corrupt";
+		writeOrphanPaneEvidence(pool.poolRoot, "scout", {
+			generation: 1,
+			workerId: scoutId,
+			paneId,
+			agentName: "momo_scout",
+			reason: "superseded_close_failed",
+			createdAt: new Date().toISOString(),
+		});
+		const corruptPath = pool.roleFile("implementer");
+		mkdirSync(path.dirname(corruptPath), { recursive: true, mode: 0o700 });
+		writeFileSync(corruptPath, "{not-valid-registry\n", { mode: 0o600 });
+		const closed: string[] = [];
+		const pi = createFakePi();
+		installMomoParent(pi as unknown as ExtensionAPI, {
+			cwd,
+			env: {
+				MOMO_PARENT: "1",
+				MOMO_PARENT_ID: "parent-orphan-xrole-corrupt",
+				HERDR_ENV: "1",
+				HERDR_PANE_ID: "w1:p0",
+				HERDR_WORKSPACE_ID: "ws",
+				HERDR_SOCKET_PATH: "s",
+			},
+			client: new HerdrClient({
+				runCommand: async (_file, args) => {
+					if (args[0] === "pane" && args[1] === "close") {
+						closed.push(String(args[2]));
+						return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+					}
+					return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+				},
+			}),
+			poolRegistry: pool,
+		});
+		const notifies: string[] = [];
+		await pi.commands.get("momo-cleanup")!.handler("", {
+			ui: { notify: (m: string) => notifies.push(m) },
+		} as never);
+		expect(closed).toEqual([]);
+		expect(roleHasOrphanPaneEvidence(pool.poolRoot, "scout")).toBe(true);
+		expect(notifies.join("\n")).toMatch(
+			/live pane collision scan failed|Pool role registry corrupt/i,
+		);
+	});
 
 	it("delayed orphan close releases role lock; successor settlement proceeds; replaced evidence retained", async () => {
 		const cacheRoot = tempDir("momo-orphan-delayed-close-");

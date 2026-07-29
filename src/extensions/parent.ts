@@ -23,6 +23,7 @@ import {
 	selectClosablePoolWorkers,
 	clearControlEphemerals,
 	isArchivalTombstone,
+	findLivePaneIdCollision,
 	withoutProvisioningOwnership,
 	type PoolWorkerRecord,
 } from "../herdr/pool-registry.js";
@@ -102,6 +103,20 @@ export function __setCleanupRoleLockEnteredHookForTest(
 /** @internal test-only: clear cleanup role-lock race hook. */
 export function __resetCleanupRoleLockEnteredHookForTest(): void {
 	cleanupRoleLockEnteredHook = undefined;
+	orphanPreCloseRecheckHook = undefined;
+}
+
+/**
+ * @internal test-only: runs outside locks after orphan candidate snapshot and
+ * immediately before the pre-close live paneId collision recheck.
+ */
+let orphanPreCloseRecheckHook: (() => void | Promise<void>) | undefined;
+
+/** @internal test-only: inject cross-role collisions between snapshot and close. */
+export function __setOrphanPreCloseRecheckHookForTest(
+	hook?: () => void | Promise<void>,
+): void {
+	orphanPreCloseRecheckHook = hook;
 }
 
 function adoptionGraceRecheckKey(poolRoot: string, worker: PoolWorkerRecord): string {
@@ -462,8 +477,9 @@ export function installMomoParent(pi: ExtensionAPI, options: InstallMomoParentOp
 
 			// Role-scoped orphan panes from superseded provision close failures.
 			// Never await Herdr/network while holding the role lock:
-			//   1) under lock: list + strict-validate + refuse live paneId collision
-			//   2) outside lock: closePane
+			//   1) under lock: list + strict-validate + refuse any live paneId collision
+			//      across every non-archival pool role
+			//   2) outside lock: recheck collision, then closePane
 			//   3) reacquire lock: remove only if exact evidence unchanged and still
 			//      does not collide; concurrent cleanups are idempotent (close/not-found)
 			//      and never delete replaced evidence.
@@ -478,7 +494,6 @@ export function installMomoParent(pi: ExtensionAPI, options: InstallMomoParentOp
 				try {
 					candidates = withRoleLock(pool.poolRoot, roleName, () => {
 						const listed = listOrphanPaneEvidence(pool.poolRoot, roleName);
-						const live = pool.getByRole(roleName);
 						const out: OrphanCloseCandidate[] = [];
 						for (const entry of listed) {
 							if (!entry.ok) {
@@ -488,11 +503,16 @@ export function installMomoParent(pi: ExtensionAPI, options: InstallMomoParentOp
 								continue;
 							}
 							const { evidence } = entry;
-							// Refuse closing any paneId still registered for this role
-							// (any generation/status) so stale evidence cannot hit the successor.
-							if (live?.paneId && live.paneId === evidence.paneId) {
+							const collision = findLivePaneIdCollision(pool, evidence.paneId);
+							if (collision.kind === "collision") {
 								notes.push(
-									`retained orphan evidence for ${evidence.paneId}: paneId collides with live registry pane (status=${live.status} gen=${live.generation})`,
+									`retained orphan evidence for ${evidence.paneId}: paneId collides with live registry pane (role=${collision.role} status=${collision.status} gen=${collision.generation})`,
+								);
+								continue;
+							}
+							if (collision.kind === "error") {
+								notes.push(
+									`retained orphan evidence for ${evidence.paneId}: live pane collision scan failed (${collision.reason})`,
 								);
 								continue;
 							}
@@ -511,6 +531,24 @@ export function installMomoParent(pi: ExtensionAPI, options: InstallMomoParentOp
 
 				for (const candidate of candidates) {
 					const { evidence } = candidate;
+					// Recheck immediately before close — no role lock held across network.
+					if (orphanPreCloseRecheckHook) {
+						await orphanPreCloseRecheckHook();
+					}
+					const preClose = findLivePaneIdCollision(pool, evidence.paneId);
+					if (preClose.kind === "collision") {
+						notes.push(
+							`retained orphan evidence for ${evidence.paneId}: paneId collides with live registry pane before close (role=${preClose.role} status=${preClose.status} gen=${preClose.generation})`,
+						);
+						continue;
+					}
+					if (preClose.kind === "error") {
+						notes.push(
+							`retained orphan evidence for ${evidence.paneId}: live pane collision scan failed before close (${preClose.reason})`,
+						);
+						continue;
+					}
+
 					try {
 						await herdrClient.closePane(evidence.paneId);
 					} catch (closeError) {
@@ -528,12 +566,19 @@ export function installMomoParent(pi: ExtensionAPI, options: InstallMomoParentOp
 
 					try {
 						const removeOutcome = withRoleLock(pool.poolRoot, roleName, () => {
-							const live = pool.getByRole(roleName);
-							if (live?.paneId && live.paneId === evidence.paneId) {
+							const postClose = findLivePaneIdCollision(pool, evidence.paneId);
+							if (postClose.kind === "collision") {
 								return {
 									kind: "collide" as const,
-									status: live.status,
-									generation: live.generation,
+									role: postClose.role,
+									status: postClose.status,
+									generation: postClose.generation,
+								};
+							}
+							if (postClose.kind === "error") {
+								return {
+									kind: "scan_error" as const,
+									reason: postClose.reason,
 								};
 							}
 							const removed = removeOrphanPaneEvidenceIfUnchanged(
@@ -545,7 +590,13 @@ export function installMomoParent(pi: ExtensionAPI, options: InstallMomoParentOp
 						});
 						if (removeOutcome.kind === "collide") {
 							notes.push(
-								`retained orphan evidence for ${evidence.paneId}: paneId collides with live registry pane after close (status=${removeOutcome.status} gen=${removeOutcome.generation})`,
+								`retained orphan evidence for ${evidence.paneId}: paneId collides with live registry pane after close (role=${removeOutcome.role} status=${removeOutcome.status} gen=${removeOutcome.generation})`,
+							);
+							continue;
+						}
+						if (removeOutcome.kind === "scan_error") {
+							notes.push(
+								`retained orphan evidence for ${evidence.paneId}: live pane collision scan failed after close (${removeOutcome.reason})`,
 							);
 							continue;
 						}
