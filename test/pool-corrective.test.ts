@@ -3872,6 +3872,13 @@ describe("dispatch/claim durable order fault injection", () => {
 });
 
 describe("adoption generation/worker fence", () => {
+	function installFakeHerdrExtension(): void {
+		const agentDir = tempDir("momo-pi-agent-adopt-");
+		mkdirSync(path.join(agentDir, "extensions"), { recursive: true });
+		writeFileSync(path.join(agentDir, "extensions", "herdr-agent-state.ts"), "// fake\n", "utf8");
+		process.env.PI_CODING_AGENT_DIR = agentDir;
+	}
+
 	it("stale adoption snapshot cannot overwrite newer busy assignment", async () => {
 		const { adoptPoolWorkers } = await import("../src/extensions/parent.js");
 		const cacheRoot = tempDir("momo-adopt-race-");
@@ -4562,7 +4569,7 @@ describe("adoption generation/worker fence", () => {
 		expect(pool.getByRole("scout")?.paneId).toBe("w1:p1");
 	});
 
-	it("adoption of owner-bearing starting→idle strips provisioning metadata", async () => {
+	it("adoption of owner-bearing starting with idle/done agent preserves owner fields", async () => {
 		const { adoptPoolWorkers } = await import("../src/extensions/parent.js");
 		const cacheRoot = tempDir("momo-adopt-own-idle-");
 		const cwd = tempDir("momo-adopt-own-idle-cwd-");
@@ -4631,15 +4638,56 @@ describe("adoption generation/worker fence", () => {
 			}),
 		).resolves.toBeUndefined();
 		const after = pool.getByRole("scout")!;
-		expect(after.status).toBe("idle");
+		expect(after.status).toBe("starting");
 		expect(after.paneId).toBe("w1:p-own-idle");
-		expect(after.provisioningOwnerId).toBeUndefined();
-		expect(after.provisioningHeartbeatAt).toBeUndefined();
-		// Registry must remain loadable (no starting-only ownership on idle).
+		expect(after.provisioningOwnerId).toBe("adopt-owner-success");
+		expect(after.provisioningHeartbeatAt).toBe(nowIso);
 		expect(() => validatePoolWorkerRecord(after)).not.toThrow();
+
+		// Concurrent owner heartbeat refresh during adopt must no-op (fence mismatch),
+		// leaving the refreshed ownership pair intact — no idle transition / strip.
+		let refreshedHb: string | undefined;
+		const hbClient = new HerdrClient({
+			runCommand: async (_file, args) => {
+				if (args[0] === "agent" && args[1] === "get") {
+					const current = pool.getByRole("scout")!;
+					refreshedHb = new Date(Date.now() + 1_000).toISOString();
+					pool.upsert({
+						...current,
+						provisioningHeartbeatAt: refreshedHb,
+						updatedAt: new Date().toISOString(),
+					});
+					return {
+						code: 0,
+						stdout: JSON.stringify({
+							id: "ok",
+							result: {
+								type: "agent_info",
+								agent: {
+									agent_status: "done",
+									pane_id: "w1:p-own-idle",
+									name: "momo_scout",
+								},
+							},
+						}),
+						stderr: "",
+					};
+				}
+				return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+			},
+		});
+		await adoptPoolWorkers(pool, hbClient, identity.poolKey, {
+			ui: { notify: () => undefined },
+		});
+		expect(refreshedHb).toBeTruthy();
+		const afterHb = pool.getByRole("scout")!;
+		expect(afterHb.status).toBe("starting");
+		expect(afterHb.provisioningOwnerId).toBe("adopt-owner-success");
+		expect(afterHb.provisioningHeartbeatAt).toBe(refreshedHb);
+		expect(afterHb.paneId).toBe("w1:p-own-idle");
 	});
 
-	it("adoption of owner-bearing starting failure→unhealthy strips metadata; supersession intact", async () => {
+	it("adoption of owner-bearing starting on agentGet/validation failure preserves owner fields", async () => {
 		const { adoptPoolWorkers } = await import("../src/extensions/parent.js");
 		const cacheRoot = tempDir("momo-adopt-own-fail-");
 		const cwd = tempDir("momo-adopt-own-fail-cwd-");
@@ -4715,10 +4763,10 @@ describe("adoption generation/worker fence", () => {
 		).resolves.toBeUndefined();
 		expect(notes.join("\n")).toMatch(/pane identity|Did not adopt/i);
 		const failed = pool.getByRole("scout")!;
-		expect(failed.status).toBe("unhealthy");
+		expect(failed.status).toBe("starting");
 		expect(failed.paneId).toBe("w1:p-own-fail");
-		expect(failed.provisioningOwnerId).toBeUndefined();
-		expect(failed.provisioningHeartbeatAt).toBeUndefined();
+		expect(failed.provisioningOwnerId).toBe("adopt-owner-fail");
+		expect(failed.provisioningHeartbeatAt).toBe(nowIso);
 		expect(() => validatePoolWorkerRecord(failed)).not.toThrow();
 
 		// Exact snapshot supersession: replace ownership/status before catch would write.
@@ -4778,6 +4826,239 @@ describe("adoption generation/worker fence", () => {
 		expect(kept.activeAssignmentId).toBe("supersedeownr01");
 		expect(kept.activeParentEpoch).toBe("e-sup");
 		expect(kept.uncertainWrite).toBeUndefined();
+	});
+
+	it("adoption while owner-bearing starting paused leaves row intact; owner then dispatches", async () => {
+		installFakeHerdrExtension();
+		const { adoptPoolWorkers } = await import("../src/extensions/parent.js");
+		const cacheRoot = tempDir("momo-adopt-owner-barrier-");
+		const cwd = tempDir("momo-adopt-owner-barrier-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		let releaseAgentStart!: () => void;
+		const agentStartGate = new Promise<void>((resolve) => {
+			releaseAgentStart = resolve;
+		});
+		let agentStartEntered = 0;
+		const closed: string[] = [];
+		const client = new HerdrClient({
+			runCommand: async (_file, args) => {
+				if (args[0] === "pane" && args[1] === "split") {
+					const envArgs = args.filter((_a, i) => args[i - 1] === "--env");
+					const controlDir =
+						envArgs.find((v) => v.startsWith("MOMO_CONTROL_DIR="))?.slice(
+							"MOMO_CONTROL_DIR=".length,
+						) ??
+						envArgs.find((v) => v.startsWith("MOMO_IPC_DIR="))?.slice("MOMO_IPC_DIR=".length);
+					const workerId =
+						envArgs.find((v) => v.startsWith("MOMO_WORKER_ID="))?.slice("MOMO_WORKER_ID=".length) ??
+						"";
+					const runId =
+						envArgs.find((v) => v.startsWith("MOMO_RUN_ID="))?.slice("MOMO_RUN_ID=".length) ?? "";
+					const generation = Number(
+						envArgs.find((v) => v.startsWith("MOMO_GENERATION="))?.slice("MOMO_GENERATION=".length) ??
+							"1",
+					);
+					if (controlDir) {
+						mkdirSync(controlDir, { recursive: true, mode: 0o700 });
+						atomicWriteJson(path.join(controlDir, "ready.json"), {
+							version: 1,
+							runId,
+							workerId,
+							readyAt: new Date().toISOString(),
+						});
+						atomicWriteJson(path.join(controlDir, "manifest.json"), {
+							version: 2,
+							poolKey: identity.poolKey,
+							workerId,
+							generation: Number.isFinite(generation) && generation >= 1 ? generation : 1,
+							role: "scout",
+							cwd,
+							paneId: "w1:p-adopt-barrier",
+							agentName: "momo_scout",
+							createdAt: new Date().toISOString(),
+						});
+						atomicWriteJson(path.join(controlDir, "heartbeat.json"), {
+							version: 1,
+							runId: `g${Number.isFinite(generation) && generation >= 1 ? generation : 1}`,
+							workerId,
+							at: new Date().toISOString(),
+							seq: 1,
+						});
+					}
+					return {
+						code: 0,
+						stdout: JSON.stringify({
+							id: "s",
+							result: { pane: { pane_id: "w1:p-adopt-barrier" } },
+						}),
+						stderr: "",
+					};
+				}
+				if (args[0] === "agent" && args[1] === "start") {
+					agentStartEntered += 1;
+					await agentStartGate;
+					return {
+						code: 0,
+						stdout: JSON.stringify({
+							id: "s",
+							result: {
+								pane_id: "w1:p-adopt-barrier",
+								name: args[2],
+								agent: "pi",
+								interactive_ready: true,
+							},
+						}),
+						stderr: "",
+					};
+				}
+				if (args[0] === "agent" && args[1] === "get") {
+					return {
+						code: 0,
+						stdout: JSON.stringify({
+							id: "g",
+							result: {
+								type: "agent_info",
+								agent: {
+									agent_status: "idle",
+									pane_id: "w1:p-adopt-barrier",
+									name: "momo_scout",
+								},
+							},
+						}),
+						stderr: "",
+					};
+				}
+				if (args[0] === "pane" && args[1] === "close") {
+					closed.push(String(args[2]));
+					return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+				}
+				return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+			},
+		});
+		const sleep = async (ms: number) => {
+			await new Promise<void>((r) => setTimeout(r, Math.min(ms, 15)));
+		};
+		const factory = createHerdrChildSessionFactory({
+			cwd,
+			parentPaneId: "w1:p0",
+			parentId: "parent-adopt-owner-barrier",
+			client,
+			poolRegistry: pool,
+			cacheRoot,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+			pollIntervalMs: 20,
+			readyTimeoutMs: 2_000,
+			sleep,
+		});
+		const session = await factory({ cwd, role: getRole("scout") });
+		const prompt = session.prompt("owner-task");
+		for (let i = 0; i < 80 && agentStartEntered < 1; i += 1) await sleep(10);
+		expect(agentStartEntered).toBe(1);
+		const mid = pool.getByRole("scout")!;
+		expect(mid.status).toBe("starting");
+		expect(mid.provisioningOwnerId).toBeTruthy();
+		expect(mid.paneId).toBe("w1:p-adopt-barrier");
+		const ownerId = mid.provisioningOwnerId!;
+		const hbAt = mid.provisioningHeartbeatAt!;
+
+		await adoptPoolWorkers(pool, client, identity.poolKey, {
+			ui: { notify: () => undefined },
+		});
+		const afterAdopt = pool.getByRole("scout")!;
+		expect(afterAdopt.status).toBe("starting");
+		expect(afterAdopt.provisioningOwnerId).toBe(ownerId);
+		expect(afterAdopt.provisioningHeartbeatAt).toBe(hbAt);
+		expect(afterAdopt.paneId).toBe("w1:p-adopt-barrier");
+		expect(closed).toEqual([]);
+		expect(queueCount(pool.poolRoot, "scout")).toBe(0);
+
+		releaseAgentStart();
+		await prompt;
+		expect(closed).toEqual([]);
+		const final = pool.getByRole("scout")!;
+		expect(final.status).toBe("busy");
+		expect(final.paneId).toBe("w1:p-adopt-barrier");
+		expect(final.provisioningOwnerId).toBeUndefined();
+		expect(final.activeAssignmentId).toBeTruthy();
+		await session.dispose();
+	}, 20_000);
+
+	it("legacy owner-less starting adoption may still promote to idle", async () => {
+		const { adoptPoolWorkers } = await import("../src/extensions/parent.js");
+		const cacheRoot = tempDir("momo-adopt-legacy-idle-");
+		const cwd = tempDir("momo-adopt-legacy-idle-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const workerId = stableWorkerId(identity.poolKey, "scout");
+		const control = workerControlPaths(pool.poolRoot, "scout");
+		mkdirSync(control.root, { recursive: true, mode: 0o700 });
+		const nowIso = new Date().toISOString();
+		pool.upsert({
+			workerId,
+			generation: 1,
+			generationTombstone: 1,
+			role: "scout",
+			paneId: "w1:p-legacy-idle",
+			agentName: "momo_scout",
+			cwd,
+			status: "starting",
+			updatedAt: nowIso,
+		});
+		atomicWriteJson(control.manifest, {
+			version: 2,
+			poolKey: identity.poolKey,
+			workerId,
+			generation: 1,
+			role: "scout",
+			cwd,
+			paneId: "w1:p-legacy-idle",
+			agentName: "momo_scout",
+			createdAt: nowIso,
+		});
+		atomicWriteJson(control.heartbeat, {
+			version: 1,
+			runId: "g1",
+			workerId,
+			at: nowIso,
+			seq: 1,
+		});
+		const client = new HerdrClient({
+			runCommand: async () => ({
+				code: 0,
+				stdout: JSON.stringify({
+					id: "ok",
+					result: {
+						type: "agent_info",
+						agent: {
+							agent_status: "idle",
+							pane_id: "w1:p-legacy-idle",
+							name: "momo_scout",
+						},
+					},
+				}),
+				stderr: "",
+			}),
+		});
+		await adoptPoolWorkers(pool, client, identity.poolKey, {
+			ui: { notify: () => undefined },
+		});
+		const after = pool.getByRole("scout")!;
+		expect(after.status).toBe("idle");
+		expect(after.paneId).toBe("w1:p-legacy-idle");
+		expect(after.provisioningOwnerId).toBeUndefined();
 	});
 
 	it("snapshot idle→current busy B during validation failure stays B", async () => {

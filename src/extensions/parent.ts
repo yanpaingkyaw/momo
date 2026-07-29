@@ -787,8 +787,13 @@ export async function adoptPoolWorkers(
 
 				// Nonactive: only mutate when snapshot itself was starting (exact fence above).
 				if (worker.status === "starting") {
+					// Owner-bearing starting: preserve unchanged — exact provisioning proxy
+					// promotes/rolls back. Stale-owner recovery is joiner timeout / cleanup.
+					if (isOwnerBearingStarting(current)) {
+						return;
+					}
 					if (info.agentStatus === "idle" || info.agentStatus === "done") {
-						// Leaving starting must strip ownership metadata (pair is starting-only).
+						// Legacy owner-less starting may still be adopted to idle.
 						pool.upsert(
 							withoutProvisioningOwnership(current, {
 								status: "idle",
@@ -803,6 +808,12 @@ export async function adoptPoolWorkers(
 				const current = pool.getByRole(worker.role);
 				// Exact whole-snapshot fence: idle/starting→busy B while await must not mutate B.
 				if (!matchesExactSnapshot(current, worker)) return;
+
+				// Owner-bearing starting: never strip ownership or mark unhealthy on
+				// agentGet/validation failure — leave for the provisioning proxy.
+				if (isOwnerBearingStarting(current)) {
+					return;
+				}
 
 				// Writer uncertain only when exact snapshot is still an active implementer assignment.
 				if (
@@ -839,7 +850,8 @@ export async function adoptPoolWorkers(
 
 /**
  * Exact whole-snapshot fence: if current diverged from the adopt snapshot, no-op.
- * Compares generation, workerId, role, status, assignment/epoch, pane/agent, cwd.
+ * Compares generation, workerId, role, status, assignment/epoch, pane/agent, cwd,
+ * and provisioning ownership pair.
  */
 function matchesExactSnapshot(
 	current: PoolWorkerRecord | undefined,
@@ -858,6 +870,20 @@ function matchesExactSnapshot(
 		current.cwd === snapshot.cwd &&
 		current.provisioningOwnerId === snapshot.provisioningOwnerId &&
 		current.provisioningHeartbeatAt === snapshot.provisioningHeartbeatAt
+	);
+}
+
+/**
+ * Live owner-bearing starting reservation: only the exact provisioning proxy may
+ * promote/rollback. Adoption must not strip ownership or transition these rows.
+ */
+function isOwnerBearingStarting(record: PoolWorkerRecord): boolean {
+	return (
+		record.status === "starting" &&
+		typeof record.provisioningOwnerId === "string" &&
+		record.provisioningOwnerId.length > 0 &&
+		typeof record.provisioningHeartbeatAt === "string" &&
+		record.provisioningHeartbeatAt.length > 0
 	);
 }
 
