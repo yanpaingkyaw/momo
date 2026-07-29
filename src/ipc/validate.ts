@@ -537,50 +537,138 @@ function validateResultMessages(messages: unknown[]): unknown[] {
 	return out;
 }
 
-/** Keep only assistant text + usage/stop/error fields for parent synthesis. */
+const IPC_ASSISTANT_TRUNCATION_MARKER = "\n\n[Output truncated for IPC result bound]";
+
+function utf8ByteLength(text: string): number {
+	return Buffer.byteLength(text, "utf8");
+}
+
+/** Prefix of `text` that fits in `maxBytes` without splitting a UTF-8 code point. */
+function utf8Prefix(text: string, maxBytes: number): string {
+	if (maxBytes <= 0) return "";
+	let bytes = 0;
+	let prefix = "";
+	for (const codePoint of text) {
+		const size = utf8ByteLength(codePoint);
+		if (bytes + size > maxBytes) break;
+		prefix += codePoint;
+		bytes += size;
+	}
+	return prefix;
+}
+
+/**
+ * Fit `text` into `budget` bytes without splitting UTF-8 code points.
+ * Use the truncation marker only when the budget fits at least one original
+ * code point plus the full marker; otherwise retain an original-text prefix
+ * (never a marker-only / blank-newline stub).
+ */
+function truncateAssistantTextToBudget(text: string, budget: number): string {
+	if (budget <= 0) return "";
+	if (utf8ByteLength(text) <= budget) return text;
+	const markerBytes = utf8ByteLength(IPC_ASSISTANT_TRUNCATION_MARKER);
+	let firstCodePointBytes: number | undefined;
+	for (const codePoint of text) {
+		firstCodePointBytes = utf8ByteLength(codePoint);
+		break;
+	}
+	if (
+		firstCodePointBytes !== undefined &&
+		firstCodePointBytes + markerBytes <= budget
+	) {
+		const prefix = utf8Prefix(text, budget - markerBytes);
+		return `${prefix}${IPC_ASSISTANT_TRUNCATION_MARKER}`;
+	}
+	return utf8Prefix(text, budget);
+}
+
+function assistantTextFromContent(content: unknown[]): string | undefined {
+	const textParts: string[] = [];
+	for (const part of content) {
+		if (typeof part !== "object" || part === null) continue;
+		const record = part as Record<string, unknown>;
+		if (record.type === "text" && typeof record.text === "string") {
+			textParts.push(record.text);
+		}
+	}
+	if (textParts.length === 0) return undefined;
+	return textParts.join("");
+}
+
+/**
+ * Keep only assistant text + usage/stop/error fields for parent synthesis.
+ *
+ * Text budget is applied newest-to-oldest so the final nonblank assistant
+ * response is retained (and truncated if needed). The returned subset stays in
+ * chronological order. Blank-only turns are skipped. Total retained text bytes
+ * never exceed maxBytes; truncation markers fit within that bound without
+ * splitting UTF-8 code points.
+ */
 export function sanitizeAssistantMessages(messages: readonly unknown[], maxBytes: number): unknown[] {
-	const sanitized: unknown[] = [];
-	let total = 0;
-	for (const message of messages) {
+	if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
+		throw new RangeError("maxBytes must be a non-negative safe integer");
+	}
+
+	type Candidate = {
+		index: number;
+		text: string;
+		usage?: unknown;
+		stopReason?: string;
+		errorMessage?: string;
+	};
+	const candidates: Candidate[] = [];
+	for (let index = 0; index < messages.length; index += 1) {
+		const message = messages[index];
 		if (typeof message !== "object" || message === null) continue;
 		const record = message as Record<string, unknown>;
 		if (record.role !== "assistant" || !Array.isArray(record.content)) continue;
-		const textParts: { type: "text"; text: string }[] = [];
-		for (const part of record.content) {
-			if (typeof part !== "object" || part === null) continue;
-			const content = part as Record<string, unknown>;
-			if (content.type === "text" && typeof content.text === "string") {
-				textParts.push({ type: "text", text: content.text });
-			}
+		const text = assistantTextFromContent(record.content);
+		if (text === undefined || !text.trim()) continue;
+		const candidate: Candidate = { index, text };
+		if (record.usage && typeof record.usage === "object") candidate.usage = record.usage;
+		if (typeof record.stopReason === "string") candidate.stopReason = record.stopReason;
+		if (typeof record.errorMessage === "string") candidate.errorMessage = record.errorMessage;
+		candidates.push(candidate);
+	}
+
+	let remaining = maxBytes;
+	const selected = new Map<number, string>();
+	for (let i = candidates.length - 1; i >= 0; i -= 1) {
+		if (remaining <= 0) break;
+		const candidate = candidates[i]!;
+		const bytes = utf8ByteLength(candidate.text);
+		if (bytes <= remaining) {
+			selected.set(candidate.index, candidate.text);
+			remaining -= bytes;
+			continue;
 		}
-		if (textParts.length === 0) continue;
-		let text = textParts.map((part) => part.text).join("");
-		const budget = Math.max(0, maxBytes - total);
-		const bytes = Buffer.byteLength(text, "utf8");
-		if (bytes > budget) {
-			// Truncate to budget without splitting code points.
-			let out = "";
-			let used = 0;
-			for (const cp of text) {
-				const size = Buffer.byteLength(cp, "utf8");
-				if (used + size > budget) break;
-				out += cp;
-				used += size;
+		// Oversized turns: only the newest retained response may truncate into the
+		// leftover budget; older turns that do not fully fit are dropped.
+		if (selected.size === 0) {
+			const truncated = truncateAssistantTextToBudget(candidate.text, remaining);
+			const truncatedBytes = utf8ByteLength(truncated);
+			if (truncatedBytes > 0) {
+				selected.set(candidate.index, truncated);
+				remaining -= truncatedBytes;
 			}
-			text = `${out}\n\n[Output truncated for IPC result bound]`;
+			break;
 		}
-		total += Buffer.byteLength(text, "utf8");
+	}
+
+	const out: unknown[] = [];
+	for (const candidate of candidates) {
+		const text = selected.get(candidate.index);
+		if (text === undefined) continue;
 		const cleaned: Record<string, unknown> = {
 			role: "assistant",
 			content: [{ type: "text", text }],
 		};
-		if (record.usage && typeof record.usage === "object") cleaned.usage = record.usage;
-		if (typeof record.stopReason === "string") cleaned.stopReason = record.stopReason;
-		if (typeof record.errorMessage === "string") cleaned.errorMessage = record.errorMessage;
-		sanitized.push(cleaned);
-		if (total >= maxBytes) break;
+		if (candidate.usage !== undefined) cleaned.usage = candidate.usage;
+		if (candidate.stopReason !== undefined) cleaned.stopReason = candidate.stopReason;
+		if (candidate.errorMessage !== undefined) cleaned.errorMessage = candidate.errorMessage;
+		out.push(cleaned);
 	}
-	return sanitized;
+	return out;
 }
 
 export function assertSafeEnvValue(key: string, value: string): void {

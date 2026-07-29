@@ -228,6 +228,8 @@ describe("worker runtime (persistent pool)", () => {
 			[{ role: "assistant", content: [{ type: "text", text: huge }] }],
 			1024,
 		);
+		const text = (out[0] as { content: { text: string }[] }).content[0]!.text;
+		expect(Buffer.byteLength(text, "utf8")).toBeLessThanOrEqual(1024);
 		expect(JSON.stringify(out).length).toBeLessThan(MAX_IPC_JSON_BYTES);
 	});
 
