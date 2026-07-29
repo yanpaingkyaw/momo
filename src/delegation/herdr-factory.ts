@@ -82,6 +82,7 @@ export function __resetIpcReadersForTest(): void {
 	stopAndSettleCommitHook = undefined;
 	joinerReadyTimeoutLockHook = undefined;
 	provisioningHeartbeatBeforeLockHook = undefined;
+	postPlanPreBranchHook = undefined;
 }
 
 /** @internal test-only: override IPC readers for race/fault injection. */
@@ -110,6 +111,18 @@ let joinerReadyTimeoutLockHook: (() => void | Promise<void>) | undefined;
 /** @internal test-only: runs inside provisioning heartbeat before the role-lock acquire. */
 let provisioningHeartbeatBeforeLockHook: (() => void) | undefined;
 
+/**
+ * @internal test-only: after provision plan owner+heartbeat installed, before try body
+ * (post-plan / pre-branch barrier for cancel-strand coverage).
+ */
+let postPlanPreBranchHook:
+	| ((plan: {
+			kind: "provision";
+			generation: number;
+			provisioningOwnerId: string;
+	  }) => void | Promise<void>)
+	| undefined;
+
 /** @internal test-only: barrier at start of atomic joiner ready-timeout lock callback. */
 export function __setJoinerReadyTimeoutLockHookForTest(
 	hook?: () => void | Promise<void>,
@@ -122,10 +135,22 @@ export function __setProvisioningHeartbeatBeforeLockHookForTest(hook?: () => voi
 	provisioningHeartbeatBeforeLockHook = hook;
 }
 
+/** @internal test-only: barrier after provision owner install, before try/cancel throw. */
+export function __setPostPlanPreBranchHookForTest(
+	hook?: (plan: {
+		kind: "provision";
+		generation: number;
+		provisioningOwnerId: string;
+	}) => void | Promise<void>,
+): void {
+	postPlanPreBranchHook = hook;
+}
+
 /** @internal test-only: clear provisioning ownership test hooks. */
 export function __resetProvisioningOwnershipHooksForTest(): void {
 	joinerReadyTimeoutLockHook = undefined;
 	provisioningHeartbeatBeforeLockHook = undefined;
+	postPlanPreBranchHook = undefined;
 }
 import {
 	getHerdrPiExtensionPath,
@@ -1067,13 +1092,22 @@ class AssignmentProxy implements ChildSession {
 		);
 
 		if (plan.kind === "done") return;
-		this.throwIfCancelled();
 
 		if (plan.kind === "provision") {
+			// Do not throwIfCancelled between reservation and this branch: that would
+			// strand a pane-less starting owner with no catch/rollback. Install owner
+			// + heartbeat, enter try, then throw so the fenced catch archives.
 			this.generation = plan.generation;
 			this.agentName = plan.agentName;
 			this.provisioningOwnerId = plan.provisioningOwnerId;
 			this.startProvisioningHeartbeat(plan.generation);
+			if (postPlanPreBranchHook) {
+				await postPlanPreBranchHook({
+					kind: "provision",
+					generation: plan.generation,
+					provisioningOwnerId: plan.provisioningOwnerId,
+				});
+			}
 			try {
 				this.throwIfCancelled();
 				const paneId = await this.provisionPhysicalWorker(plan.generation, plan.agentName);

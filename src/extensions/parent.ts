@@ -23,6 +23,7 @@ import {
 	selectClosablePoolWorkers,
 	clearControlEphemerals,
 	isArchivalTombstone,
+	withoutProvisioningOwnership,
 	type PoolWorkerRecord,
 } from "../herdr/pool-registry.js";
 import {
@@ -595,14 +596,15 @@ export async function adoptPoolWorkers(
 
 				// Nonactive: only mutate when snapshot itself was starting (exact fence above).
 				if (worker.status === "starting") {
-					pool.upsert({
-						...current,
-						status:
-							info.agentStatus === "idle" || info.agentStatus === "done"
-								? "idle"
-								: current.status,
-						updatedAt: new Date().toISOString(),
-					});
+					if (info.agentStatus === "idle" || info.agentStatus === "done") {
+						// Leaving starting must strip ownership metadata (pair is starting-only).
+						pool.upsert(
+							withoutProvisioningOwnership(current, {
+								status: "idle",
+								updatedAt: new Date().toISOString(),
+							}),
+						);
+					}
 				}
 			});
 		} catch (error) {
@@ -626,11 +628,12 @@ export async function adoptPoolWorkers(
 					return;
 				}
 
-				pool.upsert({
-					...current,
-					status: "unhealthy",
-					updatedAt: new Date().toISOString(),
-				});
+				pool.upsert(
+					withoutProvisioningOwnership(current, {
+						status: "unhealthy",
+						updatedAt: new Date().toISOString(),
+					}),
+				);
 			});
 			ctx.ui?.notify?.(
 				`Did not adopt ${worker.workerId}: ${
@@ -661,7 +664,9 @@ function matchesExactSnapshot(
 		current.activeParentEpoch === snapshot.activeParentEpoch &&
 		current.paneId === snapshot.paneId &&
 		current.agentName === snapshot.agentName &&
-		current.cwd === snapshot.cwd
+		current.cwd === snapshot.cwd &&
+		current.provisioningOwnerId === snapshot.provisioningOwnerId &&
+		current.provisioningHeartbeatAt === snapshot.provisioningHeartbeatAt
 	);
 }
 
