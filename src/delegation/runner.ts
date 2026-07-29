@@ -73,6 +73,8 @@ export interface ChildSession {
 	subscribe(listener: (event: any) => void): () => void;
 	prompt(text: string): Promise<void>;
 	abort(): Promise<void>;
+	/** Terminal-skip a never-prompted worker (Herdr). */
+	skip?(reason: string): Promise<void>;
 	dispose(): void | Promise<void>;
 }
 
@@ -345,6 +347,7 @@ export function createDelegationRunner(options: DelegationRunnerOptions): Delega
 		};
 
 		try {
+			// Allocate lazily when the concurrency slot (or single/chain step) runs.
 			session = await options.createChildSession({ cwd, role });
 			unsubscribe = session.subscribe(onEvent);
 			const abortChild = () => {
@@ -368,16 +371,19 @@ export function createDelegationRunner(options: DelegationRunnerOptions): Delega
 			flushText();
 			const messages = session.messages;
 			const usage = summarizeUsage(messages);
+			const capturedOutput = extractLastAssistantText(messages) ?? "";
 			if (runOptions.signal?.aborted) {
 				emit("aborted", `${task.agent} aborted`);
 				return {
 					agent: task.agent,
 					task: task.task,
 					status: "aborted",
-					output: "",
-					outputTruncated: false,
+					...taskOutput(capturedOutput),
 					usage,
-					error: { message: "Delegation aborted" },
+					error: {
+						message: "Delegation aborted",
+						stopReason: "aborted",
+					},
 				};
 			}
 
@@ -425,15 +431,37 @@ export function createDelegationRunner(options: DelegationRunnerOptions): Delega
 			return result;
 		} catch (error) {
 			const aborted = runOptions.signal?.aborted === true;
-			emit(aborted ? "aborted" : "failed", `${task.agent} ${aborted ? "aborted" : "failed"}`);
+			const uncertain =
+				typeof error === "object" &&
+				error !== null &&
+				"uncertainWrite" in error &&
+				(error as { uncertainWrite?: unknown }).uncertainWrite === true;
+			const status = uncertain ? "failed" : aborted ? "aborted" : "failed";
+			const messages = session?.messages ?? [];
+			const preserved = extractLastAssistantText(messages) ?? "";
+			const failure = lastAssistantFailure(messages);
+			emit(status, `${task.agent} ${status}`);
+			const stopReason =
+				typeof error === "object" &&
+				error !== null &&
+				"stopReason" in error &&
+				typeof (error as { stopReason?: unknown }).stopReason === "string"
+					? (error as { stopReason: string }).stopReason
+					: failure.stopReason;
 			return {
 				agent: task.agent,
 				task: task.task,
-				status: aborted ? "aborted" : "failed",
-				output: "",
-				outputTruncated: false,
-				usage: session ? summarizeUsage(session.messages) : emptyUsage(),
-				error: { message: aborted ? "Delegation aborted" : errorMessage(error) },
+				status,
+				...taskOutput(preserved),
+				usage: session ? summarizeUsage(messages) : emptyUsage(),
+				error: {
+					message: uncertain
+						? `Uncertain write: ${errorMessage(error)}`
+						: aborted
+							? "Delegation aborted"
+							: errorMessage(error),
+					...(stopReason === undefined ? {} : { stopReason }),
+				},
 			};
 		} finally {
 			if (textTimer) clearTimeout(textTimer);
@@ -499,13 +527,15 @@ export function createDelegationRunner(options: DelegationRunnerOptions): Delega
 				for (const [index, task] of request.tasks.entries()) {
 					reportProgress(runOptions, { mode: request.mode, phase: "queued", index, agent: task.agent, message: `${task.agent} queued` });
 				}
-				const scheduled = await mapWithConcurrency<DelegatedTask, TaskResult>(
+				// Lazy createChildSession inside mapWithConcurrency so maxParallelConcurrency
+				// bounds both session allocation and execution; abort skips queued slots.
+				const scheduled = await mapWithConcurrency(
 					request.tasks,
-					(task, index, signal) =>
+					async (task, index, signal) =>
 						runTask(request.mode, task, index, {
-								...runOptions,
-								...(signal === undefined ? {} : { signal }),
-							}),
+							...runOptions,
+							...(signal === undefined ? {} : { signal }),
+						}),
 					{
 						concurrency,
 						...(runOptions.signal === undefined ? {} : { signal: runOptions.signal }),
@@ -519,17 +549,25 @@ export function createDelegationRunner(options: DelegationRunnerOptions): Delega
 						},
 					},
 				);
-				const results = scheduled.map((item, index): TaskResult => {
+				const results: TaskResult[] = [];
+				for (let index = 0; index < scheduled.length; index += 1) {
+					const item = scheduled[index];
 					const task = request.tasks[index];
-					if (!task) throw new Error(`Missing parallel task at index ${index}`);
-					if (item.status === "fulfilled") return item.value;
-					if (item.status === "skipped") return skippedResult(task);
-					return {
+					if (!task || !item) throw new Error(`Missing parallel task at index ${index}`);
+					if (item.status === "fulfilled") {
+						results.push(item.value);
+						continue;
+					}
+					if (item.status === "skipped") {
+						results.push(skippedResult(task));
+						continue;
+					}
+					results.push({
 						...skippedResult(task),
 						status: runOptions.signal?.aborted ? "aborted" : "failed",
 						error: { message: errorMessage(item.reason) },
-					};
-				});
+					});
+				}
 				if (runOptions.signal?.aborted && results.every((result) => result.status === "skipped")) {
 					const first = request.tasks[0];
 					if (first) {
@@ -554,7 +592,10 @@ export function createDelegationRunner(options: DelegationRunnerOptions): Delega
 						status: "aborted",
 						error: { message: "Delegation aborted before child startup" },
 					});
-					for (const remaining of request.steps.slice(index + 1)) results.push(skippedResult(remaining));
+					for (let rest = index + 1; rest < request.steps.length; rest += 1) {
+						const remaining = request.steps[rest];
+						if (remaining) results.push(skippedResult(remaining));
+					}
 					break;
 				}
 				const task = {
@@ -565,7 +606,10 @@ export function createDelegationRunner(options: DelegationRunnerOptions): Delega
 				const result = await runTask(request.mode, task, index, runOptions);
 				results.push(result);
 				if (result.status !== "completed") {
-					for (const remaining of request.steps.slice(index + 1)) results.push(skippedResult(remaining));
+					for (let rest = index + 1; rest < request.steps.length; rest += 1) {
+						const remaining = request.steps[rest];
+						if (remaining) results.push(skippedResult(remaining));
+					}
 					break;
 				}
 				previous = result.output;

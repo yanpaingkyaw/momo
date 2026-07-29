@@ -1,6 +1,6 @@
 {
   "name": "momo-orchestrator",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Momo, a local software-engineering orchestrator built with the Pi SDK",
   "private": true,
   "type": "module",
@@ -18,7 +18,7 @@
     "node": ">=22.19.0"
   },
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "0.80.10",
+    "@earendil-works/pi-coding-agent": "0.82.1",
     "typebox": "1.1.38"
   },
   "devDependencies": {
