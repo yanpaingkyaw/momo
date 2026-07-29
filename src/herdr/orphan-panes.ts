@@ -189,14 +189,17 @@ export function writeOrphanPaneEvidence(
 	return validated;
 }
 
-/** True when any orphan evidence entry exists (including malformed — fail closed). */
+/**
+ * True when any orphan-panes directory entry exists — including `*.tmp` atomic-write
+ * leftovers and malformed files (fail closed; never ignore interrupted writes).
+ */
 export function roleHasOrphanPaneEvidence(poolRoot: string, role: AgentName): boolean {
 	const dir = orphanPanesDir(poolRoot, role);
 	if (!existsSync(dir)) return false;
 	try {
 		const st = lstatSync(dir);
 		if (st.isSymbolicLink() || !st.isDirectory()) return true;
-		return readdirSync(dir).some((name) => !name.endsWith(".tmp"));
+		return readdirSync(dir).length > 0;
 	} catch {
 		return true;
 	}
@@ -215,7 +218,8 @@ export type ListedOrphanPane =
 
 /**
  * List orphan evidence under the role directory. Symlinks, oversized, group/other
- * modes, filename/paneId mismatches, and malformed files fail closed.
+ * modes, filename/paneId mismatches, malformed files, and `*.tmp` atomic-write
+ * leftovers fail closed as ok:false — never silently filtered or removed.
  */
 export function listOrphanPaneEvidence(poolRoot: string, role: AgentName): ListedOrphanPane[] {
 	const dir = orphanPanesDir(poolRoot, role);
@@ -223,7 +227,7 @@ export function listOrphanPaneEvidence(poolRoot: string, role: AgentName): Liste
 	let names: string[];
 	try {
 		assertOwnerPrivateDir(dir);
-		names = readdirSync(dir).filter((name) => !name.endsWith(".tmp"));
+		names = readdirSync(dir);
 	} catch (error) {
 		return [
 			{
@@ -236,6 +240,15 @@ export function listOrphanPaneEvidence(poolRoot: string, role: AgentName): Liste
 	const out: ListedOrphanPane[] = [];
 	for (const name of names) {
 		const filePath = path.join(dir, name);
+		if (name.endsWith(".tmp")) {
+			out.push({
+				ok: false,
+				filePath,
+				reason:
+					"interrupted atomic write (temp orphan evidence); retained until resolved — run /momo-cleanup after fixing storage",
+			});
+			continue;
+		}
 		try {
 			assertOwnerPrivateFile(filePath);
 			const evidence = validateOrphanPaneEvidence(parseJsonFile(filePath), name);
@@ -260,7 +273,86 @@ export function listOrphanPaneEvidence(poolRoot: string, role: AgentName): Liste
 	return out;
 }
 
-/** Remove evidence only after definitive close / pane-not-found. */
+export function orphanPaneEvidenceEquals(
+	a: OrphanPaneEvidence,
+	b: OrphanPaneEvidence,
+): boolean {
+	return (
+		a.version === b.version &&
+		a.generation === b.generation &&
+		a.workerId === b.workerId &&
+		a.paneId === b.paneId &&
+		a.agentName === b.agentName &&
+		a.reason === b.reason &&
+		a.createdAt === b.createdAt
+	);
+}
+
+export type RemoveOrphanEvidenceIfUnchangedResult =
+	| { status: "removed" }
+	| { status: "missing" }
+	| { status: "changed" }
+	| { status: "invalid"; reason: string };
+
+/**
+ * Remove evidence only when the on-disk file still matches the exact candidate
+ * content observed before close. Concurrent replacement / mutation retains.
+ */
+export function removeOrphanPaneEvidenceIfUnchanged(
+	poolRoot: string,
+	role: AgentName,
+	expected: OrphanPaneEvidence,
+): RemoveOrphanEvidenceIfUnchangedResult {
+	const filePath = orphanEvidencePath(poolRoot, role, expected.paneId);
+	try {
+		if (!existsSync(filePath)) return { status: "missing" };
+		const st = lstatSync(filePath);
+		if (st.isSymbolicLink()) {
+			throw new OrphanPaneEvidenceError("refusing to remove symlink orphan evidence");
+		}
+		if (typeof st.mode === "number" && (st.mode & 0o077) !== 0) {
+			throw new OrphanPaneEvidenceError(
+				`refusing to remove orphan evidence with group/other permissions: ${filePath}`,
+			);
+		}
+		if (!st.isFile()) {
+			return {
+				status: "invalid",
+				reason: `orphan evidence is not a regular file: ${filePath}`,
+			};
+		}
+		let current: OrphanPaneEvidence;
+		try {
+			current = validateOrphanPaneEvidence(parseJsonFile(filePath), path.basename(filePath));
+		} catch (error) {
+			return {
+				status: "invalid",
+				reason: error instanceof Error ? error.message : String(error),
+			};
+		}
+		const expectedName = orphanEvidenceFileName(current.paneId);
+		if (path.basename(filePath) !== expectedName) {
+			return {
+				status: "invalid",
+				reason: `filename does not match canonical paneId hash (expected ${expectedName})`,
+			};
+		}
+		if (!orphanPaneEvidenceEquals(current, expected)) {
+			return { status: "changed" };
+		}
+		rmSync(filePath, { force: true });
+		return { status: "removed" };
+	} catch (error) {
+		if (error instanceof OrphanPaneEvidenceError) throw error;
+		throw new OrphanPaneEvidenceError(
+			`failed to remove orphan evidence for ${expected.paneId}: ${
+				error instanceof Error ? error.message : String(error)
+			}`,
+		);
+	}
+}
+
+/** Remove evidence only after definitive close / pane-not-found (unconditional). */
 export function removeOrphanPaneEvidence(
 	poolRoot: string,
 	role: AgentName,

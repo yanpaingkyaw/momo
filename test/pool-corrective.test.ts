@@ -36,6 +36,7 @@ import {
 } from "../src/herdr/pool-registry.js";
 import { resolvePoolIdentity, stableWorkerId } from "../src/herdr/pool-identity.js";
 import {
+	assertNoOrphanPaneEvidence,
 	listOrphanPaneEvidence,
 	orphanEvidenceFileName,
 	orphanEvidencePath,
@@ -584,6 +585,12 @@ describe("orphan pane cleanup evidence", () => {
 		expect(path.basename(realPath)).toBe(orphanEvidenceFileName("w1:p-real"));
 		const groupy = path.join(dir, "groupy.json");
 		writeFileSync(groupy, '{"version":1}\n', { mode: 0o644 });
+		// Interrupted atomic write must remain visible and block provisioning.
+		const interruptedTmp = path.join(
+			dir,
+			`${orphanEvidenceFileName("w1:p-temp")}.${process.pid}.${Date.now()}.tmp`,
+		);
+		writeFileSync(interruptedTmp, '{"partial":true}\n', { mode: 0o600 });
 		const linkPath = path.join(dir, "link.json");
 		try {
 			symlinkSync(realPath, linkPath);
@@ -596,7 +603,13 @@ describe("orphan pane cleanup evidence", () => {
 			listed.some((e) => !e.ok && /invalid|JSON|oversized|symlink|canonical|group\/other/i.test(e.reason)),
 		).toBe(true);
 		expect(listed.some((e) => !e.ok && /canonical paneId hash/i.test(e.reason))).toBe(true);
+		expect(
+			listed.some(
+				(e) => !e.ok && e.filePath === interruptedTmp && /interrupted atomic write|temp/i.test(e.reason),
+			),
+		).toBe(true);
 		expect(listed.some((e) => e.ok && e.evidence.paneId === "w1:p-real")).toBe(true);
+		expect(() => assertNoOrphanPaneEvidence(pool.poolRoot, "scout")).toThrow(/momo-cleanup/i);
 	});
 
 	it("cleanup pane-not-found removes orphan evidence without touching successor registry", async () => {
@@ -766,6 +779,224 @@ describe("orphan pane cleanup evidence", () => {
 			expect(live.status).toBe(status);
 		});
 	}
+
+	it("delayed orphan close releases role lock; successor settlement proceeds; replaced evidence retained", async () => {
+		const cacheRoot = tempDir("momo-orphan-delayed-close-");
+		const cwd = tempDir("momo-orphan-delayed-close-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const workerId = stableWorkerId(identity.poolKey, "scout");
+		const assignmentId = "succsettle000001";
+		const control = workerControlPaths(pool.poolRoot, "scout");
+		mkdirSync(control.root, { recursive: true, mode: 0o700 });
+		pool.upsert({
+			workerId,
+			generation: 2,
+			generationTombstone: 2,
+			role: "scout",
+			paneId: "w1:p-successor",
+			agentName: "momo_scout",
+			cwd: identity.canonicalRoot,
+			status: "busy",
+			activeAssignmentId: assignmentId,
+			activeParentEpoch: "e1",
+			updatedAt: new Date().toISOString(),
+		});
+		atomicWriteJson(control.active, {
+			version: 1,
+			assignmentId,
+			generation: 2,
+			parentEpoch: "e1",
+			dispatchedAt: new Date().toISOString(),
+		});
+		const originalEvidence = writeOrphanPaneEvidence(pool.poolRoot, "scout", {
+			generation: 1,
+			workerId,
+			paneId: "w1:p-orphan-delay",
+			agentName: "momo_scout",
+			reason: "superseded_close_failed",
+			createdAt: "2020-01-01T00:00:00.000Z",
+		});
+		let releaseClose!: () => void;
+		const closeGate = new Promise<void>((resolve) => {
+			releaseClose = resolve;
+		});
+		let closeEntered = 0;
+		const closed: string[] = [];
+		const pi = createFakePi();
+		installMomoParent(pi as unknown as ExtensionAPI, {
+			cwd,
+			env: {
+				MOMO_PARENT: "1",
+				MOMO_PARENT_ID: "parent-orphan-delayed",
+				HERDR_ENV: "1",
+				HERDR_PANE_ID: "w1:p0",
+				HERDR_WORKSPACE_ID: "ws",
+				HERDR_SOCKET_PATH: "s",
+			},
+			client: new HerdrClient({
+				runCommand: async (_file, args) => {
+					if (args[0] === "pane" && args[1] === "close") {
+						closed.push(String(args[2]));
+						closeEntered += 1;
+						await closeGate;
+						return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+					}
+					return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+				},
+			}),
+			poolRegistry: pool,
+		});
+		const notifies: string[] = [];
+		const cleanupDone = pi.commands.get("momo-cleanup")!.handler("", {
+			ui: { notify: (m: string) => notifies.push(m) },
+		} as never);
+		for (let i = 0; i < 80 && closeEntered < 1; i += 1) {
+			await new Promise<void>((r) => setTimeout(r, 10));
+		}
+		expect(closeEntered).toBe(1);
+		expect(closed).toEqual(["w1:p-orphan-delay"]);
+
+		// Role lock must be free during Herdr close — successor settlement proceeds.
+		const { completeCleanAssignmentLocked } = await import(
+			"../src/herdr/terminal-transition.js"
+		);
+		const settleStarted = Date.now();
+		const outcome = withRoleLock(pool.poolRoot, "scout", () =>
+			completeCleanAssignmentLocked({
+				pool,
+				role: "scout",
+				workerId,
+				generation: 2,
+				finishedAssignmentId: assignmentId,
+			}),
+		);
+		expect(Date.now() - settleStarted).toBeLessThan(2_000);
+		expect(outcome.kind).toBe("idle");
+		const afterSettle = pool.getByRole("scout")!;
+		expect(afterSettle.status).toBe("idle");
+		expect(afterSettle.paneId).toBe("w1:p-successor");
+		expect(afterSettle.activeAssignmentId).toBeUndefined();
+
+		// Replace evidence while close is still in flight — must not be deleted.
+		writeOrphanPaneEvidence(pool.poolRoot, "scout", {
+			...originalEvidence,
+			reason: "replaced_during_close",
+			createdAt: "2020-01-02T00:00:00.000Z",
+		});
+		releaseClose();
+		await cleanupDone;
+		expect(roleHasOrphanPaneEvidence(pool.poolRoot, "scout")).toBe(true);
+		const listed = listOrphanPaneEvidence(pool.poolRoot, "scout");
+		expect(
+			listed.some(
+				(e) => e.ok && e.evidence.reason === "replaced_during_close",
+			),
+		).toBe(true);
+		expect(notifies.join("\n")).toMatch(/evidence replaced during close/i);
+		expect(notifies.join("\n")).not.toMatch(/Closed 1 orphan pane/i);
+		const successor = pool.getByRole("scout")!;
+		expect(successor.status).toBe("idle");
+		expect(successor.paneId).toBe("w1:p-successor");
+		expect(successor.activeAssignmentId).toBeUndefined();
+	}, 15_000);
+
+	it("temp-only orphan evidence blocks provision and appears in cleanup notes/list", async () => {
+		installFakeHerdrExtension();
+		const cacheRoot = tempDir("momo-orphan-tmp-");
+		const cwd = tempDir("momo-orphan-tmp-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const dir = orphanPanesDir(pool.poolRoot, "scout");
+		mkdirSync(dir, { recursive: true, mode: 0o700 });
+		const tmpPath = path.join(
+			dir,
+			`${orphanEvidenceFileName("w1:p-interrupted")}.${process.pid}.tmp`,
+		);
+		writeFileSync(tmpPath, '{"version":1,"partial":true}\n', { mode: 0o600 });
+		expect(roleHasOrphanPaneEvidence(pool.poolRoot, "scout")).toBe(true);
+		const listed = listOrphanPaneEvidence(pool.poolRoot, "scout");
+		expect(listed).toHaveLength(1);
+		expect(listed[0]?.ok).toBe(false);
+		if (listed[0]?.ok === false) {
+			expect(listed[0].filePath).toBe(tmpPath);
+			expect(listed[0].reason).toMatch(/interrupted atomic write|temp orphan evidence/i);
+		}
+		expect(() => assertNoOrphanPaneEvidence(pool.poolRoot, "scout")).toThrow(
+			/orphan pane cleanup evidence|momo-cleanup/i,
+		);
+
+		const sleep = async (ms: number) => {
+			await new Promise<void>((r) => setTimeout(r, Math.min(ms, 15)));
+		};
+		const factory = createHerdrChildSessionFactory({
+			cwd,
+			parentPaneId: "w1:p0",
+			parentId: "parent-orphan-tmp",
+			client: new HerdrClient({
+				runCommand: async () => ({
+					code: 0,
+					stdout: JSON.stringify({ id: "ok", result: {} }),
+					stderr: "",
+				}),
+			}),
+			poolRegistry: pool,
+			cacheRoot,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+			readyTimeoutMs: 2_000,
+			sleep,
+		});
+		const blocked = await factory({ cwd, role: getRole("scout") });
+		await expect(blocked.prompt("blocked-by-tmp")).rejects.toThrow(
+			/orphan pane cleanup evidence|momo-cleanup/i,
+		);
+		await blocked.dispose();
+		expect(existsSync(tmpPath)).toBe(true);
+
+		const closed: string[] = [];
+		const pi = createFakePi();
+		installMomoParent(pi as unknown as ExtensionAPI, {
+			cwd,
+			env: {
+				MOMO_PARENT: "1",
+				MOMO_PARENT_ID: "parent-orphan-tmp-clean",
+				HERDR_ENV: "1",
+				HERDR_PANE_ID: "w1:p0",
+				HERDR_WORKSPACE_ID: "ws",
+				HERDR_SOCKET_PATH: "s",
+			},
+			client: new HerdrClient({
+				runCommand: async (_file, args) => {
+					if (args[0] === "pane" && args[1] === "close") {
+						closed.push(String(args[2]));
+						return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+					}
+					return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+				},
+			}),
+			poolRegistry: pool,
+		});
+		const notifies: string[] = [];
+		await pi.commands.get("momo-cleanup")!.handler("", {
+			ui: { notify: (m: string) => notifies.push(m) },
+		} as never);
+		expect(closed).toEqual([]);
+		expect(existsSync(tmpPath)).toBe(true);
+		expect(roleHasOrphanPaneEvidence(pool.poolRoot, "scout")).toBe(true);
+		expect(notifies.join("\n")).toMatch(/retained orphan evidence .*interrupted atomic write|temp orphan evidence/i);
+	}, 15_000);
 
 	it("evidence atomic write failure is not silent success", async () => {
 		installFakeHerdrExtension();

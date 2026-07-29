@@ -37,8 +37,9 @@ import { completeCleanAssignmentLocked } from "../herdr/terminal-transition.js";
 import { terminalizeAndClearRoleAssignmentsLocked } from "../herdr/cleanup-terminalize.js";
 import {
 	listOrphanPaneEvidence,
-	removeOrphanPaneEvidence,
+	removeOrphanPaneEvidenceIfUnchanged,
 	roleHasOrphanPaneEvidence,
+	type OrphanPaneEvidence,
 } from "../herdr/orphan-panes.js";
 import { WriterLeaseManager, LeaseCorruptionError } from "../lease/writer-lease.js";
 import { atomicWriteJson, DEFAULT_HEARTBEAT_STALE_MS, DEFAULT_HEARTBEAT_CLOCK_SKEW_MS } from "../ipc/spool.js";
@@ -57,6 +58,7 @@ import {
 	listClaiming,
 	listQueue,
 	queueCount,
+	withRoleLock,
 	withRoleLockAsync,
 } from "../herdr/role-queue.js";
 
@@ -459,14 +461,25 @@ export function installMomoParent(pi: ExtensionAPI, options: InstallMomoParentOp
 			}
 
 			// Role-scoped orphan panes from superseded provision close failures.
-			// Close only the evidenced paneId — never touch successor registry/lease/agent.
+			// Never await Herdr/network while holding the role lock:
+			//   1) under lock: list + strict-validate + refuse live paneId collision
+			//   2) outside lock: closePane
+			//   3) reacquire lock: remove only if exact evidence unchanged and still
+			//      does not collide; concurrent cleanups are idempotent (close/not-found)
+			//      and never delete replaced evidence.
 			let orphanClosed = 0;
 			for (const roleName of AGENT_NAMES) {
 				if (!roleHasOrphanPaneEvidence(pool.poolRoot, roleName)) continue;
+				type OrphanCloseCandidate = {
+					evidence: OrphanPaneEvidence;
+					filePath: string;
+				};
+				let candidates: OrphanCloseCandidate[] = [];
 				try {
-					await withRoleLockAsync(pool.poolRoot, roleName, async () => {
+					candidates = withRoleLock(pool.poolRoot, roleName, () => {
 						const listed = listOrphanPaneEvidence(pool.poolRoot, roleName);
 						const live = pool.getByRole(roleName);
+						const out: OrphanCloseCandidate[] = [];
 						for (const entry of listed) {
 							if (!entry.ok) {
 								notes.push(
@@ -483,30 +496,9 @@ export function installMomoParent(pi: ExtensionAPI, options: InstallMomoParentOp
 								);
 								continue;
 							}
-							// Evidence is advisory identity only; never mutate the live registry.
-							try {
-								await herdrClient.closePane(evidence.paneId);
-								removeOrphanPaneEvidence(pool.poolRoot, roleName, evidence.paneId);
-								orphanClosed += 1;
-							} catch (closeError) {
-								if (isPaneNotFoundError(closeError)) {
-									removeOrphanPaneEvidence(
-										pool.poolRoot,
-										roleName,
-										evidence.paneId,
-									);
-									orphanClosed += 1;
-									continue;
-								}
-								notes.push(
-									`retained orphan pane ${evidence.paneId} (gen=${evidence.generation}): ${
-										closeError instanceof Error
-											? closeError.message
-											: String(closeError)
-									}`,
-								);
-							}
+							out.push({ evidence, filePath: entry.filePath });
 						}
+						return out;
 					});
 				} catch (error) {
 					notes.push(
@@ -514,6 +506,71 @@ export function installMomoParent(pi: ExtensionAPI, options: InstallMomoParentOp
 							error instanceof Error ? error.message : String(error)
 						}`,
 					);
+					continue;
+				}
+
+				for (const candidate of candidates) {
+					const { evidence } = candidate;
+					try {
+						await herdrClient.closePane(evidence.paneId);
+					} catch (closeError) {
+						if (!isPaneNotFoundError(closeError)) {
+							notes.push(
+								`retained orphan pane ${evidence.paneId} (gen=${evidence.generation}): ${
+									closeError instanceof Error
+										? closeError.message
+										: String(closeError)
+								}`,
+							);
+							continue;
+						}
+					}
+
+					try {
+						const removeOutcome = withRoleLock(pool.poolRoot, roleName, () => {
+							const live = pool.getByRole(roleName);
+							if (live?.paneId && live.paneId === evidence.paneId) {
+								return {
+									kind: "collide" as const,
+									status: live.status,
+									generation: live.generation,
+								};
+							}
+							const removed = removeOrphanPaneEvidenceIfUnchanged(
+								pool.poolRoot,
+								roleName,
+								evidence,
+							);
+							return { kind: "remove" as const, removed };
+						});
+						if (removeOutcome.kind === "collide") {
+							notes.push(
+								`retained orphan evidence for ${evidence.paneId}: paneId collides with live registry pane after close (status=${removeOutcome.status} gen=${removeOutcome.generation})`,
+							);
+							continue;
+						}
+						const { removed } = removeOutcome;
+						if (removed.status === "removed" || removed.status === "missing") {
+							// missing ⇒ concurrent cleanup already cleared the same evidence.
+							orphanClosed += 1;
+							continue;
+						}
+						if (removed.status === "changed") {
+							notes.push(
+								`retained orphan evidence for ${evidence.paneId}: evidence replaced during close`,
+							);
+							continue;
+						}
+						notes.push(
+							`retained orphan evidence for ${evidence.paneId}: ${removed.reason}`,
+						);
+					} catch (error) {
+						notes.push(
+							`orphan cleanup ${roleName} failed after close of ${evidence.paneId}: ${
+								error instanceof Error ? error.message : String(error)
+							}`,
+						);
+					}
 				}
 			}
 
