@@ -86,6 +86,7 @@ export function __resetIpcReadersForTest(): void {
 	ipcValidate.tryReadIpcJson = tryReadIpcJsonImpl;
 	stopAndSettleCommitHook = undefined;
 	joinerReadyTimeoutLockHook = undefined;
+	waitForReadyPromoteLockHook = undefined;
 	provisioningHeartbeatBeforeLockHook = undefined;
 	postPlanPreBranchHook = undefined;
 }
@@ -128,11 +129,21 @@ let postPlanPreBranchHook:
 	  }) => void | Promise<void>)
 	| undefined;
 
+/** @internal test-only: runs under waitForWorkerReadyOnce promote lock before ownership checks. */
+let waitForReadyPromoteLockHook: (() => void | Promise<void>) | undefined;
+
 /** @internal test-only: barrier at start of atomic joiner ready-timeout lock callback. */
 export function __setJoinerReadyTimeoutLockHookForTest(
 	hook?: () => void | Promise<void>,
 ): void {
 	joinerReadyTimeoutLockHook = hook;
+}
+
+/** @internal test-only: barrier inside ready-promote lock before owner-match checks. */
+export function __setWaitForReadyPromoteLockHookForTest(
+	hook?: () => void | Promise<void>,
+): void {
+	waitForReadyPromoteLockHook = hook;
 }
 
 /** @internal test-only: inject faults before provisioning heartbeat lock acquire. */
@@ -154,6 +165,7 @@ export function __setPostPlanPreBranchHookForTest(
 /** @internal test-only: clear provisioning ownership test hooks. */
 export function __resetProvisioningOwnershipHooksForTest(): void {
 	joinerReadyTimeoutLockHook = undefined;
+	waitForReadyPromoteLockHook = undefined;
 	provisioningHeartbeatBeforeLockHook = undefined;
 	postPlanPreBranchHook = undefined;
 }
@@ -1721,6 +1733,9 @@ class AssignmentProxy implements ChildSession {
 
 	/**
 	 * Wait until control ready.json is valid and the starting reservation is promoted.
+	 * Only the exact provisioning owner may promote starting→idle. Joiners observing
+	 * ready while the row remains starting wait/continue until the owner finalizes;
+	 * owner-token mismatch is superseded fail-closed (never strip/close a foreign owner).
 	 * Joiners renew their local deadline while the provision owner's heartbeat is fresh;
 	 * only a stale/missing owner heartbeat may fence+archive the reservation.
 	 */
@@ -1771,32 +1786,54 @@ class AssignmentProxy implements ChildSession {
 						runId: controlRunId(this.generation),
 						workerId: this.workerId,
 					});
-					const promoted = withRoleLock(this.runtime.pool.poolRoot, this.role.name, () => {
-						this.throwIfCancelled();
-						const record = this.runtime.pool.getByRole(this.role.name);
-						if (
-							!record ||
-							record.generation !== this.generation ||
-							record.workerId !== this.workerId
-						) {
-							return "superseded" as const;
-						}
-						// Live starting→idle requires pane/agent identity (pane may land after split).
-						if (!record.paneId || !record.agentName) {
-							return "wait" as const;
-						}
-						if (record.status === "starting") {
-							this.runtime.pool.upsert(
-								withoutProvisioningOwnership(record, {
-									status: "idle",
-									updatedAt: new Date(this.runtime.now()).toISOString(),
-								}),
-							);
-						}
-						this.paneId = record.paneId;
-						this.agentName = record.agentName;
-						return "ready" as const;
-					});
+					const promoted = await withRoleLockAsync(
+						this.runtime.pool.poolRoot,
+						this.role.name,
+						async () => {
+							if (waitForReadyPromoteLockHook) {
+								await waitForReadyPromoteLockHook();
+							}
+							this.throwIfCancelled();
+							const record = this.runtime.pool.getByRole(this.role.name);
+							if (
+								!record ||
+								record.generation !== this.generation ||
+								record.workerId !== this.workerId
+							) {
+								return "superseded" as const;
+							}
+							// Live ready bind requires pane/agent identity (pane may land after split).
+							if (!record.paneId || !record.agentName) {
+								return "wait" as const;
+							}
+							if (record.status === "starting") {
+								// Only the exact live provisioning owner may promote starting→idle.
+								if (this.matchesProvisioningOwnerLocked(record, this.generation)) {
+									this.runtime.pool.upsert(
+										withoutProvisioningOwnership(record, {
+											status: "idle",
+											updatedAt: new Date(this.runtime.now()).toISOString(),
+										}),
+									);
+									this.paneId = record.paneId;
+									this.agentName = record.agentName;
+									return "ready" as const;
+								}
+								// Owner token present but does not match the live reservation —
+								// fail closed without stripping/closing the foreign owner.
+								if (this.provisioningOwnerId) {
+									return "superseded" as const;
+								}
+								// Joiner (no owner token): wait until the owner finalizes/promotes.
+								return "wait" as const;
+							}
+							// Owner already finalized (idle/busy/…) — bind identity and proceed.
+							this.paneId = record.paneId;
+							this.agentName = record.agentName;
+							return "ready" as const;
+						},
+						{ now: this.runtime.now, sleep: this.runtime.sleep },
+					);
 					if (promoted === "superseded") {
 						throw new Error(`Worker ${this.workerId} superseded while waiting for ready`);
 					}
