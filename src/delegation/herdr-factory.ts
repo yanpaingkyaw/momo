@@ -26,6 +26,7 @@ import {
 	isArchivalTombstone,
 	isNonReusableLiveWorker,
 	PoolRegistry,
+	withoutProvisioningOwnership,
 	type PoolWorkerRecord,
 	type PoolWorkerState,
 } from "../herdr/pool-registry.js";
@@ -79,6 +80,8 @@ export function __resetIpcReadersForTest(): void {
 	ipcSpool.readEventsIncrementally = readEventsIncrementallyImpl;
 	ipcValidate.tryReadIpcJson = tryReadIpcJsonImpl;
 	stopAndSettleCommitHook = undefined;
+	joinerReadyTimeoutLockHook = undefined;
+	provisioningHeartbeatBeforeLockHook = undefined;
 }
 
 /** @internal test-only: override IPC readers for race/fault injection. */
@@ -99,6 +102,30 @@ export function __setStopAndSettleCommitHookForTest(
 	hook?: () => void | Promise<void>,
 ): void {
 	stopAndSettleCommitHook = hook;
+}
+
+/** @internal test-only: runs under the joiner ready-timeout role lock before liveness+fence. */
+let joinerReadyTimeoutLockHook: (() => void | Promise<void>) | undefined;
+
+/** @internal test-only: runs inside provisioning heartbeat before the role-lock acquire. */
+let provisioningHeartbeatBeforeLockHook: (() => void) | undefined;
+
+/** @internal test-only: barrier at start of atomic joiner ready-timeout lock callback. */
+export function __setJoinerReadyTimeoutLockHookForTest(
+	hook?: () => void | Promise<void>,
+): void {
+	joinerReadyTimeoutLockHook = hook;
+}
+
+/** @internal test-only: inject faults before provisioning heartbeat lock acquire. */
+export function __setProvisioningHeartbeatBeforeLockHookForTest(hook?: () => void): void {
+	provisioningHeartbeatBeforeLockHook = hook;
+}
+
+/** @internal test-only: clear provisioning ownership test hooks. */
+export function __resetProvisioningOwnershipHooksForTest(): void {
+	joinerReadyTimeoutLockHook = undefined;
+	provisioningHeartbeatBeforeLockHook = undefined;
 }
 import {
 	getHerdrPiExtensionPath,
@@ -139,6 +166,14 @@ export class ProvisioningFailure extends Error {
 		if (options.closePaneSucceeded !== undefined) {
 			this.closePaneSucceeded = options.closePaneSucceeded;
 		}
+	}
+}
+
+/** Local wait-ready deadline expired — distinct from invalid ready IPC (fail-closed). */
+export class WorkerReadyTimeoutError extends Error {
+	constructor(workerId: string) {
+		super(`Worker ${workerId} did not become ready in time`);
+		this.name = "WorkerReadyTimeoutError";
 	}
 }
 
@@ -239,6 +274,10 @@ class AssignmentProxy implements ChildSession {
 	private diagnosticFailure: string | undefined;
 	private stoppingAfterFailure = false;
 	private pollTimer: ReturnType<typeof setInterval> | undefined;
+	/** Bounded owner heartbeat while this proxy owns a `starting` reservation. */
+	private provisioningHeartbeatTimer: ReturnType<typeof setInterval> | undefined;
+	/** Unique token matching registry `provisioningOwnerId` for this provision owner. */
+	private provisioningOwnerId: string | undefined;
 	/** Set by abort(); prompt/dispatch check this and stop without publishing. */
 	private cancelRequested = false;
 	private readonly cancelWaiters: Array<() => void> = [];
@@ -309,6 +348,134 @@ class AssignmentProxy implements ChildSession {
 			clearInterval(this.pollTimer);
 			this.pollTimer = undefined;
 		}
+	}
+
+	private provisioningHeartbeatIntervalMs(): number {
+		return Math.max(25, Math.min(1_000, Math.floor(this.runtime.readyTimeoutMs / 3)));
+	}
+
+	/** Owner heartbeat older than this is treated as stale for joiner fence decisions. */
+	private provisioningHeartbeatStaleMs(): number {
+		return this.provisioningHeartbeatIntervalMs() * 3;
+	}
+
+	private startProvisioningHeartbeat(generation: number): void {
+		this.stopProvisioningHeartbeat();
+		const intervalMs = this.provisioningHeartbeatIntervalMs();
+		this.provisioningHeartbeatTimer = setInterval(() => {
+			this.beatProvisioningHeartbeat(generation);
+		}, intervalMs);
+		this.provisioningHeartbeatTimer.unref?.();
+	}
+
+	private stopProvisioningHeartbeat(): void {
+		if (this.provisioningHeartbeatTimer !== undefined) {
+			clearInterval(this.provisioningHeartbeatTimer);
+			this.provisioningHeartbeatTimer = undefined;
+		}
+	}
+
+	/** True when this proxy still owns the in-flight starting reservation. */
+	private matchesProvisioningOwnerLocked(
+		record: PoolWorkerRecord,
+		generation: number,
+	): boolean {
+		return (
+			record.generation === generation &&
+			record.workerId === this.workerId &&
+			record.status === "starting" &&
+			!!this.provisioningOwnerId &&
+			record.provisioningOwnerId === this.provisioningOwnerId
+		);
+	}
+
+	/**
+	 * Generation+worker+starting+owner fenced heartbeat. Stops the timer only when
+	 * ownership is definitively lost. Lock/registry errors are swallowed so the
+	 * interval cannot become an uncaught exception; the timer is retained to retry.
+	 */
+	private beatProvisioningHeartbeat(generation: number): void {
+		try {
+			if (this.disposed || !this.provisioningOwnerId) {
+				this.stopProvisioningHeartbeat();
+				return;
+			}
+			provisioningHeartbeatBeforeLockHook?.();
+			const ownerId = this.provisioningOwnerId;
+			const stillOwner = withRoleLock(this.runtime.pool.poolRoot, this.role.name, () => {
+				const record = this.runtime.pool.getByRole(this.role.name);
+				if (
+					!record ||
+					record.generation !== generation ||
+					record.workerId !== this.workerId ||
+					record.status !== "starting" ||
+					record.provisioningOwnerId !== ownerId
+				) {
+					return false;
+				}
+				const nowIso = new Date(this.runtime.now()).toISOString();
+				this.runtime.pool.upsert({
+					...record,
+					provisioningHeartbeatAt: nowIso,
+					updatedAt: nowIso,
+				});
+				return true;
+			});
+			if (!stillOwner) {
+				this.stopProvisioningHeartbeat();
+			}
+		} catch {
+			// Retain timer and retry on the next interval — do not declare ownership dead.
+		}
+	}
+
+	/**
+	 * Under role lock: classify provision-owner liveness for a still-starting reservation.
+	 * Missing legacy ownership metadata is treated as stale (recoverable via fence).
+	 * Future timestamps are never "fresh" (maxFutureSkewMs=0), even though the shared
+	 * heartbeat assert otherwise permits a small clock-skew grace.
+	 */
+	private classifyProvisioningOwnerLivenessLocked(
+		generation: number,
+		workerId: string,
+	): "fresh" | "stale" | "gone" {
+		const record = this.runtime.pool.getByRole(this.role.name);
+		if (
+			!record ||
+			record.generation !== generation ||
+			record.workerId !== workerId ||
+			record.status !== "starting"
+		) {
+			return "gone";
+		}
+		if (!record.provisioningOwnerId || !record.provisioningHeartbeatAt) {
+			return "stale";
+		}
+		try {
+			assertHeartbeatFreshness(record.provisioningHeartbeatAt, {
+				now: this.runtime.now(),
+				staleMs: this.provisioningHeartbeatStaleMs(),
+				maxFutureSkewMs: 0,
+			});
+			return "fresh";
+		} catch {
+			return "stale";
+		}
+	}
+
+	/**
+	 * Atomic under the caller-held role lock: classify owner liveness and, when stale,
+	 * fence/archive in the same critical section so a refresh cannot interleave.
+	 */
+	private resolveJoinerReadyTimeoutLocked(
+		generation: number,
+		workerId: string,
+	): "renew" | "fenced" | "gone" {
+		const liveness = this.classifyProvisioningOwnerLivenessLocked(generation, workerId);
+		if (liveness === "fresh") return "renew";
+		if (liveness === "gone") return "gone";
+		this.fenceStartingReservationOnJoinerFailureLocked(generation, workerId);
+		return "fenced";
 	}
 
 	private notifyCancelled(): void {
@@ -781,7 +948,12 @@ class AssignmentProxy implements ChildSession {
 	private async dispatchOrEnqueue(task: string): Promise<void> {
 		this.throwIfCancelled();
 		type Plan =
-			| { kind: "provision"; generation: number; agentName: string }
+			| {
+					kind: "provision";
+					generation: number;
+					agentName: string;
+					provisioningOwnerId: string;
+			  }
 			| {
 					kind: "wait-ready";
 					generation: number;
@@ -837,6 +1009,8 @@ class AssignmentProxy implements ChildSession {
 				if (!existing || isArchivalTombstone(existing)) {
 					const generation = this.runtime.pool.nextGeneration(this.role.name);
 					const agentName = herdrAgentNameForWorker(this.workerId);
+					const provisioningOwnerId = randomUUID();
+					const nowIso = new Date(this.runtime.now()).toISOString();
 					clearControlEphemerals(this.runtime.pool.poolRoot, this.role.name);
 					this.runtime.pool.upsert({
 						workerId: this.workerId,
@@ -846,9 +1020,11 @@ class AssignmentProxy implements ChildSession {
 						agentName,
 						status: "starting",
 						cwd: this.runtime.cwd,
-						updatedAt: new Date(this.runtime.now()).toISOString(),
+						provisioningOwnerId,
+						provisioningHeartbeatAt: nowIso,
+						updatedAt: nowIso,
 					});
-					return { kind: "provision", generation, agentName };
+					return { kind: "provision", generation, agentName, provisioningOwnerId };
 				}
 
 				// Every other non-archival live record must already be at canonical root.
@@ -896,6 +1072,8 @@ class AssignmentProxy implements ChildSession {
 		if (plan.kind === "provision") {
 			this.generation = plan.generation;
 			this.agentName = plan.agentName;
+			this.provisioningOwnerId = plan.provisioningOwnerId;
+			this.startProvisioningHeartbeat(plan.generation);
 			try {
 				this.throwIfCancelled();
 				const paneId = await this.provisionPhysicalWorker(plan.generation, plan.agentName);
@@ -920,12 +1098,7 @@ class AssignmentProxy implements ChildSession {
 					() => {
 						this.throwIfCancelled();
 						const record = this.runtime.pool.getByRole(this.role.name);
-						if (
-							!record ||
-							record.generation !== plan.generation ||
-							record.workerId !== this.workerId ||
-							record.status !== "starting"
-						) {
+						if (!record || !this.matchesProvisioningOwnerLocked(record, plan.generation)) {
 							return false;
 						}
 						this.runtime.pool.upsert({
@@ -942,6 +1115,7 @@ class AssignmentProxy implements ChildSession {
 					{ now: this.runtime.now, sleep: this.runtime.sleep },
 				);
 				if (!finalized) {
+					this.stopProvisioningHeartbeat();
 					await this.runtime.client.closePane(paneId).catch(() => undefined);
 					throw new Error("Worker provision superseded by a newer generation");
 				}
@@ -951,6 +1125,7 @@ class AssignmentProxy implements ChildSession {
 				await this.waitForWorkerReady();
 				this.throwIfCancelled();
 			} catch (error) {
+				this.stopProvisioningHeartbeat();
 				let failError: unknown = error;
 				if (
 					this.cancelRequested &&
@@ -976,10 +1151,8 @@ class AssignmentProxy implements ChildSession {
 					this.role.name,
 					() => {
 						const record = this.runtime.pool.getByRole(this.role.name);
-						if (
-							record?.generation !== plan.generation ||
-							record.workerId !== this.workerId
-						) {
+						// Same-generation replacement owners must not be mutated by a stale owner.
+						if (!record || !this.matchesProvisioningOwnerLocked(record, plan.generation)) {
 							return;
 						}
 						const nowIso = new Date(this.runtime.now()).toISOString();
@@ -1010,31 +1183,33 @@ class AssignmentProxy implements ChildSession {
 
 						if (provisionFail?.paneId) {
 							const closeSucceeded = provisionFail.closePaneSucceeded === true;
-							this.runtime.pool.upsert({
-								...record,
-								paneId,
-								agentName,
+							this.runtime.pool.upsert(
+								withoutProvisioningOwnership(record, {
+									paneId,
+									agentName,
+									status: "unhealthy",
+									paneClosed: closeSucceeded,
+									generationTombstone: Math.max(
+										record.generationTombstone,
+										plan.generation,
+									),
+									updatedAt: nowIso,
+								}),
+							);
+							return;
+						}
+
+						// Ready-timeout / post-finalization: keep pane/agent identity.
+						this.runtime.pool.upsert(
+							withoutProvisioningOwnership(record, {
 								status: "unhealthy",
-								paneClosed: closeSucceeded,
 								generationTombstone: Math.max(
 									record.generationTombstone,
 									plan.generation,
 								),
 								updatedAt: nowIso,
-							});
-							return;
-						}
-
-						// Ready-timeout / post-finalization: keep pane/agent identity.
-						this.runtime.pool.upsert({
-							...record,
-							status: "unhealthy",
-							generationTombstone: Math.max(
-								record.generationTombstone,
-								plan.generation,
-							),
-							updatedAt: nowIso,
-						});
+							}),
+						);
 					},
 					{ now: this.runtime.now, sleep: this.runtime.sleep },
 				);
@@ -1042,6 +1217,8 @@ class AssignmentProxy implements ChildSession {
 					return;
 				}
 				throw failError;
+			} finally {
+				this.stopProvisioningHeartbeat();
 			}
 			this.throwIfCancelled();
 			await this.dispatchOrEnqueue(task);
@@ -1049,108 +1226,101 @@ class AssignmentProxy implements ChildSession {
 		}
 
 		// wait-ready: join the in-flight starting reservation, then dispatch/enqueue once.
+		// Cancellation must not fence. Invalid ready IPC is fail-closed (not a local timeout).
+		// Stale ready-timeout fencing happens inside waitForWorkerReady({ asJoiner: true }).
 		this.generation = plan.generation;
 		if (plan.paneId) this.paneId = plan.paneId;
 		if (plan.agentName) this.agentName = plan.agentName;
 		this.throwIfCancelled();
-		try {
-			await this.waitForWorkerReady();
-			this.throwIfCancelled();
-			await withRoleLockAsync(
-				this.runtime.pool.poolRoot,
-				this.role.name,
-				async () => {
+		await this.waitForWorkerReady({ asJoiner: true });
+		this.throwIfCancelled();
+		await withRoleLockAsync(
+			this.runtime.pool.poolRoot,
+			this.role.name,
+			async () => {
+				this.throwIfCancelled();
+				const record = this.runtime.pool.getByRole(this.role.name);
+				if (
+					!record ||
+					record.generation !== plan.generation ||
+					record.workerId !== plan.workerId
+				) {
+					throw new Error(`Role ${this.role.name} worker superseded after ready`);
+				}
+				assertLiveWorkerCanonicalCwd(record, this.runtime.cwd, this.role.name);
+				if (!record.paneId || !record.agentName) {
+					throw new Error(`Role ${this.role.name} worker missing pane/agent after ready`);
+				}
+				this.paneId = record.paneId;
+				this.agentName = record.agentName;
+				this.physicalEnsured = true;
+				this.throwIfCancelled();
+				if (record.status === "idle") {
+					this.dispatchActiveLocked(task, record);
+					return;
+				}
+				if (record.status === "busy" || record.status === "blocked") {
 					this.throwIfCancelled();
-					const record = this.runtime.pool.getByRole(this.role.name);
-					if (
-						!record ||
-						record.generation !== plan.generation ||
-						record.workerId !== plan.workerId
-					) {
-						throw new Error(`Role ${this.role.name} worker superseded after ready`);
-					}
-					assertLiveWorkerCanonicalCwd(record, this.runtime.cwd, this.role.name);
-					if (!record.paneId || !record.agentName) {
-						throw new Error(`Role ${this.role.name} worker missing pane/agent after ready`);
-					}
-					this.paneId = record.paneId;
-					this.agentName = record.agentName;
-					this.physicalEnsured = true;
-					this.throwIfCancelled();
-					if (record.status === "idle") {
-						this.dispatchActiveLocked(task, record);
-						return;
-					}
-					if (record.status === "busy" || record.status === "blocked") {
-						this.throwIfCancelled();
-						enqueueAssignment(this.runtime.pool.poolRoot, this.role.name, {
-							assignmentId: this.assignmentId,
-							workerId: this.workerId,
-							generation: record.generation,
-							parentEpoch: this.runtime.parentEpoch,
-							task,
-						});
-						this.heartbeatExpectedAt = this.runtime.now();
-						return;
-					}
-					if (record.status === "starting") {
-						throw new Error(`Role ${this.role.name} worker still starting after ready`);
-					}
-					throw new Error(
-						`Role ${this.role.name} worker not dispatchable after ready (${record.status})`,
-					);
-				},
-				{ now: this.runtime.now, sleep: this.runtime.sleep },
-			);
-		} catch (error) {
-			// Cancellation must not fence/overwrite a live in-flight provision.
-			if (!(this.cancelRequested || this.isCancelledError(error))) {
-				this.fenceStartingReservationOnJoinerFailure(plan.generation, plan.workerId);
-			}
-			throw error;
-		}
+					enqueueAssignment(this.runtime.pool.poolRoot, this.role.name, {
+						assignmentId: this.assignmentId,
+						workerId: this.workerId,
+						generation: record.generation,
+						parentEpoch: this.runtime.parentEpoch,
+						task,
+					});
+					this.heartbeatExpectedAt = this.runtime.now();
+					return;
+				}
+				if (record.status === "starting") {
+					throw new Error(`Role ${this.role.name} worker still starting after ready`);
+				}
+				throw new Error(
+					`Role ${this.role.name} worker not dispatchable after ready (${record.status})`,
+				);
+			},
+			{ now: this.runtime.now, sleep: this.runtime.sleep },
+		);
 	}
 
 	/**
-	 * Non-cancellation wait-ready failure: generation+worker fence the still-starting
-	 * reservation. Paneful → unhealthy (retain pane/agent for cleanup). Pane-less →
-	 * archive with monotonic tombstone so N+1 can reprovision. Never overwrite a newer
-	 * generation or a non-starting status.
+	 * Fence a still-starting reservation. Caller must hold the role lock.
+	 * Paneful → unhealthy (retain pane/agent for cleanup). Pane-less → archive with
+	 * monotonic tombstone so N+1 can reprovision. Never overwrite a newer generation
+	 * or a non-starting status.
 	 */
-	private fenceStartingReservationOnJoinerFailure(
+	private fenceStartingReservationOnJoinerFailureLocked(
 		generation: number,
 		workerId: string,
 	): void {
-		withRoleLock(this.runtime.pool.poolRoot, this.role.name, () => {
-			const record = this.runtime.pool.getByRole(this.role.name);
-			if (
-				!record ||
-				record.generation !== generation ||
-				record.workerId !== workerId ||
-				record.status !== "starting"
-			) {
-				return;
-			}
-			const nowIso = new Date(this.runtime.now()).toISOString();
-			if (record.paneId) {
-				this.runtime.pool.upsert({
-					...record,
+		const record = this.runtime.pool.getByRole(this.role.name);
+		if (
+			!record ||
+			record.generation !== generation ||
+			record.workerId !== workerId ||
+			record.status !== "starting"
+		) {
+			return;
+		}
+		const nowIso = new Date(this.runtime.now()).toISOString();
+		if (record.paneId) {
+			this.runtime.pool.upsert(
+				withoutProvisioningOwnership(record, {
 					status: "unhealthy",
 					generationTombstone: Math.max(record.generationTombstone, generation),
 					updatedAt: nowIso,
-				});
-				return;
-			}
-			this.runtime.pool.archiveRoleKeepingTombstone(this.role.name, nowIso);
-			const archived = this.runtime.pool.getByRole(this.role.name);
-			if (archived && archived.generationTombstone < generation) {
-				this.runtime.pool.upsert({
-					...archived,
-					generationTombstone: generation,
-					updatedAt: nowIso,
-				});
-			}
-		});
+				}),
+			);
+			return;
+		}
+		this.runtime.pool.archiveRoleKeepingTombstone(this.role.name, nowIso);
+		const archived = this.runtime.pool.getByRole(this.role.name);
+		if (archived && archived.generationTombstone < generation) {
+			this.runtime.pool.upsert({
+				...archived,
+				generationTombstone: generation,
+				updatedAt: nowIso,
+			});
+		}
 	}
 
 	/**
@@ -1247,12 +1417,7 @@ class AssignmentProxy implements ChildSession {
 			// (before rename/start) so parent death leaves closable evidence.
 			const persisted = withRoleLock(this.runtime.pool.poolRoot, this.role.name, () => {
 				const record = this.runtime.pool.getByRole(this.role.name);
-				if (
-					!record ||
-					record.generation !== generation ||
-					record.workerId !== this.workerId ||
-					record.status !== "starting"
-				) {
+				if (!record || !this.matchesProvisioningOwnerLocked(record, generation)) {
 					return false;
 				}
 				this.runtime.pool.upsert({
@@ -1348,7 +1513,47 @@ class AssignmentProxy implements ChildSession {
 		}
 	}
 
-	private async waitForWorkerReady(): Promise<void> {
+	/**
+	 * Wait until control ready.json is valid and the starting reservation is promoted.
+	 * Joiners renew their local deadline while the provision owner's heartbeat is fresh;
+	 * only a stale/missing owner heartbeat may fence+archive the reservation.
+	 */
+	private async waitForWorkerReady(options?: { asJoiner?: boolean }): Promise<void> {
+		for (;;) {
+			try {
+				await this.waitForWorkerReadyOnce();
+				this.stopProvisioningHeartbeat();
+				return;
+			} catch (error) {
+				if (!(error instanceof WorkerReadyTimeoutError)) {
+					throw error;
+				}
+				if (!options?.asJoiner) {
+					throw error;
+				}
+				// Liveness classify + stale fence/archive must be one role-lock critical
+				// section so an owner heartbeat cannot refresh between check and fence.
+				const decision = await withRoleLockAsync(
+					this.runtime.pool.poolRoot,
+					this.role.name,
+					async () => {
+						if (joinerReadyTimeoutLockHook) {
+							await joinerReadyTimeoutLockHook();
+						}
+						return this.resolveJoinerReadyTimeoutLocked(this.generation, this.workerId);
+					},
+					{ now: this.runtime.now, sleep: this.runtime.sleep },
+				);
+				if (decision === "renew") {
+					continue;
+				}
+				// "fenced" or "gone": fail (gone leaves reservation untouched).
+				throw error;
+			}
+		}
+	}
+
+	private async waitForWorkerReadyOnce(): Promise<void> {
 		const control = workerControlPaths(this.runtime.pool.poolRoot, this.role.name);
 		const deadline = this.runtime.now() + this.runtime.readyTimeoutMs;
 		while (this.runtime.now() < deadline) {
@@ -1375,11 +1580,12 @@ class AssignmentProxy implements ChildSession {
 							return "wait" as const;
 						}
 						if (record.status === "starting") {
-							this.runtime.pool.upsert({
-								...record,
-								status: "idle",
-								updatedAt: new Date(this.runtime.now()).toISOString(),
-							});
+							this.runtime.pool.upsert(
+								withoutProvisioningOwnership(record, {
+									status: "idle",
+									updatedAt: new Date(this.runtime.now()).toISOString(),
+								}),
+							);
 						}
 						this.paneId = record.paneId;
 						this.agentName = record.agentName;
@@ -1397,13 +1603,14 @@ class AssignmentProxy implements ChildSession {
 				}
 			} catch (error) {
 				if (error instanceof IpcValidationError) {
+					// Fail closed: invalid ready is not a local timeout and must not fence.
 					throw new Error(`Worker ${this.workerId} ready IPC invalid: ${error.message}`);
 				}
 				throw error;
 			}
 			await this.runtime.sleep(50);
 		}
-		throw new Error(`Worker ${this.workerId} did not become ready in time`);
+		throw new WorkerReadyTimeoutError(this.workerId);
 	}
 
 	/** Terminal skip for prepared but never-prompted proxies (chain tails / cancel-before-prompt). */
@@ -1557,6 +1764,7 @@ class AssignmentProxy implements ChildSession {
 	async dispose(): Promise<void> {
 		this.disposed = true;
 		this.stopPolling();
+		this.stopProvisioningHeartbeat();
 		// Persistent panes are retained; proxies do not close them.
 	}
 }

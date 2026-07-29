@@ -1,7 +1,12 @@
 import { existsSync, readdirSync, rmSync } from "node:fs";
 import path from "node:path";
 import { isAgentName, ROLE_LIST, type AgentName } from "../roles.js";
-import { atomicWriteJson, ensurePrivateDir, momoCacheRoot } from "../ipc/spool.js";
+import {
+	atomicWriteJson,
+	DEFAULT_HEARTBEAT_CLOCK_SKEW_MS,
+	ensurePrivateDir,
+	momoCacheRoot,
+} from "../ipc/spool.js";
 import { parseJsonFile } from "../ipc/validate.js";
 import {
 	POOL_REGISTRY_VERSION,
@@ -43,6 +48,13 @@ export interface PoolWorkerRecord {
 	paneClosed?: boolean;
 	recoveryRequired?: boolean;
 	cwd?: string;
+	/**
+	 * Unique token for the assignment proxy that owns an in-flight `starting`
+	 * reservation. Cleared when leaving starting.
+	 */
+	provisioningOwnerId?: string;
+	/** ISO timestamp of the latest generation-fenced provisioning owner heartbeat. */
+	provisioningHeartbeatAt?: string;
 	updatedAt: string;
 }
 
@@ -105,7 +117,84 @@ export function validatePoolWorkerRecord(value: unknown, label = "worker"): Pool
 	if (typeof record.paneClosed === "boolean") out.paneClosed = record.paneClosed;
 	if (typeof record.recoveryRequired === "boolean") out.recoveryRequired = record.recoveryRequired;
 	if (typeof record.cwd === "string" && record.cwd) out.cwd = record.cwd;
+
+	const ownerRaw = record.provisioningOwnerId;
+	const heartbeatRaw = record.provisioningHeartbeatAt;
+	const ownerPresent = ownerRaw !== undefined && ownerRaw !== null;
+	const heartbeatPresent = heartbeatRaw !== undefined && heartbeatRaw !== null;
+	if (ownerPresent || heartbeatPresent) {
+		if (statusRaw !== "starting") {
+			throw new PoolRegistryCorruptionError(
+				`Pool registry ${label} provisioning ownership only allowed on starting`,
+			);
+		}
+		if (!ownerPresent || !heartbeatPresent) {
+			throw new PoolRegistryCorruptionError(
+				`Pool registry ${label} provisioning ownership fields must be a pair`,
+			);
+		}
+		const ownerId = requireNonEmptyString(ownerRaw, `${label}.provisioningOwnerId`, 128);
+		const at = requireNonEmptyString(heartbeatRaw, `${label}.provisioningHeartbeatAt`, 64);
+		const parsed = Date.parse(at);
+		if (!Number.isFinite(parsed)) {
+			throw new PoolRegistryCorruptionError(
+				`Pool registry ${label}.provisioningHeartbeatAt invalid`,
+			);
+		}
+		const ageMs = Date.now() - parsed;
+		// Fail closed on implausibly future timestamps (beyond shared clock-skew grace).
+		if (ageMs < -DEFAULT_HEARTBEAT_CLOCK_SKEW_MS) {
+			throw new PoolRegistryCorruptionError(
+				`Pool registry ${label}.provisioningHeartbeatAt is in the future`,
+			);
+		}
+		out.provisioningOwnerId = ownerId;
+		out.provisioningHeartbeatAt = at;
+	}
 	return out;
+}
+
+/**
+ * Copy a registry row without provisioning-ownership fields. Use when leaving
+ * `starting` so joiners cannot treat stale ownership metadata as live.
+ */
+export function withoutProvisioningOwnership(
+	record: PoolWorkerRecord,
+	patch: Partial<PoolWorkerRecord> = {},
+): PoolWorkerRecord {
+	const merged: PoolWorkerRecord = {
+		workerId: patch.workerId ?? record.workerId,
+		generation: patch.generation ?? record.generation,
+		generationTombstone: patch.generationTombstone ?? record.generationTombstone,
+		role: patch.role ?? record.role,
+		status: patch.status ?? record.status,
+		updatedAt: patch.updatedAt ?? record.updatedAt,
+	};
+	const paneId = patch.paneId !== undefined ? patch.paneId : record.paneId;
+	const agentName = patch.agentName !== undefined ? patch.agentName : record.agentName;
+	const activeAssignmentId =
+		patch.activeAssignmentId !== undefined
+			? patch.activeAssignmentId
+			: record.activeAssignmentId;
+	const activeParentEpoch =
+		patch.activeParentEpoch !== undefined
+			? patch.activeParentEpoch
+			: record.activeParentEpoch;
+	const uncertainWrite =
+		patch.uncertainWrite !== undefined ? patch.uncertainWrite : record.uncertainWrite;
+	const paneClosed = patch.paneClosed !== undefined ? patch.paneClosed : record.paneClosed;
+	const recoveryRequired =
+		patch.recoveryRequired !== undefined ? patch.recoveryRequired : record.recoveryRequired;
+	const cwd = patch.cwd !== undefined ? patch.cwd : record.cwd;
+	if (paneId !== undefined) merged.paneId = paneId;
+	if (agentName !== undefined) merged.agentName = agentName;
+	if (activeAssignmentId !== undefined) merged.activeAssignmentId = activeAssignmentId;
+	if (activeParentEpoch !== undefined) merged.activeParentEpoch = activeParentEpoch;
+	if (uncertainWrite !== undefined) merged.uncertainWrite = uncertainWrite;
+	if (paneClosed !== undefined) merged.paneClosed = paneClosed;
+	if (recoveryRequired !== undefined) merged.recoveryRequired = recoveryRequired;
+	if (cwd !== undefined) merged.cwd = cwd;
+	return merged;
 }
 
 /**

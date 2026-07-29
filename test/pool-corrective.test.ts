@@ -18,20 +18,34 @@ import {
 	QueueCorruptionError,
 	cancelQueuedAssignment,
 } from "../src/herdr/role-queue.js";
-import { PoolRegistry, isArchivalTombstone, isNonReusableLiveWorker, selectClosablePoolWorkers } from "../src/herdr/pool-registry.js";
+import {
+	PoolRegistry,
+	isArchivalTombstone,
+	isNonReusableLiveWorker,
+	selectClosablePoolWorkers,
+	validatePoolWorkerRecord,
+} from "../src/herdr/pool-registry.js";
 import { resolvePoolIdentity, stableWorkerId } from "../src/herdr/pool-identity.js";
 import { installMomoWorker } from "../src/extensions/worker-runtime.js";
 import { workerControlPaths, assignmentSpoolPaths } from "../src/herdr/assignment-spool.js";
 import { atomicWriteJson } from "../src/ipc/spool.js";
 import { tryReadIpcJson, validateResult } from "../src/ipc/validate.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { createHerdrChildSessionFactory } from "../src/delegation/herdr-factory.js";
+import {
+	createHerdrChildSessionFactory,
+	WorkerReadyTimeoutError,
+	__resetProvisioningOwnershipHooksForTest,
+	__setJoinerReadyTimeoutLockHookForTest,
+	__setProvisioningHeartbeatBeforeLockHookForTest,
+} from "../src/delegation/herdr-factory.js";
 import { HerdrClient } from "../src/herdr/client.js";
 import { getRole } from "../src/roles.js";
+import { DEFAULT_HEARTBEAT_CLOCK_SKEW_MS } from "../src/ipc/spool.js";
 
 const tempDirs: string[] = [];
 
 afterEach(() => {
+	__resetProvisioningOwnershipHooksForTest();
 	while (tempDirs.length > 0) {
 		const dir = tempDirs.pop();
 		if (dir) rmSync(dir, { recursive: true, force: true });
@@ -1049,6 +1063,780 @@ describe("starting reservation wait (no duplicate provision)", () => {
 		expect(after.status).toBe("starting");
 		expect(after.paneId).toBe("w1:p-live");
 		expect(after.generation).toBe(1);
+		await session.dispose();
+	}, 10_000);
+
+	it("live provision owner heartbeat: joiner timeout renews; both assignments succeed FIFO", async () => {
+		installFakeHerdrExtension();
+		const cacheRoot = tempDir("momo-owner-live-");
+		const cwd = tempDir("momo-owner-live-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		let releaseSplit!: () => void;
+		const splitGate = new Promise<void>((resolve) => {
+			releaseSplit = resolve;
+		});
+		let splitEntered = 0;
+		const client = new HerdrClient({
+			runCommand: async (_file, args) => {
+				if (args[0] === "pane" && args[1] === "split") {
+					splitEntered += 1;
+					const envArgs = args.filter((_a, i) => args[i - 1] === "--env");
+					const control =
+						envArgs.find((v) => v.startsWith("MOMO_CONTROL_DIR="))?.slice(
+							"MOMO_CONTROL_DIR=".length,
+						) ??
+						envArgs.find((v) => v.startsWith("MOMO_IPC_DIR="))?.slice("MOMO_IPC_DIR=".length);
+					const workerId =
+						envArgs.find((v) => v.startsWith("MOMO_WORKER_ID="))?.slice("MOMO_WORKER_ID=".length) ??
+						"";
+					const runId =
+						envArgs.find((v) => v.startsWith("MOMO_RUN_ID="))?.slice("MOMO_RUN_ID=".length) ?? "";
+					await splitGate;
+					if (control) {
+						mkdirSync(control, { recursive: true, mode: 0o700 });
+						atomicWriteJson(path.join(control, "ready.json"), {
+							version: 1,
+							runId,
+							workerId,
+							readyAt: new Date().toISOString(),
+						});
+					}
+					return {
+						code: 0,
+						stdout: JSON.stringify({
+							id: "s",
+							result: { pane: { pane_id: "w1:p-owned" } },
+						}),
+						stderr: "",
+					};
+				}
+				if (args[0] === "agent" && args[1] === "start") {
+					return {
+						code: 0,
+						stdout: JSON.stringify({
+							id: "s",
+							result: {
+								pane_id: "w1:p-owned",
+								name: args[2],
+								agent: "pi",
+								interactive_ready: true,
+							},
+						}),
+						stderr: "",
+					};
+				}
+				return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+			},
+		});
+		const sleep = async (ms: number) => {
+			await new Promise<void>((r) => setTimeout(r, Math.min(ms, 15)));
+		};
+		const factoryOpts = {
+			cwd,
+			parentPaneId: "w1:p0",
+			parentId: "parent-owner-live",
+			client,
+			poolRegistry: pool,
+			cacheRoot,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+			pollIntervalMs: 20,
+			// Joiner local deadline is shorter than the blocked split hold.
+			readyTimeoutMs: 90,
+			sleep,
+		} as const;
+		const factoryA = createHerdrChildSessionFactory(factoryOpts);
+		const factoryB = createHerdrChildSessionFactory({
+			...factoryOpts,
+			parentId: "parent-owner-live-b",
+			parentEpoch: "epoch-b",
+		});
+		const sessionA = await factoryA({ cwd, role: getRole("scout") });
+		const promptA = sessionA.prompt("task-a");
+		for (let i = 0; i < 80 && splitEntered < 1; i += 1) await sleep(10);
+		expect(splitEntered).toBe(1);
+		const mid = pool.getByRole("scout")!;
+		expect(mid.status).toBe("starting");
+		expect(mid.provisioningOwnerId).toBeTruthy();
+		expect(mid.provisioningHeartbeatAt).toBeTruthy();
+
+		const sessionB = await factoryB({ cwd, role: getRole("scout") });
+		const promptB = sessionB.prompt("task-b");
+		// Hold past at least one joiner readyTimeout while owner keeps heartbeating.
+		await sleep(220);
+		expect(pool.getByRole("scout")?.status).toBe("starting");
+		expect(pool.getByRole("scout")?.provisioningOwnerId).toBe(mid.provisioningOwnerId);
+		expect(isArchivalTombstone(pool.getByRole("scout")!)).toBe(false);
+
+		releaseSplit();
+		await promptA;
+		await promptB;
+		const record = pool.getByRole("scout")!;
+		expect(record.status).toBe("busy");
+		expect(record.paneId).toBe("w1:p-owned");
+		expect(record.provisioningOwnerId).toBeUndefined();
+		expect(record.provisioningHeartbeatAt).toBeUndefined();
+		expect(queueCount(pool.poolRoot, "scout")).toBe(1);
+		expect(listQueue(pool.poolRoot, "scout")[0]?.task).toBe("task-b");
+		await sessionA.dispose();
+		await sessionB.dispose();
+	}, 20_000);
+
+	it("dead owner stale heartbeat: joiner timeout fences and allows reprovision", async () => {
+		installFakeHerdrExtension();
+		const cacheRoot = tempDir("momo-owner-stale-");
+		const cwd = tempDir("momo-owner-stale-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const workerId = stableWorkerId(identity.poolKey, "scout");
+		const staleAt = new Date(Date.now() - 60_000).toISOString();
+		pool.upsert({
+			workerId,
+			generation: 1,
+			generationTombstone: 1,
+			role: "scout",
+			agentName: "momo_scout",
+			status: "starting",
+			cwd: identity.canonicalRoot,
+			provisioningOwnerId: "dead-owner-token",
+			provisioningHeartbeatAt: staleAt,
+			updatedAt: staleAt,
+		});
+		const client = new HerdrClient({
+			runCommand: async () => ({
+				code: 0,
+				stdout: JSON.stringify({ id: "ok", result: {} }),
+				stderr: "",
+			}),
+		});
+		const factory = createHerdrChildSessionFactory({
+			cwd,
+			parentPaneId: "w1:p0",
+			parentId: "parent-owner-stale",
+			client,
+			poolRegistry: pool,
+			cacheRoot,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+			readyTimeoutMs: 80,
+			sleep: async (ms) => {
+				await new Promise((r) => setTimeout(r, Math.min(ms, 20)));
+			},
+		});
+		const session = await factory({ cwd, role: getRole("scout") });
+		await expect(session.prompt("join")).rejects.toBeInstanceOf(WorkerReadyTimeoutError);
+		const after = pool.getByRole("scout")!;
+		expect(isArchivalTombstone(after)).toBe(true);
+		expect(after.provisioningOwnerId).toBeUndefined();
+		expect(after.provisioningHeartbeatAt).toBeUndefined();
+		expect(pool.nextGeneration("scout")).toBe(after.generationTombstone + 1);
+		await session.dispose();
+	}, 10_000);
+
+	it("invalid ready IPC fails closed without fencing a live starting owner", async () => {
+		installFakeHerdrExtension();
+		const cacheRoot = tempDir("momo-owner-bad-ready-");
+		const cwd = tempDir("momo-owner-bad-ready-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const workerId = stableWorkerId(identity.poolKey, "scout");
+		const nowIso = new Date().toISOString();
+		pool.upsert({
+			workerId,
+			generation: 1,
+			generationTombstone: 1,
+			role: "scout",
+			paneId: "w1:p-bad-ready",
+			agentName: "momo_scout",
+			status: "starting",
+			cwd: identity.canonicalRoot,
+			provisioningOwnerId: "live-owner",
+			provisioningHeartbeatAt: nowIso,
+			updatedAt: nowIso,
+		});
+		const control = workerControlPaths(pool.poolRoot, "scout");
+		mkdirSync(control.root, { recursive: true, mode: 0o700 });
+		atomicWriteJson(control.ready, {
+			version: 1,
+			runId: "wrong-run",
+			workerId: "wrong-worker",
+			readyAt: nowIso,
+		});
+		const client = new HerdrClient({
+			runCommand: async () => ({
+				code: 0,
+				stdout: JSON.stringify({ id: "ok", result: {} }),
+				stderr: "",
+			}),
+		});
+		const factory = createHerdrChildSessionFactory({
+			cwd,
+			parentPaneId: "w1:p0",
+			parentId: "parent-bad-ready",
+			client,
+			poolRegistry: pool,
+			cacheRoot,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+			readyTimeoutMs: 5_000,
+			sleep: async (ms) => {
+				await new Promise((r) => setTimeout(r, Math.min(ms, 20)));
+			},
+		});
+		const session = await factory({ cwd, role: getRole("scout") });
+		await expect(session.prompt("join")).rejects.toThrow(/ready IPC invalid/i);
+		const after = pool.getByRole("scout")!;
+		expect(after.status).toBe("starting");
+		expect(after.generation).toBe(1);
+		expect(after.paneId).toBe("w1:p-bad-ready");
+		expect(after.provisioningOwnerId).toBe("live-owner");
+		await session.dispose();
+	}, 10_000);
+
+	it("provisioning heartbeat cannot mutate newer generation or foreign owner", async () => {
+		installFakeHerdrExtension();
+		const cacheRoot = tempDir("momo-owner-fence-hb-");
+		const cwd = tempDir("momo-owner-fence-hb-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		let releaseSplit!: () => void;
+		const splitGate = new Promise<void>((resolve) => {
+			releaseSplit = resolve;
+		});
+		let splitEntered = 0;
+		const client = new HerdrClient({
+			runCommand: async (_file, args) => {
+				if (args[0] === "pane" && args[1] === "split") {
+					splitEntered += 1;
+					await splitGate;
+					return {
+						code: 0,
+						stdout: JSON.stringify({
+							id: "s",
+							result: { pane: { pane_id: "w1:p-hb" } },
+						}),
+						stderr: "",
+					};
+				}
+				return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+			},
+		});
+		const sleep = async (ms: number) => {
+			await new Promise<void>((r) => setTimeout(r, Math.min(ms, 15)));
+		};
+		const factory = createHerdrChildSessionFactory({
+			cwd,
+			parentPaneId: "w1:p0",
+			parentId: "parent-hb-fence",
+			client,
+			poolRegistry: pool,
+			cacheRoot,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+			readyTimeoutMs: 120,
+			sleep,
+		});
+		const session = await factory({ cwd, role: getRole("scout") });
+		const prompt = session.prompt("task");
+		for (let i = 0; i < 80 && splitEntered < 1; i += 1) await sleep(10);
+		expect(splitEntered).toBe(1);
+		const owned = pool.getByRole("scout")!;
+		expect(owned.provisioningOwnerId).toBeTruthy();
+		// Wait for at least one owner heartbeat tick.
+		let advanced = owned.provisioningHeartbeatAt!;
+		for (let i = 0; i < 40; i += 1) {
+			await sleep(20);
+			const hb = pool.getByRole("scout")?.provisioningHeartbeatAt;
+			if (hb && hb !== owned.provisioningHeartbeatAt) {
+				advanced = hb;
+				break;
+			}
+		}
+		expect(advanced).not.toBe(owned.provisioningHeartbeatAt);
+
+		const frozenAt = new Date(Date.now() - 1_000).toISOString();
+		pool.upsert({
+			...owned,
+			generation: owned.generation + 1,
+			generationTombstone: owned.generation + 1,
+			provisioningOwnerId: "foreign-owner",
+			provisioningHeartbeatAt: frozenAt,
+			updatedAt: frozenAt,
+		});
+		await sleep(200);
+		const after = pool.getByRole("scout")!;
+		expect(after.generation).toBe(owned.generation + 1);
+		expect(after.provisioningOwnerId).toBe("foreign-owner");
+		expect(after.provisioningHeartbeatAt).toBe(frozenAt);
+
+		releaseSplit();
+		await prompt.catch(() => undefined);
+		await session.dispose();
+		// Dispose stops the timer; foreign ownership must remain untouched.
+		await sleep(120);
+		const final = pool.getByRole("scout")!;
+		expect(final.provisioningOwnerId === "foreign-owner" || final.generation === 0).toBe(true);
+	}, 15_000);
+
+	it("provisioning ownership metadata clears on leave-starting and timers stop", async () => {
+		installFakeHerdrExtension();
+		const cacheRoot = tempDir("momo-owner-clear-");
+		const cwd = tempDir("momo-owner-clear-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const client = new HerdrClient({
+			runCommand: async (_file, args) => {
+				if (args[0] === "pane" && args[1] === "split") {
+					const envArgs = args.filter((_a, i) => args[i - 1] === "--env");
+					const control =
+						envArgs.find((v) => v.startsWith("MOMO_CONTROL_DIR="))?.slice(
+							"MOMO_CONTROL_DIR=".length,
+						) ??
+						envArgs.find((v) => v.startsWith("MOMO_IPC_DIR="))?.slice("MOMO_IPC_DIR=".length);
+					const workerId =
+						envArgs.find((v) => v.startsWith("MOMO_WORKER_ID="))?.slice("MOMO_WORKER_ID=".length) ??
+						"";
+					const runId =
+						envArgs.find((v) => v.startsWith("MOMO_RUN_ID="))?.slice("MOMO_RUN_ID=".length) ?? "";
+					if (control) {
+						mkdirSync(control, { recursive: true, mode: 0o700 });
+						atomicWriteJson(path.join(control, "ready.json"), {
+							version: 1,
+							runId,
+							workerId,
+							readyAt: new Date().toISOString(),
+						});
+					}
+					return {
+						code: 0,
+						stdout: JSON.stringify({
+							id: "s",
+							result: { pane: { pane_id: "w1:p-clear" } },
+						}),
+						stderr: "",
+					};
+				}
+				if (args[0] === "agent" && args[1] === "start") {
+					return {
+						code: 0,
+						stdout: JSON.stringify({
+							id: "s",
+							result: {
+								pane_id: "w1:p-clear",
+								name: args[2],
+								agent: "pi",
+								interactive_ready: true,
+							},
+						}),
+						stderr: "",
+					};
+				}
+				return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+			},
+		});
+		const factory = createHerdrChildSessionFactory({
+			cwd,
+			parentPaneId: "w1:p0",
+			parentId: "parent-owner-clear",
+			client,
+			poolRegistry: pool,
+			cacheRoot,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+			readyTimeoutMs: 2_000,
+			pollIntervalMs: 20,
+			sleep: async (ms) => {
+				await new Promise((r) => setTimeout(r, Math.min(ms, 15)));
+			},
+		});
+		const session = await factory({ cwd, role: getRole("scout") });
+		await session.prompt("task");
+		const busy = pool.getByRole("scout")!;
+		expect(busy.status).toBe("busy");
+		expect(busy.provisioningOwnerId).toBeUndefined();
+		expect(busy.provisioningHeartbeatAt).toBeUndefined();
+		const snapshot = { ...busy };
+		await new Promise((r) => setTimeout(r, 150));
+		const after = pool.getByRole("scout")!;
+		expect(after.provisioningOwnerId).toBeUndefined();
+		expect(after.provisioningHeartbeatAt).toBeUndefined();
+		expect(after.updatedAt).toBe(snapshot.updatedAt);
+		await session.dispose();
+	}, 15_000);
+
+	it("validatePoolWorkerRecord requires ownership as a starting-only pair", () => {
+		const base = {
+			workerId: "w".repeat(16),
+			generation: 1,
+			generationTombstone: 1,
+			role: "scout",
+			status: "starting",
+			updatedAt: new Date().toISOString(),
+			provisioningOwnerId: "owner-1",
+			provisioningHeartbeatAt: new Date().toISOString(),
+		};
+		const ok = validatePoolWorkerRecord(base);
+		expect(ok.provisioningOwnerId).toBe("owner-1");
+		expect(validatePoolWorkerRecord({ ...base, provisioningOwnerId: undefined, provisioningHeartbeatAt: undefined }).provisioningOwnerId).toBeUndefined();
+		expect(() =>
+			validatePoolWorkerRecord({
+				...base,
+				provisioningHeartbeatAt: "not-a-date",
+			}),
+		).toThrow(/provisioningHeartbeatAt/);
+		expect(() =>
+			validatePoolWorkerRecord({
+				...base,
+				provisioningHeartbeatAt: undefined,
+			}),
+		).toThrow(/pair/i);
+		expect(() =>
+			validatePoolWorkerRecord({
+				...base,
+				provisioningOwnerId: undefined,
+			}),
+		).toThrow(/pair/i);
+		expect(() =>
+			validatePoolWorkerRecord({
+				...base,
+				status: "idle",
+				paneId: "w1:p1",
+				agentName: "momo_scout",
+			}),
+		).toThrow(/only allowed on starting/i);
+		expect(() =>
+			validatePoolWorkerRecord({
+				...base,
+				provisioningHeartbeatAt: new Date(
+					Date.now() + DEFAULT_HEARTBEAT_CLOCK_SKEW_MS + 60_000,
+				).toISOString(),
+			}),
+		).toThrow(/future/i);
+	});
+
+	it("atomic joiner stale decision fences before concurrent refresh can interleave", async () => {
+		installFakeHerdrExtension();
+		const cacheRoot = tempDir("momo-owner-atomic-");
+		const cwd = tempDir("momo-owner-atomic-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const workerId = stableWorkerId(identity.poolKey, "scout");
+		const staleAt = new Date(Date.now() - 60_000).toISOString();
+		pool.upsert({
+			workerId,
+			generation: 1,
+			generationTombstone: 1,
+			role: "scout",
+			agentName: "momo_scout",
+			status: "starting",
+			cwd: identity.canonicalRoot,
+			provisioningOwnerId: "stale-owner",
+			provisioningHeartbeatAt: staleAt,
+			updatedAt: staleAt,
+		});
+
+		let refreshSawStatus: string | undefined;
+		let refreshWroteFresh = false;
+		let refreshPromise: Promise<void> | undefined;
+		__setJoinerReadyTimeoutLockHookForTest(async () => {
+			refreshPromise = withRoleLockAsync(pool.poolRoot, "scout", () => {
+				const record = pool.getByRole("scout")!;
+				refreshSawStatus = record.status;
+				if (record.status === "starting") {
+					const nowIso = new Date().toISOString();
+					pool.upsert({
+						...record,
+						provisioningHeartbeatAt: nowIso,
+						updatedAt: nowIso,
+					});
+					refreshWroteFresh = true;
+				}
+			});
+			// Let the refresh acquire attempt block on the held role lock.
+			await new Promise((r) => setTimeout(r, 40));
+		});
+
+		const client = new HerdrClient({
+			runCommand: async () => ({
+				code: 0,
+				stdout: JSON.stringify({ id: "ok", result: {} }),
+				stderr: "",
+			}),
+		});
+		const factory = createHerdrChildSessionFactory({
+			cwd,
+			parentPaneId: "w1:p0",
+			parentId: "parent-owner-atomic",
+			client,
+			poolRegistry: pool,
+			cacheRoot,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+			readyTimeoutMs: 80,
+			sleep: async (ms) => {
+				await new Promise((r) => setTimeout(r, Math.min(ms, 20)));
+			},
+		});
+		const session = await factory({ cwd, role: getRole("scout") });
+		await expect(session.prompt("join")).rejects.toBeInstanceOf(WorkerReadyTimeoutError);
+		expect(refreshPromise).toBeTruthy();
+		await refreshPromise;
+		expect(refreshWroteFresh).toBe(false);
+		expect(refreshSawStatus).not.toBe("starting");
+		const after = pool.getByRole("scout")!;
+		expect(isArchivalTombstone(after)).toBe(true);
+		await session.dispose();
+	}, 15_000);
+
+	it("provisioning heartbeat lock errors are not uncaught and retry keeps ownership live", async () => {
+		installFakeHerdrExtension();
+		const cacheRoot = tempDir("momo-owner-hb-err-");
+		const cwd = tempDir("momo-owner-hb-err-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		let releaseSplit!: () => void;
+		const splitGate = new Promise<void>((resolve) => {
+			releaseSplit = resolve;
+		});
+		let splitEntered = 0;
+		const client = new HerdrClient({
+			runCommand: async (_file, args) => {
+				if (args[0] === "pane" && args[1] === "split") {
+					splitEntered += 1;
+					await splitGate;
+					return {
+						code: 0,
+						stdout: JSON.stringify({
+							id: "s",
+							result: { pane: { pane_id: "w1:p-hb-err" } },
+						}),
+						stderr: "",
+					};
+				}
+				return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+			},
+		});
+		let faults = 0;
+		__setProvisioningHeartbeatBeforeLockHookForTest(() => {
+			faults += 1;
+			if (faults <= 2) {
+				throw new Error("injected heartbeat lock fault");
+			}
+		});
+		const sleep = async (ms: number) => {
+			await new Promise<void>((r) => setTimeout(r, Math.min(ms, 15)));
+		};
+		const factory = createHerdrChildSessionFactory({
+			cwd,
+			parentPaneId: "w1:p0",
+			parentId: "parent-hb-err",
+			client,
+			poolRegistry: pool,
+			cacheRoot,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+			readyTimeoutMs: 120,
+			sleep,
+		});
+		const session = await factory({ cwd, role: getRole("scout") });
+		const prompt = session.prompt("task");
+		for (let i = 0; i < 80 && splitEntered < 1; i += 1) await sleep(10);
+		expect(splitEntered).toBe(1);
+		const owned = pool.getByRole("scout")!;
+		expect(owned.status).toBe("starting");
+		expect(owned.provisioningOwnerId).toBeTruthy();
+		let recoveredHb: string | undefined;
+		for (let i = 0; i < 60; i += 1) {
+			await sleep(20);
+			const hb = pool.getByRole("scout")?.provisioningHeartbeatAt;
+			if (hb && hb !== owned.provisioningHeartbeatAt) {
+				recoveredHb = hb;
+				break;
+			}
+		}
+		expect(faults).toBeGreaterThanOrEqual(2);
+		expect(recoveredHb).toBeTruthy();
+		expect(pool.getByRole("scout")?.status).toBe("starting");
+		expect(pool.getByRole("scout")?.provisioningOwnerId).toBe(owned.provisioningOwnerId);
+		releaseSplit();
+		await prompt.catch(() => undefined);
+		await session.dispose();
+	}, 15_000);
+
+	it("same-generation owner replacement: stale owner cannot persist pane or rollback", async () => {
+		installFakeHerdrExtension();
+		const cacheRoot = tempDir("momo-owner-replace-");
+		const cwd = tempDir("momo-owner-replace-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		let releaseSplit!: () => void;
+		const splitGate = new Promise<void>((resolve) => {
+			releaseSplit = resolve;
+		});
+		let splitEntered = 0;
+		const closed: string[] = [];
+		const client = new HerdrClient({
+			runCommand: async (_file, args) => {
+				if (args[0] === "pane" && args[1] === "split") {
+					splitEntered += 1;
+					await splitGate;
+					return {
+						code: 0,
+						stdout: JSON.stringify({
+							id: "s",
+							result: { pane: { pane_id: "w1:p-stale-owner" } },
+						}),
+						stderr: "",
+					};
+				}
+				if (args[0] === "pane" && args[1] === "close") {
+					closed.push(String(args[2] ?? ""));
+					return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+				}
+				return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+			},
+		});
+		const sleep = async (ms: number) => {
+			await new Promise<void>((r) => setTimeout(r, Math.min(ms, 15)));
+		};
+		const factory = createHerdrChildSessionFactory({
+			cwd,
+			parentPaneId: "w1:p0",
+			parentId: "parent-owner-replace",
+			client,
+			poolRegistry: pool,
+			cacheRoot,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+			readyTimeoutMs: 2_000,
+			sleep,
+		});
+		const session = await factory({ cwd, role: getRole("scout") });
+		const prompt = session.prompt("task");
+		for (let i = 0; i < 80 && splitEntered < 1; i += 1) await sleep(10);
+		expect(splitEntered).toBe(1);
+		const original = pool.getByRole("scout")!;
+		expect(original.provisioningOwnerId).toBeTruthy();
+		const replacementOwner = "replacement-owner-token";
+		const nowIso = new Date().toISOString();
+		pool.upsert({
+			...original,
+			provisioningOwnerId: replacementOwner,
+			provisioningHeartbeatAt: nowIso,
+			updatedAt: nowIso,
+			// Still starting at the same generation — only ownership changed.
+		});
+		releaseSplit();
+		await expect(prompt).rejects.toThrow(/superseded after pane split/i);
+		const after = pool.getByRole("scout")!;
+		expect(after.status).toBe("starting");
+		expect(after.generation).toBe(original.generation);
+		expect(after.provisioningOwnerId).toBe(replacementOwner);
+		expect(after.paneId).toBeUndefined();
+		expect(closed).toContain("w1:p-stale-owner");
+		await session.dispose();
+	}, 15_000);
+
+	it("future provisioning heartbeat within skew is not classified fresh", async () => {
+		installFakeHerdrExtension();
+		const cacheRoot = tempDir("momo-owner-future-");
+		const cwd = tempDir("momo-owner-future-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const workerId = stableWorkerId(identity.poolKey, "scout");
+		// Within shared skew grace for registry storage, but must not count as fresh.
+		const futureAt = new Date(Date.now() + Math.floor(DEFAULT_HEARTBEAT_CLOCK_SKEW_MS / 2)).toISOString();
+		pool.upsert({
+			workerId,
+			generation: 1,
+			generationTombstone: 1,
+			role: "scout",
+			agentName: "momo_scout",
+			status: "starting",
+			cwd: identity.canonicalRoot,
+			provisioningOwnerId: "future-owner",
+			provisioningHeartbeatAt: futureAt,
+			updatedAt: futureAt,
+		});
+		const client = new HerdrClient({
+			runCommand: async () => ({
+				code: 0,
+				stdout: JSON.stringify({ id: "ok", result: {} }),
+				stderr: "",
+			}),
+		});
+		const factory = createHerdrChildSessionFactory({
+			cwd,
+			parentPaneId: "w1:p0",
+			parentId: "parent-owner-future",
+			client,
+			poolRegistry: pool,
+			cacheRoot,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+			readyTimeoutMs: 80,
+			sleep: async (ms) => {
+				await new Promise((r) => setTimeout(r, Math.min(ms, 20)));
+			},
+		});
+		const session = await factory({ cwd, role: getRole("scout") });
+		await expect(session.prompt("join")).rejects.toBeInstanceOf(WorkerReadyTimeoutError);
+		expect(isArchivalTombstone(pool.getByRole("scout")!)).toBe(true);
 		await session.dispose();
 	}, 10_000);
 
