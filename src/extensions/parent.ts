@@ -77,6 +77,26 @@ export function __adoptionGraceRecheckCountForTest(): number {
 	return adoptionGraceRechecks.size;
 }
 
+/**
+ * @internal test-only: runs under each cleanup role lock after acquire, before
+ * fresh eligibility / closePane / agentGet / terminalize / lease operations.
+ */
+let cleanupRoleLockEnteredHook:
+	| ((snapshot: PoolWorkerRecord) => void | Promise<void>)
+	| undefined;
+
+/** @internal test-only: mutate registry under the cleanup role lock for race tests. */
+export function __setCleanupRoleLockEnteredHookForTest(
+	hook?: (snapshot: PoolWorkerRecord) => void | Promise<void>,
+): void {
+	cleanupRoleLockEnteredHook = hook;
+}
+
+/** @internal test-only: clear cleanup role-lock race hook. */
+export function __resetCleanupRoleLockEnteredHookForTest(): void {
+	cleanupRoleLockEnteredHook = undefined;
+}
+
 function adoptionGraceRecheckKey(poolRoot: string, worker: PoolWorkerRecord): string {
 	return `${poolRoot}:${worker.role}:${worker.generation}:${worker.activeAssignmentId ?? ""}`;
 }
@@ -246,6 +266,8 @@ export function installMomoParent(pi: ExtensionAPI, options: InstallMomoParentOp
 			const uncertain = workers.filter(
 				(worker) => worker.status === "uncertain" && !(worker.paneClosed && worker.recoveryRequired),
 			);
+			/** Uncertain rows included in the force-confirm dialog (empty if none / cancelled). */
+			const confirmedUncertainKeys = new Set<string>();
 			if (force && uncertain.length > 0) {
 				const confirmed = await ctx.ui?.confirm?.(
 					"Force-clean uncertain workers?",
@@ -255,6 +277,9 @@ export function installMomoParent(pi: ExtensionAPI, options: InstallMomoParentOp
 					ctx.ui?.notify?.("Force cleanup cancelled.");
 					return;
 				}
+				for (const worker of uncertain) {
+					confirmedUncertainKeys.add(`${worker.workerId}:${worker.generation}`);
+				}
 			}
 
 			const { closable, refused } = selectClosablePoolWorkers(workers, { force });
@@ -263,9 +288,52 @@ export function installMomoParent(pi: ExtensionAPI, options: InstallMomoParentOp
 			for (const worker of closable) {
 				try {
 					await withRoleLockAsync(pool.poolRoot, worker.role, async () => {
+						if (cleanupRoleLockEnteredHook) {
+							await cleanupRoleLockEnteredHook(worker);
+						}
 						const current = pool.getByRole(worker.role);
-						if (!current || current.generation !== worker.generation) return;
+						// Stale pool.list eligibility is not authoritative — re-fence live row.
+						if (
+							!current ||
+							current.generation !== worker.generation ||
+							current.workerId !== worker.workerId
+						) {
+							notes.push(
+								`refused ${worker.workerId}: generation/worker superseded before cleanup`,
+							);
+							return;
+						}
+						const liveEligibility = selectClosablePoolWorkers([current], { force });
+						if (liveEligibility.closable.length === 0) {
+							const reason =
+								current.status === "busy" ||
+								current.status === "blocked" ||
+								current.status === "starting"
+									? `status is ${current.status}`
+									: current.status === "uncertain" && !force
+										? "uncertain requires --force"
+										: isArchivalTombstone(current)
+											? "archival tombstone"
+											: current.paneClosed && current.recoveryRequired
+												? "recoveryRequired"
+												: !current.paneId
+													? "pane-less / ineligible"
+													: `no longer eligible (status=${current.status})`;
+							notes.push(`refused ${current.workerId}: ${reason}`);
+							return;
+						}
 						if (current.status === "uncertain") {
+							const uncertainKey = `${current.workerId}:${current.generation}`;
+							// New uncertainty after the initial snapshot/confirmation must not
+							// be force-cleaned without an explicit rerun confirm.
+							if (!confirmedUncertainKeys.has(uncertainKey)) {
+								notes.push(
+									force
+										? `refused ${current.workerId}: became uncertain after confirmation — rerun /momo-cleanup --force to confirm`
+										: `refused ${current.workerId}: uncertain requires --force`,
+								);
+								return;
+							}
 							// Do not treat a missing lease as proof of safety: it
 							// can be a corrupted/partially removed lease.
 							const leaseCwd = current.cwd ?? identity.canonicalRoot;
