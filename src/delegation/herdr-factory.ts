@@ -46,10 +46,13 @@ import {
 	commitClaim,
 	enqueueAssignment,
 	listClaiming,
+	roleHasPendingWorkAheadOfAssignment,
 	withRoleLock,
 	withRoleLockAsync,
 } from "../herdr/role-queue.js";
 import { completeCleanAssignmentLocked } from "../herdr/terminal-transition.js";
+import { publishAssignmentCommandLocked } from "../herdr/dispatch-publish.js";
+import { withPaneLifecycleLockAsync } from "../herdr/pane-lifecycle-lock.js";
 import { assertRolePoolPristineForProvision, RolePoolEvidenceError } from "../herdr/role-pool-evidence.js";
 import {
 	OrphanPaneEvidencePersistenceError,
@@ -1310,8 +1313,7 @@ class AssignmentProxy implements ChildSession {
 
 				this.throwIfCancelled();
 				if (existing.status === "idle") {
-					this.assertBoundPolicyBeforeDispatch(existing);
-					this.dispatchActiveLocked(task, existing);
+					this.dispatchIdleOrEnqueueLocked(task, existing);
 					return { kind: "done" };
 				}
 
@@ -1653,8 +1655,7 @@ class AssignmentProxy implements ChildSession {
 				this.physicalEnsured = true;
 				this.throwIfCancelled();
 				if (record.status === "idle") {
-					this.assertBoundPolicyBeforeDispatch(record);
-					this.dispatchActiveLocked(task, record);
+					this.dispatchIdleOrEnqueueLocked(task, record);
 					return;
 				}
 				if (record.status === "busy" || record.status === "blocked") {
@@ -1728,6 +1729,31 @@ class AssignmentProxy implements ChildSession {
 	 * 1) command.json  2) registry busy  3) active.json (commit point).
 	 * Registry failure must not publish active.json.
 	 */
+	private dispatchIdleOrEnqueueLocked(task: string, record: PoolWorkerRecord): void {
+		this.assertBoundPolicyBeforeDispatch(record);
+		if (
+			roleHasPendingWorkAheadOfAssignment(
+				this.runtime.pool.poolRoot,
+				this.role.name,
+				record.generation,
+				this.assignmentId,
+			)
+		) {
+			this.throwIfCancelled();
+			enqueueAssignment(this.runtime.pool.poolRoot, this.role.name, {
+				assignmentId: this.assignmentId,
+				workerId: this.workerId,
+				generation: record.generation,
+				parentEpoch: this.runtime.parentEpoch,
+				task,
+				...this.ipcFieldsForAssignment(),
+			});
+			this.heartbeatExpectedAt = this.runtime.now();
+			return;
+		}
+		this.dispatchActiveLocked(task, record);
+	}
+
 	private dispatchActiveLocked(task: string, record: PoolWorkerRecord): void {
 		if (record.generation !== this.generation || record.workerId !== this.workerId) {
 			throw new Error("dispatch generation/worker fence mismatch");
@@ -1736,39 +1762,30 @@ class AssignmentProxy implements ChildSession {
 		if (!record.paneId || !record.agentName) {
 			throw new Error("dispatch requires live pane/agent identity");
 		}
-		const paths = ensureAssignmentSpool(
+		ensureAssignmentSpool(
 			this.runtime.pool.poolRoot,
 			this.role.name,
 			this.assignmentId,
 		);
-		atomicWriteJson(paths.command, {
-			version: 1,
-			type: "prompt",
-			task,
-			issuedAt: new Date(this.runtime.now()).toISOString(),
-			runId: this.assignmentId,
+		const ipcFields = this.ipcFieldsForAssignment();
+		const outcome = publishAssignmentCommandLocked({
+			pool: this.runtime.pool,
+			poolRoot: this.runtime.pool.poolRoot,
+			role: this.role.name,
 			workerId: this.workerId,
 			generation: this.generation,
-			parentEpoch: this.runtime.parentEpoch,
-			...this.ipcFieldsForAssignment(),
-		});
-		this.runtime.pool.upsert({
-			...record,
-			status: "busy",
-			activeAssignmentId: this.assignmentId,
-			activeParentEpoch: this.runtime.parentEpoch,
-			updatedAt: new Date(this.runtime.now()).toISOString(),
-		});
-		const control = workerControlPaths(this.runtime.pool.poolRoot, this.role.name);
-		const active: WorkerActivePointer = {
-			version: 1,
 			assignmentId: this.assignmentId,
-			generation: this.generation,
 			parentEpoch: this.runtime.parentEpoch,
-			dispatchedAt: new Date(this.runtime.now()).toISOString(),
-		};
-		atomicWriteJson(control.active, active);
-		// After durable dispatch, this prompted assignment should expect heartbeats.
+			task,
+			now: () => this.runtime.now(),
+			rollbackRecord: record,
+			...(ipcFields.capability !== undefined || ipcFields.modelPolicy !== undefined
+				? { commandExtras: ipcFields }
+				: {}),
+		});
+		if (!outcome.ok) {
+			throw new Error(`dispatch publication failed (${outcome.reason})`);
+		}
 		this.heartbeatExpectedAt = this.runtime.now();
 	}
 
@@ -1802,59 +1819,62 @@ class AssignmentProxy implements ChildSession {
 
 		let paneId: string | undefined;
 		try {
-			const split = await this.runtime.client.splitPane({
-				pane: this.runtime.parentPaneId,
-				direction: this.runtime.direction,
-				cwd: this.runtime.cwd,
-				noFocus: true,
-				env: workerEnv,
-			});
-			paneId = split.paneId;
-			this.paneId = paneId;
-			const splitPaneId = split.paneId;
-			this.throwIfCancelled();
-
-			// Persist paneId into the starting reservation immediately after split
-			// (before rename/start) so parent death leaves closable evidence.
-			const persisted = withRoleLock(this.runtime.pool.poolRoot, this.role.name, () => {
-				const record = this.runtime.pool.getByRole(this.role.name);
-				if (!record || !this.matchesProvisioningOwnerLocked(record, generation)) {
-					return false;
-				}
-				this.runtime.pool.upsert({
-					...record,
-					paneId: splitPaneId,
-					agentName,
-					cwd: this.runtime.cwd,
-					generationTombstone: Math.max(record.generationTombstone, generation),
-					updatedAt: new Date(this.runtime.now()).toISOString(),
-				});
-				return true;
-			});
-			if (!persisted) {
-				// Stale/superseded split: close the orphan pane; do not mutate foreign gen.
-				let closePaneSucceeded = false;
-				try {
-					await this.runtime.client.closePane(splitPaneId);
-					closePaneSucceeded = true;
-				} catch {
-					closePaneSucceeded = false;
-				}
-				if (!closePaneSucceeded) {
-					this.recordOrphanPaneCloseFailure({
-						generation,
-						paneId: splitPaneId,
-						agentName,
-						reason: "provision_superseded_after_split_close_failed",
+			const splitPaneId = await withPaneLifecycleLockAsync(
+				this.runtime.pool.poolRoot,
+				async () => {
+					const split = await this.runtime.client.splitPane({
+						pane: this.runtime.parentPaneId,
+						direction: this.runtime.direction,
+						cwd: this.runtime.cwd,
+						noFocus: true,
+						env: workerEnv,
 					});
-				}
-				throw new ProvisioningFailure({
-					message: "Worker provision superseded after pane split",
-					agentName,
-					paneId: splitPaneId,
-					closePaneSucceeded,
-				});
-			}
+					const id = split.paneId;
+					this.paneId = id;
+					const persisted = withRoleLock(this.runtime.pool.poolRoot, this.role.name, () => {
+						const record = this.runtime.pool.getByRole(this.role.name);
+						if (!record || !this.matchesProvisioningOwnerLocked(record, generation)) {
+							return false;
+						}
+						this.runtime.pool.upsert({
+							...record,
+							paneId: id,
+							agentName,
+							cwd: this.runtime.cwd,
+							generationTombstone: Math.max(record.generationTombstone, generation),
+							updatedAt: new Date(this.runtime.now()).toISOString(),
+						});
+						return true;
+					});
+					if (!persisted) {
+						let closePaneSucceeded = false;
+						try {
+							await this.runtime.client.closePane(id);
+							closePaneSucceeded = true;
+						} catch {
+							closePaneSucceeded = false;
+						}
+						if (!closePaneSucceeded) {
+							this.recordOrphanPaneCloseFailure({
+								generation,
+								paneId: id,
+								agentName,
+								reason: "provision_superseded_after_split_close_failed",
+							});
+						}
+						throw new ProvisioningFailure({
+							message: "Worker provision superseded after pane split",
+							agentName,
+							paneId: id,
+							closePaneSucceeded,
+						});
+					}
+					this.throwIfCancelled();
+					return id;
+				},
+				{ now: this.runtime.now, sleep: this.runtime.sleep },
+			);
+			paneId = splitPaneId;
 
 			await this.runtime.client.renamePane(splitPaneId, `Momo ${this.role.name}`);
 			await this.runtime.client.reportMetadata(splitPaneId, {

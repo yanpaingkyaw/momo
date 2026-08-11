@@ -599,6 +599,38 @@ export function peekHead(poolRoot: string, role: AgentName): QueueEntry | undefi
 	return listQueue(poolRoot, role)[0];
 }
 
+/**
+ * FIFO queue/claim priority head (claiming precedes queue). Use under the role
+ * lock when deciding idle direct dispatch vs enqueue.
+ */
+export function pendingRoleQueueHead(
+	poolRoot: string,
+	role: AgentName,
+): QueueEntry | undefined {
+	return peekHead(poolRoot, role);
+}
+
+/**
+ * True when claiming or queued work for the same generation would be overtaken
+ * by a direct idle dispatch of assignmentId.
+ */
+export function roleHasPendingWorkAheadOfAssignment(
+	poolRoot: string,
+	role: AgentName,
+	generation: number,
+	assignmentId: string,
+): boolean {
+	for (const entry of listClaiming(poolRoot, role)) {
+		if (entry.generation !== generation) continue;
+		if (entry.assignmentId !== assignmentId) return true;
+	}
+	for (const entry of listQueue(poolRoot, role)) {
+		if (entry.generation !== generation) continue;
+		if (entry.assignmentId !== assignmentId) return true;
+	}
+	return false;
+}
+
 export function newQueuedAssignmentId(): string {
 	return createAssignmentId();
 }

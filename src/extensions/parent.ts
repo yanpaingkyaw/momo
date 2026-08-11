@@ -23,6 +23,7 @@ import {
 	createStableParentId,
 } from "../delegation/herdr-factory.js";
 import { HerdrClient, HerdrCliError, isAgentNotFoundError, isPaneNotFoundError } from "../herdr/client.js";
+import { withPaneLifecycleLockAsync } from "../herdr/pane-lifecycle-lock.js";
 import {
 	formatWorkerStatusLine,
 	PoolRegistry,
@@ -118,6 +119,7 @@ export function __setCleanupRoleLockEnteredHookForTest(
 export function __resetCleanupRoleLockEnteredHookForTest(): void {
 	cleanupRoleLockEnteredHook = undefined;
 	orphanPreCloseRecheckHook = undefined;
+	orphanAwaitingLifecycleLockHook = undefined;
 }
 
 /**
@@ -131,6 +133,19 @@ export function __setOrphanPreCloseRecheckHookForTest(
 	hook?: () => void | Promise<void>,
 ): void {
 	orphanPreCloseRecheckHook = hook;
+}
+
+/**
+ * @internal test-only: runs after orphan candidates are chosen and immediately
+ * before attempting to acquire the pool-wide pane lifecycle lock for close.
+ */
+let orphanAwaitingLifecycleLockHook: (() => void | Promise<void>) | undefined;
+
+/** @internal test-only: observe orphan cleanup waiting on pane lifecycle lock. */
+export function __setOrphanAwaitingLifecycleLockHookForTest(
+	hook?: () => void | Promise<void>,
+): void {
+	orphanAwaitingLifecycleLockHook = hook;
 }
 
 function adoptionGraceRecheckKey(poolRoot: string, worker: PoolWorkerRecord): string {
@@ -501,13 +516,9 @@ export function installMomoParent(pi: ExtensionAPI, options: InstallMomoParentOp
 			}
 
 			// Role-scoped orphan panes from superseded provision close failures.
-			// Never await Herdr/network while holding the role lock:
-			//   1) under lock: list + strict-validate + refuse any live paneId collision
-			//      across every non-archival pool role
-			//   2) outside lock: recheck collision, then closePane
-			//   3) reacquire lock: remove only if exact evidence unchanged and still
-			//      does not collide; concurrent cleanups are idempotent (close/not-found)
-			//      and never delete replaced evidence.
+			// Pool-wide pane lifecycle lock spans global collision recheck + closePane;
+			// role lock (nested global→role) removes unchanged evidence. No role lock
+			// is held across Herdr network I/O.
 			let orphanClosed = 0;
 			for (const roleName of AGENT_NAMES) {
 				if (!roleHasOrphanPaneEvidence(pool.poolRoot, roleName)) continue;
@@ -556,93 +567,96 @@ export function installMomoParent(pi: ExtensionAPI, options: InstallMomoParentOp
 
 				for (const candidate of candidates) {
 					const { evidence } = candidate;
-					// Recheck immediately before close — no role lock held across network.
-					if (orphanPreCloseRecheckHook) {
-						await orphanPreCloseRecheckHook();
-					}
-					const preClose = findLivePaneIdCollision(pool, evidence.paneId);
-					if (preClose.kind === "collision") {
-						notes.push(
-							`retained orphan evidence for ${evidence.paneId}: paneId collides with live registry pane before close (role=${preClose.role} status=${preClose.status} gen=${preClose.generation})`,
-						);
-						continue;
-					}
-					if (preClose.kind === "error") {
-						notes.push(
-							`retained orphan evidence for ${evidence.paneId}: live pane collision scan failed before close (${preClose.reason})`,
-						);
-						continue;
-					}
-
 					try {
-						await herdrClient.closePane(evidence.paneId);
-					} catch (closeError) {
-						if (!isPaneNotFoundError(closeError)) {
-							notes.push(
-								`retained orphan pane ${evidence.paneId} (gen=${evidence.generation}): ${
-									closeError instanceof Error
-										? closeError.message
-										: String(closeError)
-								}`,
-							);
-							continue;
+						if (orphanAwaitingLifecycleLockHook) {
+							await orphanAwaitingLifecycleLockHook();
 						}
-					}
+						await withPaneLifecycleLockAsync(pool.poolRoot, async () => {
+							if (orphanPreCloseRecheckHook) {
+								await orphanPreCloseRecheckHook();
+							}
+							const preClose = findLivePaneIdCollision(pool, evidence.paneId);
+							if (preClose.kind === "collision") {
+								notes.push(
+									`retained orphan evidence for ${evidence.paneId}: paneId collides with live registry pane before close (role=${preClose.role} status=${preClose.status} gen=${preClose.generation})`,
+								);
+								return;
+							}
+							if (preClose.kind === "error") {
+								notes.push(
+									`retained orphan evidence for ${evidence.paneId}: live pane collision scan failed before close (${preClose.reason})`,
+								);
+								return;
+							}
 
-					try {
-						const removeOutcome = withRoleLock(pool.poolRoot, roleName, () => {
-							const postClose = findLivePaneIdCollision(pool, evidence.paneId);
-							if (postClose.kind === "collision") {
-								return {
-									kind: "collide" as const,
-									role: postClose.role,
-									status: postClose.status,
-									generation: postClose.generation,
-								};
+							try {
+								await herdrClient.closePane(evidence.paneId);
+							} catch (closeError) {
+								if (!isPaneNotFoundError(closeError)) {
+									notes.push(
+										`retained orphan pane ${evidence.paneId} (gen=${evidence.generation}): ${
+											closeError instanceof Error
+												? closeError.message
+												: String(closeError)
+										}`,
+									);
+									return;
+								}
 							}
-							if (postClose.kind === "error") {
-								return {
-									kind: "scan_error" as const,
-									reason: postClose.reason,
-								};
+
+							const removeOutcome = withRoleLock(pool.poolRoot, roleName, () => {
+								const postClose = findLivePaneIdCollision(pool, evidence.paneId);
+								if (postClose.kind === "collision") {
+									return {
+										kind: "collide" as const,
+										role: postClose.role,
+										status: postClose.status,
+										generation: postClose.generation,
+									};
+								}
+								if (postClose.kind === "error") {
+									return {
+										kind: "scan_error" as const,
+										reason: postClose.reason,
+									};
+								}
+								const removed = removeOrphanPaneEvidenceIfUnchanged(
+									pool.poolRoot,
+									roleName,
+									evidence,
+								);
+								return { kind: "remove" as const, removed };
+							});
+							if (removeOutcome.kind === "collide") {
+								notes.push(
+									`retained orphan evidence for ${evidence.paneId}: paneId collides with live registry pane after close (role=${removeOutcome.role} status=${removeOutcome.status} gen=${removeOutcome.generation})`,
+								);
+								return;
 							}
-							const removed = removeOrphanPaneEvidenceIfUnchanged(
-								pool.poolRoot,
-								roleName,
-								evidence,
+							if (removeOutcome.kind === "scan_error") {
+								notes.push(
+									`retained orphan evidence for ${evidence.paneId}: live pane collision scan failed after close (${removeOutcome.reason})`,
+								);
+								return;
+							}
+							const { removed } = removeOutcome;
+							if (removed.status === "removed" || removed.status === "missing") {
+								orphanClosed += 1;
+								return;
+							}
+							if (removed.status === "changed") {
+								notes.push(
+									`retained orphan evidence for ${evidence.paneId}: evidence replaced during close`,
+								);
+								return;
+							}
+							notes.push(
+								`retained orphan evidence for ${evidence.paneId}: ${removed.reason}`,
 							);
-							return { kind: "remove" as const, removed };
 						});
-						if (removeOutcome.kind === "collide") {
-							notes.push(
-								`retained orphan evidence for ${evidence.paneId}: paneId collides with live registry pane after close (role=${removeOutcome.role} status=${removeOutcome.status} gen=${removeOutcome.generation})`,
-							);
-							continue;
-						}
-						if (removeOutcome.kind === "scan_error") {
-							notes.push(
-								`retained orphan evidence for ${evidence.paneId}: live pane collision scan failed after close (${removeOutcome.reason})`,
-							);
-							continue;
-						}
-						const { removed } = removeOutcome;
-						if (removed.status === "removed" || removed.status === "missing") {
-							// missing ⇒ concurrent cleanup already cleared the same evidence.
-							orphanClosed += 1;
-							continue;
-						}
-						if (removed.status === "changed") {
-							notes.push(
-								`retained orphan evidence for ${evidence.paneId}: evidence replaced during close`,
-							);
-							continue;
-						}
-						notes.push(
-							`retained orphan evidence for ${evidence.paneId}: ${removed.reason}`,
-						);
 					} catch (error) {
 						notes.push(
-							`orphan cleanup ${roleName} failed after close of ${evidence.paneId}: ${
+							`orphan cleanup ${roleName} failed for ${evidence.paneId}: ${
 								error instanceof Error ? error.message : String(error)
 							}`,
 						);

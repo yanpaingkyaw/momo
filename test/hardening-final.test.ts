@@ -92,7 +92,7 @@ function createFakePi() {
 }
 
 describe("writer settlement ordering", () => {
-	it("releases lease before a clean completed result", async () => {
+	it("releases lease after durable completed result", async () => {
 		vi.useFakeTimers();
 		const cwd = tempDir("momo-settle-cwd-");
 		const cacheRoot = tempDir("momo-settle-cache-");
