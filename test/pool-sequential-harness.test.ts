@@ -7,6 +7,7 @@ import { createHerdrChildSessionFactory } from "../src/delegation/herdr-factory.
 import { extractLastAssistantText } from "../src/delegation/results.js";
 import { installMomoWorker } from "../src/extensions/worker-runtime.js";
 import { HerdrClient } from "../src/herdr/client.js";
+import { createTestHerdrClient } from "./helpers/herdr-mock-client.js";
 import { resolvePoolIdentity } from "../src/herdr/pool-identity.js";
 import { PoolRegistry } from "../src/herdr/pool-registry.js";
 import { RoleTransactionLock, listQueue } from "../src/herdr/role-queue.js";
@@ -122,7 +123,7 @@ describe("pool sequential assignment harness", () => {
 		let workerCtx: ExtensionContext | null = null;
 		let bootPromise: Promise<void> | null = null;
 
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "pane" && args[1] === "split") {
 					splits.push("split");
@@ -338,7 +339,7 @@ describe("pool sequential assignment harness", () => {
 		let bootPromise: Promise<void> | null = null;
 		let gate = 0;
 
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "pane" && args[1] === "split") {
 					const envArgs = args.filter((_a, i) => args[i - 1] === "--env");

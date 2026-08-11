@@ -1,5 +1,7 @@
 import { accessSync, constants } from "node:fs";
 import path from "node:path";
+import { cliArgsForPolicy, effectivePolicyForScope } from "./config/model-policy.js";
+import { readMomoConfigOrThrow } from "./config/momo-config.js";
 import { detectHerdrEnv, parseMomoBackend, selectBackend } from "./herdr/env.js";
 import { HerdrClient, preflightHerdr, TESTED_PI_VERSION } from "./herdr/client.js";
 import {
@@ -121,6 +123,22 @@ export async function planLaunch(
 		"-e",
 		herdrExtension,
 	];
+
+	try {
+		const config = readMomoConfigOrThrow();
+		if (config) {
+			const parentPolicy = effectivePolicyForScope("parent", config);
+			if (parentPolicy) {
+				piArgs.push(...cliArgsForPolicy(parentPolicy));
+			}
+		}
+	} catch (error) {
+		return {
+			mode: "fail",
+			reason: "Invalid momo/config.json",
+			error: error instanceof Error ? error.message : String(error),
+		};
+	}
 	// Forward non-flag initial task args only (help/version already handled).
 	const initial = cliArgs.filter((arg) => !arg.startsWith("-")).join(" ").trim();
 	if (initial) {

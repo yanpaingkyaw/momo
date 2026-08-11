@@ -11,6 +11,7 @@ import { PoolRegistry } from "../src/herdr/pool-registry.js";
 import { resolvePoolIdentity, stableWorkerId } from "../src/herdr/pool-identity.js";
 import { assignmentSpoolPaths, workerControlPaths } from "../src/herdr/assignment-spool.js";
 import { enqueueAssignment, queueCount } from "../src/herdr/role-queue.js";
+import { createTestHerdrClient } from "./helpers/herdr-mock-client.js";
 
 const tempDirs: string[] = [];
 
@@ -916,7 +917,7 @@ describe("worker runtime (persistent pool)", () => {
 				HERDR_WORKSPACE_ID: "ws",
 				HERDR_SOCKET_PATH: "s",
 			},
-			client: new HerdrClient({
+			client: createTestHerdrClient({
 				runCommand: async (_file, args) => {
 					if (args[0] === "pane" && args[1] === "close") {
 						closed.push(String(args[2]));

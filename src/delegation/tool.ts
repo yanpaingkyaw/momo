@@ -1,5 +1,7 @@
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import type { MomoConfigV1 } from "../config/model-policy.js";
+import { readMomoConfig } from "../config/momo-config.js";
 import { ROLE_LIST, type AgentName } from "../roles.js";
 import type {
 	DelegationProgress,
@@ -70,7 +72,10 @@ export interface RunningDelegationDetails {
 
 export type DelegateToolDetails = RunningDelegationDetails | DelegationResult;
 
-export type CreateDelegateToolOptions = Omit<PiChildSessionFactoryOptions, "reviewerTools">;
+export type CreateDelegateToolOptions = Omit<PiChildSessionFactoryOptions, "reviewerTools"> & {
+	readConfig?: () => MomoConfigV1 | undefined;
+	getModelRegistry?: () => import("@earendil-works/pi-coding-agent").ModelRegistry;
+};
 
 function formatUsage(result: DelegationResult): string {
 	const usage = result.usage;
@@ -108,6 +113,10 @@ export function createDelegateTool(runnerOrOptions: DelegationRunner | CreateDel
 					...runnerOrOptions,
 					reviewerTools: [createWorkspaceDiffTool(runnerOrOptions.cwd)],
 				}),
+				readConfig: runnerOrOptions.readConfig ?? readMomoConfig,
+				...(runnerOrOptions.getModelRegistry
+					? { getModelRegistry: runnerOrOptions.getModelRegistry }
+					: {}),
 			});
 
 	return defineTool({

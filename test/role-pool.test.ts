@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createDelegationRunner } from "../src/delegation/runner.js";
 import { createHerdrChildSessionFactory } from "../src/delegation/herdr-factory.js";
 import { HerdrClient } from "../src/herdr/client.js";
+import { createTestHerdrClient } from "./helpers/herdr-mock-client.js";
 import { PoolRegistry } from "../src/herdr/pool-registry.js";
 import { resolvePoolIdentity, stableWorkerId } from "../src/herdr/pool-identity.js";
 import { listQueue, queueCount } from "../src/herdr/role-queue.js";
@@ -60,7 +61,7 @@ function makeClient(options: {
 	const splits: string[] = [];
 	const starts: string[] = [];
 	const counter = options.paneCounter ?? { n: 0 };
-	const client = new HerdrClient({
+	const client = createTestHerdrClient({
 		runCommand: async (_file, args) => {
 			if (args[0] === "pane" && args[1] === "split") {
 				counter.n += 1;
@@ -545,7 +546,7 @@ describe("persistent worker assignment isolation", () => {
 		const momoCwds: string[] = [];
 		const splits: string[] = [];
 		const counter = { n: 0 };
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "pane" && args[1] === "split") {
 					counter.n += 1;

@@ -13,6 +13,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { installMomoParent, reconcileRegistry } from "../src/extensions/parent.js";
 import { installMomoWorker } from "../src/extensions/worker-runtime.js";
 import { HerdrClient } from "../src/herdr/client.js";
+import { createTestHerdrClient } from "./helpers/herdr-mock-client.js";
 import { PaneRegistry, selectClosablePanes } from "../src/herdr/registry.js";
 import {
 	isArchivalTombstone,
@@ -147,7 +148,7 @@ describe("parent reconciliation from result.json", () => {
 			}
 		}
 		const notifies: string[] = [];
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "agent" && args[1] === "get") {
 					return {
@@ -245,7 +246,7 @@ describe("parent reconciliation from result.json", () => {
 			updatedAt: new Date().toISOString(),
 		});
 		const pi = createFakePi();
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async () => ({
 				code: 0,
 				stdout: JSON.stringify({ id: "ok", result: {} }),
@@ -321,7 +322,7 @@ describe("NDJSON fail-closed", () => {
 		let workerId = "";
 		let runId = "";
 		const calls: string[][] = [];
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				calls.push([...args]);
 				if (args[0] === "pane" && args[1] === "split") {
@@ -397,7 +398,7 @@ describe("NDJSON fail-closed", () => {
 		installFakeHerdrExtension();
 		const cacheRoot = tempDir("momo-evt-ok-cache-");
 		const cwd = tempDir("momo-evt-ok-cwd-");
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "pane" && args[1] === "split") {
 					const envArgs = args.filter((_a, i) => args[i - 1] === "--env");
@@ -483,7 +484,7 @@ describe("NDJSON fail-closed", () => {
 		let workerId = "";
 		let runId = "";
 		const calls: string[][] = [];
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				calls.push([...args]);
 				if (args[0] === "pane" && args[1] === "split") {
@@ -809,7 +810,7 @@ describe("force cleanup recovery retention", () => {
 				HERDR_WORKSPACE_ID: "test-ws",
 				HERDR_SOCKET_PATH: "test-sock",
 			},
-			client: new HerdrClient({
+			client: createTestHerdrClient({
 				runCommand: async (_file, args) => {
 					if (args[0] === "pane" && args[1] === "close") {
 						closed.push(String(args[2]));
@@ -891,7 +892,7 @@ describe("force cleanup recovery retention", () => {
 					HERDR_WORKSPACE_ID: "test-ws",
 					HERDR_SOCKET_PATH: "test-sock",
 				},
-				client: new HerdrClient({
+				client: createTestHerdrClient({
 					runCommand: async (_file, args) => {
 						if (args[0] === "pane" && args[1] === "close") {
 							closed.push(String(args[2]));
@@ -1007,7 +1008,7 @@ describe("force cleanup recovery retention", () => {
 				HERDR_WORKSPACE_ID: "test-ws",
 				HERDR_SOCKET_PATH: "test-sock",
 			},
-			client: new HerdrClient({
+			client: createTestHerdrClient({
 				runCommand: async (_file, args) => {
 					if (args[0] === "pane" && args[1] === "close") {
 						closed.push(String(args[2]));
@@ -1096,7 +1097,7 @@ describe("force cleanup recovery retention", () => {
 				HERDR_WORKSPACE_ID: "test-ws",
 				HERDR_SOCKET_PATH: "test-sock",
 			},
-			client: new HerdrClient({
+			client: createTestHerdrClient({
 				runCommand: async (_file, args) => {
 					if (args[0] === "pane" && args[1] === "close") {
 						closed.push(String(args[2]));
@@ -1182,7 +1183,7 @@ describe("force cleanup recovery retention", () => {
 				HERDR_WORKSPACE_ID: "test-ws",
 				HERDR_SOCKET_PATH: "test-sock",
 			},
-			client: new HerdrClient({
+			client: createTestHerdrClient({
 				runCommand: async (_file, args) => {
 					if (args[0] === "pane" && args[1] === "close") {
 						closed.push(String(args[2]));
@@ -1265,7 +1266,7 @@ describe("force cleanup recovery retention", () => {
 					HERDR_WORKSPACE_ID: "test-ws",
 					HERDR_SOCKET_PATH: "test-sock",
 				},
-				client: new HerdrClient({
+				client: createTestHerdrClient({
 					runCommand: async (_file, args) => {
 						if (args[0] === "pane" && args[1] === "close") {
 							closed.push(String(args[2]));
@@ -1354,7 +1355,7 @@ describe("force cleanup recovery retention", () => {
 				HERDR_WORKSPACE_ID: "test-ws",
 				HERDR_SOCKET_PATH: "test-sock",
 			},
-			client: new HerdrClient({
+			client: createTestHerdrClient({
 				runCommand: async (_file, args) => {
 					if (args[0] === "pane" && args[1] === "close") {
 						return {
@@ -1407,7 +1408,7 @@ describe("force cleanup recovery retention", () => {
 				HERDR_WORKSPACE_ID: "test-ws",
 				HERDR_SOCKET_PATH: "test-sock",
 			},
-			client: new HerdrClient({
+			client: createTestHerdrClient({
 				runCommand: async (_file, args) => {
 					if (args[0] === "pane" && args[1] === "close") {
 						pool2.upsert({

@@ -18,7 +18,63 @@ macOS operator evidence exists (below); **full live Herdr acceptance
 - Optional: [Herdr](https://herdr.dev) 0.7.5 for pane-visible specialists
 
 Momo reads the normal Pi configuration under `~/.pi/agent`, including provider
-credentials, model settings, and project context.
+credentials, model settings, and project context. Momo **never** reads or writes
+`auth.json` or other credential material in its own config.
+
+### Model policies (credential-free)
+
+Optional global model/reasoning policies live at:
+
+- `$XDG_CONFIG_HOME/momo/config.json` (fallback `~/.config/momo/config.json`)
+
+Schema version `1` with scopes: `default`, `parent`, `scout`, `planner`,
+`implementer`, `reviewer`. Each policy is `{ provider, model, reasoning }`.
+Absent config preserves legacy Pi session defaults.
+
+Supported provider IDs: `openai-codex`, `anthropic`, `openai`, `openrouter`,
+`google`, `opencode`, `opencode-go`. **Cursor subscription is not supported.**
+
+Commands (parent Herdr and in-process):
+
+- `/momo-model [scope]` — staged selector over **authenticated** models only
+  (`modelRegistry.getAvailable` / `find`; no probing, no `getProviderAuth`)
+- `/momo-models` — effective policies + `/login` guidance
+- `/momo-model [scope] clear` — remove a scope override
+
+Precedence: role override → `default`; `parent` override → `default`. Config is read
+once per delegation `run()`, then the immutable policy is passed to in-process or
+Herdr assignment proxies before `prompt()`; it is never retained as a process-lifetime snapshot.
+IPC capability **v3** requires **concrete** `modelPolicy` on queue/command/started/result
+(legacy records omit both `capability` and `modelPolicy`; null is forbidden).
+
+**Generation-bound workers:** each Herdr worker generation binds to an exact concrete
+policy at **process launch** via `--provider`, `--model`, `--thinking`. Workers
+**verify** live session (`ctx.model` + `ctx.thinkingLevel`) and store the verified
+effective snapshot in `started.json` / `result.json` — never blind echo, never
+`pi.setModel` on persistent panes. Early terminal paths carry requested policy with
+`modelPolicyApplied: false`; completed success requires `modelPolicyApplied: true`
+and matching started/result policies.
+
+**Parent apply:** `/momo-model` parent/default changes refuse while the agent is
+busy (`!ctx.isIdle()`), otherwise capture session, prevalidate/apply target, persist
+under token-fenced config lock, rollback session on persist failure. Clearing to
+legacy restores captured baseline when available. Worker-scope changes persist only;
+existing panes keep launch-bound policy until `/momo-cleanup`.
+
+### Provider auth matrix
+
+| Provider | Auth path | Notes |
+|---|---|---|
+| OpenAI Codex (`openai-codex`) | Codex Plus/Pro via Pi `/login` | Supported |
+| Anthropic (`anthropic`) | Claude Pro/Max OAuth or API key | Pro/Max third-party usage is billed per token, not plan quota |
+| OpenAI (`openai`) | Direct API key | Supported |
+| OpenRouter (`openrouter`) | OAuth credits / API key | Supported |
+| Google (`google`) | Direct API key | Supported |
+| OpenCode (`opencode`, `opencode-go`) | Provider keys via Pi | Supported |
+| Cursor subscription | — | **Unsupported** (no token scraping) |
+
+Start Momo/Pi, then run `/login` in its interactive input before `/momo-model`
+when no authenticated models appear in the selector.
 
 ## Target version matrix (candidate)
 

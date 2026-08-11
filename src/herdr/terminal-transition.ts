@@ -1,7 +1,7 @@
 import { existsSync, rmSync } from "node:fs";
 import type { AgentName } from "../roles.js";
 import { atomicWriteJson } from "../ipc/spool.js";
-import { tryReadIpcJson, validateActivePointer } from "../ipc/validate.js";
+import { assertIpcPoliciesEqualRecords, tryReadIpcJson, validateActivePointer } from "../ipc/validate.js";
 import {
 	assignmentSpoolPaths,
 	workerControlPaths,
@@ -122,6 +122,7 @@ export function completeCleanAssignmentLocked(options: {
 			...(still.paneId ? { paneId: still.paneId } : {}),
 			...(still.agentName ? { agentName: still.agentName } : {}),
 			...(still.cwd ? { cwd: still.cwd } : {}),
+			...(still.boundPolicy ? { boundPolicy: still.boundPolicy } : {}),
 		});
 		return { kind: "idle" };
 	}
@@ -151,6 +152,17 @@ function publishNextAssignmentLocked(
 		throw new Error("publishNextAssignmentLocked generation/worker fence mismatch");
 	}
 	const paths = assignmentSpoolPaths(pool.poolRoot, role, next.assignmentId);
+	const ipcFields = {
+		...(next.capability !== undefined ? { capability: next.capability } : {}),
+		...(next.modelPolicy !== undefined ? { modelPolicy: next.modelPolicy } : {}),
+	};
+	if (next.capability !== undefined && next.modelPolicy !== undefined) {
+		const record = pool.getByRole(role);
+		if (!record?.boundPolicy) {
+			throw new Error("publishNextAssignmentLocked missing registry boundPolicy for v3 queue entry");
+		}
+		assertIpcPoliciesEqualRecords(next.modelPolicy, record.boundPolicy, "queue→registry");
+	}
 	atomicWriteJson(paths.command, {
 		version: 1,
 		type: "prompt",
@@ -160,6 +172,7 @@ function publishNextAssignmentLocked(
 		workerId,
 		generation,
 		parentEpoch: next.parentEpoch,
+		...ipcFields,
 	});
 	pool.upsert({
 		...current,

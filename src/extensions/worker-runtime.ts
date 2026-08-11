@@ -1,6 +1,14 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { existsSync, rmSync } from "node:fs";
 import path from "node:path";
+import {
+	verifySessionModelPolicy,
+	ModelPolicyApplyError,
+	toIpcModelPolicy,
+	verifiedPolicyFromSession,
+	IPC_PROTOCOL_CAPABILITY,
+	type ModelPolicySnapshot,
+} from "../config/model-policy.js";
 import { createWorkspaceDiffTool } from "../delegation/workspace-diff.js";
 import { assignmentSpoolPaths } from "../herdr/assignment-spool.js";
 import {
@@ -30,7 +38,12 @@ import {
 	validateCommand,
 	validateResult,
 	validateStarted,
+	validateWorkerManifest,
 } from "../ipc/validate.js";
+import {
+	inferRecoveryProtocolVersion,
+	validateAssignmentRecoveryChain,
+} from "../ipc/recovery-validator.js";
 import {
 	appendEvent,
 	atomicWriteJson,
@@ -103,6 +116,12 @@ interface ActiveAssignment {
 	parentEpoch?: string;
 	/** A cancellation is terminal even when Pi settles without an assistant message. */
 	cancelRequested?: string;
+	/** Requested v3 policy from durable command (immutable for assignment). */
+	requestedModelPolicy?: ModelPolicySnapshot;
+	/** Verified effective policy from live session after fence checks. */
+	verifiedModelPolicy?: ModelPolicySnapshot;
+	/** IPC capability when policy feature active. */
+	ipcCapability?: number;
 	/** Progress event log hit the byte cap; further non-authoritative events are dropped. */
 	eventsCapacityExhausted?: boolean;
 }
@@ -457,6 +476,13 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 			if (errorMessage !== undefined) payload.errorMessage = errorMessage;
 			if (uncertainWrite) payload.uncertainWrite = true;
 			if (partial.usage !== undefined) payload.usage = partial.usage;
+			const policyForResult = assignment.verifiedModelPolicy ?? assignment.requestedModelPolicy;
+			if (policyForResult !== undefined && assignment.ipcCapability !== undefined) {
+				payload.capability = assignment.ipcCapability;
+				payload.modelPolicy = toIpcModelPolicy(policyForResult);
+				payload.modelPolicyApplied =
+					partial.status === "completed" && assignment.verifiedModelPolicy !== undefined;
+			}
 
 			if (uncertainWrite && payload.status === "completed") {
 				payload.status = "failed";
@@ -679,6 +705,69 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 			}
 		}
 
+		let manifestInfo: { version: 2 | 3; boundPolicy?: import("../ipc/spool.js").IpcModelPolicy } | undefined;
+		if (existsSync(controlPaths.manifest)) {
+			try {
+				const manifestRaw = tryReadIpcJson(controlPaths.manifest);
+				if (manifestRaw) {
+					const manifest = validateWorkerManifest(manifestRaw, {
+						poolKey,
+						workerId,
+						generation,
+						role: role.name,
+					});
+					manifestInfo = {
+						version: manifest.version,
+						...(manifest.boundPolicy ? { boundPolicy: manifest.boundPolicy } : {}),
+					};
+				}
+			} catch {
+				markProtocolCorruptLocked("invalid manifest");
+				return "handled";
+			}
+		}
+
+		const protocolVersion = inferRecoveryProtocolVersion({
+			...(manifestInfo?.version !== undefined ? { manifestVersion: manifestInfo.version } : {}),
+			...(current.boundPolicy !== undefined ? { registryBoundPolicy: current.boundPolicy } : {}),
+			command,
+			...(result !== undefined ? { result } : {}),
+		});
+
+		let hasLeaseEvidence = false;
+		if (role.canWrite) {
+			try {
+				const owner = lease.peekOwner(cwd);
+				hasLeaseEvidence = !!(owner && owner.ownerId === workerId);
+			} catch {
+				// lease corruption handled below for in-flight without result
+			}
+		}
+
+		const recovery = validateAssignmentRecoveryChain({
+			role,
+			protocolVersion,
+			command,
+			...(manifestInfo !== undefined ? { manifest: manifestInfo } : {}),
+			...(current.boundPolicy !== undefined ? { registryBoundPolicy: current.boundPolicy } : {}),
+			...(started !== undefined ? { started } : {}),
+			...(result !== undefined ? { result } : {}),
+			...(hasLeaseEvidence ? { hasLeaseEvidence: true } : {}),
+		});
+		if (!recovery.ok) {
+			disableMutationTools();
+			protocolUnhealthy = true;
+			pool.upsert({
+				...current,
+				status: recovery.fence === "uncertain" ? "uncertain" : "unhealthy",
+				...(recovery.fence === "uncertain" ? { uncertainWrite: true } : {}),
+				activeAssignmentId: assignmentId,
+				activeParentEpoch: parentEpoch,
+				updatedAt: new Date(now()).toISOString(),
+			});
+			return "handled";
+		}
+
 		// 1) Valid result => never rerun.
 		if (result) {
 			if (result.uncertainWrite === true) {
@@ -872,6 +961,8 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 			workerId,
 			generation,
 			parentEpoch: next.parentEpoch,
+			...(next.capability !== undefined ? { capability: next.capability } : {}),
+			...(next.modelPolicy !== undefined ? { modelPolicy: next.modelPolicy } : {}),
 		});
 		if (
 			!markRegistryLocked("busy", {
@@ -1150,10 +1241,33 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 
 	async function runAssignment(ctx: ExtensionContext, assignment: ActiveAssignment): Promise<void> {
 		try {
+			const commandRaw = tryReadIpcJson(assignment.paths.command);
+			if (!commandRaw) {
+				// Active pointer without command yet — wait.
+				active = undefined;
+				return;
+			}
+			const command = validateCommand(commandRaw, {
+				runId: assignment.assignmentId,
+				workerId,
+				generation,
+				...(assignment.parentEpoch ? { parentEpoch: assignment.parentEpoch } : {}),
+			});
+
+			// Authoritative v3 policy from durable command before cancel/skip/lease/terminal paths.
+			if (command.type === "prompt") {
+				if (command.capability === IPC_PROTOCOL_CAPABILITY && command.modelPolicy) {
+					assignment.requestedModelPolicy = {
+						provider: command.modelPolicy.provider,
+						model: command.modelPolicy.model,
+						reasoning: command.modelPolicy.reasoning as ModelPolicySnapshot["reasoning"],
+					};
+					assignment.ipcCapability = command.capability;
+				}
+			}
+
 			const cancelReason = cancelPending(assignment);
 			if (cancelReason) {
-				// Publish only when production dispatch already left busy|blocked
-				// for this exact assignment; never manufacture busy from idle/starting.
 				await finishAssignment(
 					assignment,
 					{
@@ -1167,18 +1281,6 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 				return;
 			}
 
-			const commandRaw = tryReadIpcJson(assignment.paths.command);
-			if (!commandRaw) {
-				// Active pointer without command yet — wait.
-				active = undefined;
-				return;
-			}
-			const command = validateCommand(commandRaw, {
-				runId: assignment.assignmentId,
-				workerId,
-				generation,
-				...(assignment.parentEpoch ? { parentEpoch: assignment.parentEpoch } : {}),
-			});
 			if (command.type === "skip" || command.type === "cancel") {
 				await finishAssignment(
 					assignment,
@@ -1198,6 +1300,33 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 				throw new Error("Persistent assignment command missing parentEpoch");
 			}
 			assignment.parentEpoch = parentEpoch;
+
+			if (command.type === "prompt" && assignment.requestedModelPolicy !== undefined) {
+				try {
+					const sessionView: import("../config/model-policy.js").SessionModelView = {};
+					if (ctx.model !== undefined) sessionView.model = ctx.model;
+					if (ctx.thinkingLevel !== undefined) sessionView.thinkingLevel = ctx.thinkingLevel;
+					verifySessionModelPolicy(sessionView, assignment.requestedModelPolicy);
+					assignment.verifiedModelPolicy = verifiedPolicyFromSession(sessionView);
+				} catch (error) {
+					const message =
+						error instanceof ModelPolicyApplyError || error instanceof Error
+							? error.message
+							: String(error);
+					await finishAssignment(
+						assignment,
+						{
+							status: "failed",
+							messages: assignment.assistantMessages,
+							errorMessage: message,
+							uncertainWrite: false,
+							modelPolicyApplied: false,
+						},
+						"failed",
+					);
+					return;
+				}
+			}
 
 			markRegistry("busy", {
 				activeAssignmentId: assignment.assignmentId,
@@ -1226,8 +1355,6 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 						},
 					});
 					assignment.leaseHeld = true;
-					// Close cancel-vs-acquire race: cancel may land after shouldCancel
-					// cleared but before enableMutationTools.
 					const cancelAfterAcquire = cancelPending(assignment);
 					if (cancelAfterAcquire) {
 						await finishCancelledBeforeWork(assignment, cancelAfterAcquire);
@@ -1268,7 +1395,6 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 				}
 			}
 
-			// Narrow cancel window before durable start / prompt.
 			const cancelBeforeStart = cancelPending(assignment);
 			if (cancelBeforeStart) {
 				await finishCancelledBeforeWork(assignment, cancelBeforeStart);
@@ -1280,11 +1406,10 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 				throw new Error("Expected prompt command after skip/cancel filter");
 			}
 
-			// At-most-once: if started marker already exists, never re-prompt.
 			if (existsSync(assignment.paths.started)) {
 				throw new Error("Assignment already started; refusing duplicate prompt");
 			}
-			// Durable start fence immediately BEFORE sendUserMessage.
+
 			atomicWriteJson(assignment.paths.started, {
 				version: 1,
 				runId: assignment.assignmentId,
@@ -1292,6 +1417,12 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 				generation,
 				parentEpoch,
 				startedAt: new Date(now()).toISOString(),
+				...(assignment.ipcCapability !== undefined
+					? { capability: assignment.ipcCapability }
+					: {}),
+				...(assignment.verifiedModelPolicy !== undefined
+					? { modelPolicy: toIpcModelPolicy(assignment.verifiedModelPolicy) }
+					: {}),
 			});
 			pi.sendUserMessage(command.task);
 		} catch (error) {

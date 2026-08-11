@@ -70,7 +70,7 @@ export function ensureAssignmentSpool(
 }
 
 export interface WorkerManifest {
-	version: 2;
+	version: 2 | 3;
 	poolKey: string;
 	workerId: string;
 	generation: number;
@@ -79,6 +79,8 @@ export interface WorkerManifest {
 	paneId?: string;
 	agentName?: string;
 	createdAt: string;
+	/** Generation-bound launch policy (v3). Omitted on legacy v2 manifests. */
+	boundPolicy?: import("../ipc/spool.js").IpcModelPolicy;
 }
 
 export interface WorkerActivePointer {

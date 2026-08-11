@@ -7,6 +7,13 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { MOMO_SYSTEM_PROMPT } from "../prompts.js";
+import {
+	effectivePolicyForScope,
+	findAuthenticatedModel,
+	isConfigPolicyFeatureActive,
+} from "../config/model-policy.js";
+import { readMomoConfig } from "../config/momo-config.js";
+import { registerModelPolicyCommands } from "../config/model-commands.js";
 import { createDelegateTool } from "../delegation/tool.js";
 import { createDelegationRunner } from "../delegation/runner.js";
 import { AGENT_NAMES, getRole, ROLE_LIST } from "../roles.js";
@@ -43,16 +50,23 @@ import {
 	type OrphanPaneEvidence,
 } from "../herdr/orphan-panes.js";
 import { WriterLeaseManager, LeaseCorruptionError } from "../lease/writer-lease.js";
-import { atomicWriteJson, DEFAULT_HEARTBEAT_STALE_MS, DEFAULT_HEARTBEAT_CLOCK_SKEW_MS } from "../ipc/spool.js";
+import { atomicWriteJson, DEFAULT_HEARTBEAT_STALE_MS, DEFAULT_HEARTBEAT_CLOCK_SKEW_MS, type IpcResult } from "../ipc/spool.js";
 import {
 	IpcValidationError,
 	assertHeartbeatFreshness,
 	tryReadIpcJson,
 	validateActivePointer,
+	validateCommand,
 	validateHeartbeat,
 	validateResult,
 	validateStarted,
+	validateWorkerManifest,
+	assertIpcPoliciesEqualRecords,
 } from "../ipc/validate.js";
+import {
+	inferRecoveryProtocolVersion,
+	validateAssignmentRecoveryChain,
+} from "../ipc/recovery-validator.js";
 import {
 	cancelQueuedAssignment,
 	commitClaim,
@@ -182,15 +196,26 @@ export function installMomoParent(pi: ExtensionAPI, options: InstallMomoParentOp
 		...(env.HERDR_WORKSPACE_ID ? { workspaceId: env.HERDR_WORKSPACE_ID } : {}),
 		...(env.HERDR_SOCKET_PATH ? { socketPath: env.HERDR_SOCKET_PATH } : {}),
 	});
+
+	let getModelRegistry: (() => import("@earendil-works/pi-coding-agent").ModelRegistry) | undefined;
 	const runner = createDelegationRunner({
 		cwd,
 		roles: ROLE_LIST,
 		createChildSession,
+		readConfig: readMomoConfig,
+		getModelRegistry: () => {
+			if (!getModelRegistry) {
+				throw new Error("Model registry unavailable before session_start");
+			}
+			return getModelRegistry();
+		},
 	});
 
 	pi.registerTool(createDelegateTool(runner));
+	registerModelPolicyCommands(pi);
 
 	pi.on("session_start", async (_event, ctx) => {
+		getModelRegistry = () => ctx.modelRegistry;
 		if (ctx.hasUI !== true) return;
 		pi.setActiveTools([...PARENT_ACTIVE_TOOLS]);
 
@@ -646,6 +671,154 @@ export function installMomoParent(pi: ExtensionAPI, options: InstallMomoParentOp
  * Never adopts arbitrary or legacy v1 workers.
  * Registry writes run under the per-role lock with generation/worker/snapshot fences.
  */
+function validateAdoptionManifest(
+	manifestRaw: unknown,
+	options: { poolKey: string; worker: PoolWorkerRecord },
+): ReturnType<typeof validateWorkerManifest> {
+	const manifest = validateWorkerManifest(manifestRaw, {
+		poolKey: options.poolKey,
+		workerId: options.worker.workerId,
+		generation: options.worker.generation,
+		role: options.worker.role,
+	});
+	if (options.worker.cwd === undefined) {
+		throw new Error("missing canonical cwd on registry or manifest");
+	}
+	if (manifest.cwd !== options.worker.cwd) {
+		throw new Error("manifest cwd mismatch");
+	}
+	if (manifest.version === 3) {
+		if (!manifest.boundPolicy) {
+			throw new Error("v3 manifest missing boundPolicy");
+		}
+		if (!options.worker.boundPolicy) {
+			throw new Error("registry missing boundPolicy for v3 worker");
+		}
+		assertIpcPoliciesEqualRecords(
+			manifest.boundPolicy,
+			options.worker.boundPolicy,
+			"manifest→registry",
+		);
+	} else if (options.worker.boundPolicy) {
+		throw new Error("registry boundPolicy incompatible with v2 manifest");
+	}
+	return manifest;
+}
+
+function validateAndApplyTerminalResultLocked(options: {
+	pool: PoolRegistry;
+	poolKey: string;
+	current: PoolWorkerRecord;
+	worker: PoolWorkerRecord;
+	assignmentId: string;
+	control: ReturnType<typeof workerControlPaths>;
+	paths: ReturnType<typeof assignmentSpoolPaths>;
+	result: IpcResult;
+	leases?: WriterLeaseManager;
+}): void {
+	const { pool, poolKey, current, worker, assignmentId, control, paths, result, leases } =
+		options;
+	let command: ReturnType<typeof validateCommand> | undefined;
+	let started: ReturnType<typeof validateStarted> | undefined;
+	let manifestInfo:
+		| { version: 2 | 3; boundPolicy?: import("../ipc/spool.js").IpcModelPolicy }
+		| undefined;
+
+	const commandRaw = tryReadIpcJson(paths.command);
+	if (!commandRaw) {
+		throw new Error("missing command for terminal result");
+	}
+	command = validateCommand(commandRaw, {
+		runId: assignmentId,
+		workerId: worker.workerId,
+		generation: worker.generation,
+	});
+
+	if (existsSync(paths.started)) {
+		const startedRaw = tryReadIpcJson(paths.started);
+		if (startedRaw) {
+			started = validateStarted(startedRaw, {
+				runId: assignmentId,
+				workerId: worker.workerId,
+				generation: worker.generation,
+				parentEpoch: worker.activeParentEpoch ?? "",
+			});
+		}
+	}
+
+	const manifestRaw = tryReadIpcJson(control.manifest);
+	if (!manifestRaw) {
+		throw new Error("missing manifest for terminal result");
+	}
+	const manifest = validateWorkerManifest(manifestRaw, {
+		poolKey,
+		workerId: worker.workerId,
+		generation: worker.generation,
+		role: worker.role,
+	});
+	manifestInfo = {
+		version: manifest.version,
+		...(manifest.boundPolicy ? { boundPolicy: manifest.boundPolicy } : {}),
+	};
+
+	const protocolVersion = inferRecoveryProtocolVersion({
+		manifestVersion: manifestInfo.version,
+		...(current.boundPolicy !== undefined ? { registryBoundPolicy: current.boundPolicy } : {}),
+		command,
+		result,
+	});
+
+	let hasLeaseEvidence = false;
+	const role = getRole(worker.role);
+	if (role.canWrite && leases && worker.cwd) {
+		try {
+			const owner = leases.peekOwner(worker.cwd);
+			hasLeaseEvidence = !!(owner && owner.ownerId === worker.workerId);
+		} catch {
+			// treat as no lease evidence
+		}
+	}
+
+	const recovery = validateAssignmentRecoveryChain({
+		role,
+		protocolVersion,
+		command,
+		manifest: manifestInfo,
+		...(current.boundPolicy !== undefined ? { registryBoundPolicy: current.boundPolicy } : {}),
+		...(started !== undefined ? { started } : {}),
+		result,
+		...(hasLeaseEvidence ? { hasLeaseEvidence: true } : {}),
+	});
+
+	if (!recovery.ok) {
+		pool.upsert({
+			...current,
+			status: recovery.fence === "uncertain" ? "uncertain" : "unhealthy",
+			...(recovery.fence === "uncertain" ? { uncertainWrite: true } : {}),
+			updatedAt: new Date().toISOString(),
+		});
+		return;
+	}
+
+	if (result.uncertainWrite) {
+		pool.upsert({
+			...current,
+			status: "uncertain",
+			uncertainWrite: true,
+			updatedAt: new Date().toISOString(),
+		});
+		return;
+	}
+
+	completeCleanAssignmentLocked({
+		pool,
+		role: worker.role,
+		workerId: worker.workerId,
+		generation: worker.generation,
+		finishedAssignmentId: assignmentId,
+	});
+}
+
 export async function adoptPoolWorkers(
 	pool: PoolRegistry,
 	client: HerdrClient,
@@ -698,37 +871,10 @@ export async function adoptPoolWorkers(
 		const control = workerControlPaths(pool.poolRoot, worker.role);
 		try {
 			const manifestRaw = tryReadIpcJson(control.manifest);
-			if (!manifestRaw || typeof manifestRaw !== "object") {
+			if (!manifestRaw) {
 				throw new Error("missing manifest");
 			}
-			const manifest = manifestRaw as {
-				version?: number;
-				poolKey?: string;
-				workerId?: string;
-				generation?: number;
-				paneId?: string;
-				agentName?: string;
-				role?: string;
-				cwd?: string;
-			};
-			if (
-				manifest.version !== 2 ||
-				manifest.poolKey !== poolKey ||
-				manifest.workerId !== worker.workerId ||
-				manifest.generation !== worker.generation ||
-				manifest.paneId !== worker.paneId ||
-				manifest.agentName !== worker.agentName ||
-				manifest.role !== worker.role
-			) {
-				throw new Error("manifest identity mismatch");
-			}
-			// Live manifested workers must carry canonical cwd on registry + manifest.
-			if (worker.cwd === undefined || typeof manifest.cwd !== "string") {
-				throw new Error("missing canonical cwd on registry or manifest");
-			}
-			if (manifest.cwd !== worker.cwd) {
-				throw new Error("manifest cwd mismatch");
-			}
+			const manifest = validateAdoptionManifest(manifestRaw, { poolKey, worker });
 
 			const heartbeatRaw = tryReadIpcJson(control.heartbeat);
 			if (!heartbeatRaw) {
@@ -769,21 +915,23 @@ export async function adoptPoolWorkers(
 							runId: worker.activeAssignmentId,
 							workerId: worker.workerId,
 						});
-						if (result.uncertainWrite) {
+						try {
+							validateAndApplyTerminalResultLocked({
+								pool,
+								poolKey,
+								current,
+								worker,
+								assignmentId: worker.activeAssignmentId,
+								control,
+								paths,
+								result,
+								leases,
+							});
+						} catch {
 							pool.upsert({
 								...current,
-								status: "uncertain",
-								uncertainWrite: true,
+								status: "unhealthy",
 								updatedAt: new Date().toISOString(),
-							});
-						} else {
-							// Shared idempotent A→B (or idle) terminal transition.
-							completeCleanAssignmentLocked({
-								pool,
-								role: worker.role,
-								workerId: worker.workerId,
-								generation: worker.generation,
-								finishedAssignmentId: worker.activeAssignmentId,
 							});
 						}
 						return;
@@ -1108,36 +1256,10 @@ async function recheckReadOnlyAdoptionAfterGrace(options: {
 		if (!matchesExactSnapshot(currentBefore, worker)) return;
 
 		const manifestRaw = tryReadIpcJson(control.manifest);
-		if (!manifestRaw || typeof manifestRaw !== "object") {
+		if (!manifestRaw) {
 			throw new Error("missing manifest");
 		}
-		const manifest = manifestRaw as {
-			version?: number;
-			poolKey?: string;
-			workerId?: string;
-			generation?: number;
-			paneId?: string;
-			agentName?: string;
-			role?: string;
-			cwd?: string;
-		};
-		if (
-			manifest.version !== 2 ||
-			manifest.poolKey !== poolKey ||
-			manifest.workerId !== worker.workerId ||
-			manifest.generation !== worker.generation ||
-			manifest.paneId !== worker.paneId ||
-			manifest.agentName !== worker.agentName ||
-			manifest.role !== worker.role
-		) {
-			throw new Error("manifest identity mismatch");
-		}
-		if (worker.cwd === undefined || typeof manifest.cwd !== "string") {
-			throw new Error("missing canonical cwd on registry or manifest");
-		}
-		if (manifest.cwd !== worker.cwd) {
-			throw new Error("manifest cwd mismatch");
-		}
+		validateAdoptionManifest(manifestRaw, { poolKey, worker });
 
 		const heartbeatRaw = tryReadIpcJson(control.heartbeat);
 		if (!heartbeatRaw) {
@@ -1172,20 +1294,23 @@ async function recheckReadOnlyAdoptionAfterGrace(options: {
 					runId: worker.activeAssignmentId!,
 					workerId: worker.workerId,
 				});
-				if (result.uncertainWrite) {
+				try {
+					validateAndApplyTerminalResultLocked({
+						pool,
+						poolKey,
+						current,
+						worker,
+						assignmentId: worker.activeAssignmentId!,
+						control,
+						paths,
+						result,
+						leases: options.leases,
+					});
+				} catch {
 					pool.upsert({
 						...current,
-						status: "uncertain",
-						uncertainWrite: true,
+						status: "unhealthy",
 						updatedAt: new Date().toISOString(),
-					});
-				} else {
-					completeCleanAssignmentLocked({
-						pool,
-						role: worker.role,
-						workerId: worker.workerId,
-						generation: worker.generation,
-						finishedAssignmentId: worker.activeAssignmentId!,
 					});
 				}
 				return;

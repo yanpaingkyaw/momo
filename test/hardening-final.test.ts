@@ -14,6 +14,7 @@ import { installMomoParent } from "../src/extensions/parent.js";
 import { WriterLeaseManager, createLeaseToken } from "../src/lease/writer-lease.js";
 import { createHerdrChildSessionFactory, createStableParentId } from "../src/delegation/herdr-factory.js";
 import { HerdrClient, parseAgentGetResult, AGENT_PANE_BUSY_CODE } from "../src/herdr/client.js";
+import { createTestHerdrClient } from "./helpers/herdr-mock-client.js";
 import { PaneRegistry, RegistryCorruptionError } from "../src/herdr/registry.js";
 import {
 	isArchivalTombstone,
@@ -327,7 +328,7 @@ describe("factory rollback", () => {
 			cwd,
 			parentPaneId: "w1:p1",
 			parentId: `parent-${options.label}`,
-			client: new HerdrClient({ runCommand: options.runCommand }),
+			client: createTestHerdrClient({ runCommand: options.runCommand }),
 			poolRegistry: pool,
 			cacheRoot: pool.cacheRoot,
 			canonicalRoot: cwd,
@@ -559,7 +560,7 @@ describe("factory rollback", () => {
 				HERDR_WORKSPACE_ID: "test-ws",
 				HERDR_SOCKET_PATH: "test-sock",
 			},
-			client: new HerdrClient({
+			client: createTestHerdrClient({
 				runCommand: async (_file, args) => {
 					if (args[0] === "pane" && args[1] === "close") {
 						closed.push(String(args[2]));
@@ -706,7 +707,7 @@ describe("agent get / cancel statuses", () => {
 		const cwd = tempDir("momo-cancel-cwd-");
 		let gets = 0;
 		let now = 1_000_000;
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			agentStartBusyRetryMs: 0,
 			runCommand: async (_file, args) => {
 				if (args[0] === "pane" && args[1] === "split") {
@@ -754,6 +755,16 @@ describe("agent get / cancel statuses", () => {
 				}
 				if (args[0] === "agent" && args[1] === "get") {
 					gets += 1;
+					if (gets <= 2) {
+						return {
+							code: 1,
+							stdout: JSON.stringify({
+								id: "g",
+								error: { code: "agent_not_found", message: "missing" },
+							}),
+							stderr: "",
+						};
+					}
 					return {
 						code: 0,
 						stdout: JSON.stringify({
@@ -818,7 +829,7 @@ describe("agent get / cancel statuses", () => {
 		expect(tryReadIpcJson(implProxy.paths.cancel)).toBeTruthy();
 		expect(implProxy.uncertainWrite).toBe(false);
 		// No terminal-key / agentWait escalation on shared panes.
-		expect(gets).toBe(0);
+		expect(gets).toBe(2);
 		void AGENT_PANE_BUSY_CODE;
 	});
 });
@@ -851,7 +862,7 @@ describe("parent identity and quit", () => {
 			updatedAt: new Date().toISOString(),
 		});
 		const keys: string[][] = [];
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "agent" && args[1] === "send-keys") {
 					keys.push([...args]);
@@ -923,7 +934,7 @@ describe("parent identity and quit", () => {
 			updatedAt: new Date().toISOString(),
 		});
 		const keys: string[][] = [];
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "agent" && args[1] === "send-keys") {
 					keys.push([...args]);
@@ -1003,7 +1014,7 @@ describe("parent identity and quit", () => {
 			task: "foreign-still-queued",
 		});
 
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async () => ({
 				code: 0,
 				stdout: JSON.stringify({ id: "ok", result: {} }),
@@ -1052,7 +1063,7 @@ describe("parent identity and quit", () => {
 			activeParentEpoch: exitingEpoch,
 			updatedAt: new Date().toISOString(),
 		});
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async () => ({
 				code: 0,
 				stdout: JSON.stringify({ id: "ok", result: {} }),

@@ -4,7 +4,7 @@ Status: Baseline + Herdr pane-worker **implementation candidate** in package
 0.2.0; authenticated §27 and live §32.11 Herdr acceptance still pending
 Spec version: 1.1.0
 Package implementation version: 0.2.0 (`package.json`)
-Last updated: 2026-07-27
+Last updated: 2026-08-11
 
 Implementation-status summary (does not weaken normative requirements below):
 
@@ -73,7 +73,8 @@ Version 1 does not include:
 - Git worktree creation or automatic branch management.
 - Parallel agents with write or shell permissions.
 - User-defined or repository-defined specialist roles.
-- Per-role model selection.
+- ~~Per-role model selection.~~ **Implementation candidate (0.2.0):** optional
+  credential-free global policies via `momo/config.json` and `/momo-model`.
 - A workflow editor or persisted workflow definitions.
 - Publishing the package to npm.
 - Automatic commits, pushes, pull requests, or deployments.
@@ -1050,7 +1051,8 @@ The following may be considered after version 1:
 
 - User-defined roles loaded from trusted global configuration.
 - Project roles with explicit trust confirmation.
-- Per-role model and thinking-level selection.
+- Per-role model and thinking-level selection (**partial:** credential-free
+  `momo/config.json` + `/momo-model` in 0.2.0 candidate; live auth not automated).
 - Git worktree isolation for parallel implementers as a **product runtime**
   feature (distinct from delivery-governance worktrees in §32.12).
 - Configurable concurrency and output limits.
@@ -1230,6 +1232,66 @@ cannot add tools or widen permissions.
    completion or to extract final results.
 4. Pane TTY output is for humans and debugging only.
 
+#### 32.6.1 IPC protocol v2 (legacy) and v3 (configured policy)
+
+1. **Legacy mode** is defined only by an **absent** `momo/config.json` file.
+   Workers use manifest **v2** (no `boundPolicy` key). Queue/command/started/result
+   records must not include v3 `capability` / `modelPolicy` / `modelPolicyApplied`.
+2. **Configured mode** requires a present, validated `momo/config.json` with
+   `policies.default` whenever any scope is set. Delegation reads config **once**
+   per `runner.run()` and freezes assignment policy for that run.
+3. Configured workers use manifest **v3** with a concrete generation-bound
+   `boundPolicy`. Queue, command, started, and result must carry matching v3
+   policy fields. `null`/`undefined` `boundPolicy` is forbidden — omit the key
+   on legacy rows instead.
+4. Dispatch to an idle worker must enforce **bound vs assignment compatibility**:
+   configured dispatch requires registry `boundPolicy`; legacy dispatch requires
+   absence of `boundPolicy`. Incompatible idle workers must refuse dispatch until
+   `/momo-cleanup`.
+5. Terminal idle rebuild must **preserve** registry `boundPolicy` so configured
+   workers can be reused without re-provisioning.
+
+#### 32.6.2 Shared assignment recovery validation
+
+Worker reconciliation, parent adoption terminal advance, and live settlement
+must use a shared recovery validator:
+
+1. **v3:** `command.modelPolicy` = `manifest.boundPolicy` = registry
+   `boundPolicy` = `started.modelPolicy` = `result.modelPolicy` when present.
+2. **Completed v3** requires matching `started.json` and
+   `result.modelPolicyApplied: true`.
+3. **Early failed/aborted v3** without `started.json` requires
+   `result.modelPolicyApplied: false`.
+4. Violations mark the worker **unhealthy** (read-only roles) or **uncertain**
+   (implementer with started/lease evidence).
+5. Adoption protocol version (v2 vs v3) is determined from **durable**
+   manifest/registry state, not from the parent's current config file.
+
+#### 32.6.3 Credential-free model policy config
+
+1. Config path: `~/.config/momo/config.json` (private dir `0700`, file `0600`).
+2. Validation runs on every persist/build. Nonempty config requires
+   `policies.default`. Setting parent/role overrides before default must fail
+   with “configure default first” and write nothing.
+3. Config mutations use a token-fenced lock with dev/ino identity carried from
+   acquire through release; quarantine paths must not preexist; release validates
+   quarantine dev/ino and owner token before delete. Callback errors must be
+   preserved when release also fails (`AggregateError`).
+4. Parent effective-policy changes use optimistic CAS on the config snapshot.
+   Clearing to legacy without a pre-feature session baseline must refuse and
+   document restart/manual config removal.
+5. Credentials are configured via Pi only: start Momo/Pi, then run `/login` in
+   its interactive input and select the provider. Momo never reads `auth.json` or
+   stores credentials in `config.json`.
+
+#### 32.6.4 Absent-registry provisioning
+
+When no live registry row exists, Momo must fail closed if the role pool has
+control manifest/ready/heartbeat/active, queue/claim entries, assignment spool
+evidence (excluding the in-flight assignment being set up), or orphan-pane
+evidence. Only a **pristine** role pool may provision a new physical worker.
+Archival generation-0 tombstones follow the orphan-evidence gate only.
+
 ### 32.7 Herdr CLI invocation
 
 1. Momo must invoke the `herdr` CLI with an argv array and must not use a
@@ -1272,9 +1334,12 @@ cannot add tools or widen permissions.
    transient confirmation failure retains `paneClosed` + lease for a later
    `--force` retry without re-closing. Force-release failure after confirmed
    close retains `paneClosed:true` and `recoveryRequired:true`.
-5. Parent relaunch may adopt a pool worker only when registry + v2 manifest +
-   heartbeat freshness + Herdr identity match. Momo must not adopt arbitrary or
-   legacy v1 workers.
+5. Parent relaunch may adopt a pool worker only when registry + manifest (v2 or
+   v3 per durable state) + heartbeat freshness + Herdr identity match. v3
+   requires manifest/registry `boundPolicy` agreement; v2 requires absence of
+   `boundPolicy`. Current parent config enforces policy only on **new dispatch**,
+   not retroactively on adoption. Momo must not adopt arbitrary or legacy v1
+   workers.
 6. One-time migration must close terminal/ready legacy pane-per-task duplicates
    safely; active/uncertain legacy panes must fail clearly for operator cleanup.
 7. Parent shutdown must, under each role lock: remove every queued entry whose

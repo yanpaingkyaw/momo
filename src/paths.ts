@@ -13,6 +13,10 @@ export function getPackageRoot(): string {
 	return packageRoot;
 }
 
+export function getModelPolicyExtensionPath(): string {
+	return path.join(packageRoot, "dist", "extensions", "model-policy.js");
+}
+
 export function getParentExtensionPath(): string {
 	return path.join(packageRoot, "dist", "extensions", "parent.js");
 }

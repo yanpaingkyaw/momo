@@ -48,7 +48,7 @@ import {
 } from "../src/herdr/orphan-panes.js";
 import { installMomoWorker } from "../src/extensions/worker-runtime.js";
 import { workerControlPaths, assignmentSpoolPaths } from "../src/herdr/assignment-spool.js";
-import { atomicWriteJson, MAX_IPC_JSON_BYTES, DEFAULT_HEARTBEAT_CLOCK_SKEW_MS } from "../src/ipc/spool.js";
+import { atomicWriteJson, MAX_IPC_JSON_BYTES, DEFAULT_HEARTBEAT_CLOCK_SKEW_MS, IPC_PROTOCOL_CAPABILITY } from "../src/ipc/spool.js";
 import { tryReadIpcJson, validateResult } from "../src/ipc/validate.js";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
@@ -62,6 +62,7 @@ import {
 	type HerdrDiagnosticReport,
 } from "../src/delegation/herdr-factory.js";
 import { HerdrClient } from "../src/herdr/client.js";
+import { createTestHerdrClient } from "./helpers/herdr-mock-client.js";
 import { getRole } from "../src/roles.js";
 import {
 	installMomoParent,
@@ -357,7 +358,7 @@ describe("orphan pane cleanup evidence", () => {
 		});
 		let splitEntered = 0;
 		let closeCalls = 0;
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "pane" && args[1] === "split") {
 					splitEntered += 1;
@@ -475,7 +476,7 @@ describe("orphan pane cleanup evidence", () => {
 
 		// Provision allowed after cleanup once successor is archived.
 		pool.archiveRoleKeepingTombstone("scout", new Date().toISOString());
-		const client2 = new HerdrClient({
+		const client2 = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "pane" && args[1] === "split") {
 					const envArgs = args.filter((_a, i) => args[i - 1] === "--env");
@@ -659,7 +660,7 @@ describe("orphan pane cleanup evidence", () => {
 				HERDR_WORKSPACE_ID: "ws",
 				HERDR_SOCKET_PATH: "s",
 			},
-			client: new HerdrClient({
+			client: createTestHerdrClient({
 				runCommand: async (_file, args) => {
 					if (args[0] === "pane" && args[1] === "close") {
 						closed.push(String(args[2]));
@@ -758,7 +759,7 @@ describe("orphan pane cleanup evidence", () => {
 					HERDR_WORKSPACE_ID: "ws",
 					HERDR_SOCKET_PATH: "s",
 				},
-				client: new HerdrClient({
+				client: createTestHerdrClient({
 					runCommand: async (_file, args) => {
 						if (args[0] === "pane" && args[1] === "close") {
 							closed.push(String(args[2]));
@@ -843,7 +844,7 @@ describe("orphan pane cleanup evidence", () => {
 					HERDR_WORKSPACE_ID: "ws",
 					HERDR_SOCKET_PATH: "s",
 				},
-				client: new HerdrClient({
+				client: createTestHerdrClient({
 					runCommand: async (_file, args) => {
 						if (args[0] === "pane" && args[1] === "close") {
 							closed.push(String(args[2]));
@@ -930,7 +931,7 @@ describe("orphan pane cleanup evidence", () => {
 				HERDR_WORKSPACE_ID: "ws",
 				HERDR_SOCKET_PATH: "s",
 			},
-			client: new HerdrClient({
+			client: createTestHerdrClient({
 				runCommand: async (_file, args) => {
 					if (args[0] === "pane" && args[1] === "close") {
 						closed.push(String(args[2]));
@@ -987,7 +988,7 @@ describe("orphan pane cleanup evidence", () => {
 				HERDR_WORKSPACE_ID: "ws",
 				HERDR_SOCKET_PATH: "s",
 			},
-			client: new HerdrClient({
+			client: createTestHerdrClient({
 				runCommand: async (_file, args) => {
 					if (args[0] === "pane" && args[1] === "close") {
 						closed.push(String(args[2]));
@@ -1058,7 +1059,7 @@ describe("orphan pane cleanup evidence", () => {
 				HERDR_WORKSPACE_ID: "ws",
 				HERDR_SOCKET_PATH: "s",
 			},
-			client: new HerdrClient({
+			client: createTestHerdrClient({
 				runCommand: async (_file, args) => {
 					if (args[0] === "pane" && args[1] === "close") {
 						closed.push(String(args[2]));
@@ -1139,7 +1140,7 @@ describe("orphan pane cleanup evidence", () => {
 				HERDR_WORKSPACE_ID: "ws",
 				HERDR_SOCKET_PATH: "s",
 			},
-			client: new HerdrClient({
+			client: createTestHerdrClient({
 				runCommand: async (_file, args) => {
 					if (args[0] === "pane" && args[1] === "close") {
 						closed.push(String(args[2]));
@@ -1243,7 +1244,7 @@ describe("orphan pane cleanup evidence", () => {
 			cwd,
 			parentPaneId: "w1:p0",
 			parentId: "parent-orphan-tmp",
-			client: new HerdrClient({
+			client: createTestHerdrClient({
 				runCommand: async () => ({
 					code: 0,
 					stdout: JSON.stringify({ id: "ok", result: {} }),
@@ -1277,7 +1278,7 @@ describe("orphan pane cleanup evidence", () => {
 				HERDR_WORKSPACE_ID: "ws",
 				HERDR_SOCKET_PATH: "s",
 			},
-			client: new HerdrClient({
+			client: createTestHerdrClient({
 				runCommand: async (_file, args) => {
 					if (args[0] === "pane" && args[1] === "close") {
 						closed.push(String(args[2]));
@@ -1317,7 +1318,7 @@ describe("orphan pane cleanup evidence", () => {
 		__setOrphanEvidenceWriteForTest(() => {
 			throw new Error("injected orphan evidence atomic write failure");
 		});
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "pane" && args[1] === "split") {
 					splitEntered += 1;
@@ -1400,7 +1401,7 @@ describe("orphan pane cleanup evidence", () => {
 		__setOrphanEvidenceWriteForTest(() => {
 			throw new Error("injected orphan evidence atomic write failure");
 		});
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "pane" && args[1] === "split") {
 					splitEntered += 1;
@@ -1824,7 +1825,7 @@ describe("adoption heartbeat freshness", () => {
 			seq: 1,
 		});
 		const notes: string[] = [];
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async () => ({
 				code: 0,
 				stdout: JSON.stringify({
@@ -1883,7 +1884,7 @@ describe("archive then reprovision", () => {
 		expect(pool.nextGeneration("scout")).toBe(6);
 
 		let provisionedGen: string | undefined;
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "pane" && args[1] === "split") {
 					const envArgs = args.filter((_a, i) => args[i - 1] === "--env");
@@ -1978,7 +1979,7 @@ describe("archive then reprovision", () => {
 			cwd,
 			parentPaneId: "w1:p0",
 			parentId: "parent-refuse",
-			client: new HerdrClient({
+			client: createTestHerdrClient({
 				runCommand: async () => ({
 					code: 0,
 					stdout: JSON.stringify({ id: "ok", result: {} }),
@@ -2121,7 +2122,7 @@ describe("starting reservation wait (no duplicate provision)", () => {
 		});
 		let splitEntered = 0;
 
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "pane" && args[1] === "split") {
 					splitEntered += 1;
@@ -2249,7 +2250,7 @@ describe("starting reservation wait (no duplicate provision)", () => {
 			cwd: identity.canonicalRoot,
 			updatedAt: new Date().toISOString(),
 		});
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async () => ({
 				code: 0,
 				stdout: JSON.stringify({ id: "ok", result: {} }),
@@ -2305,7 +2306,7 @@ describe("starting reservation wait (no duplicate provision)", () => {
 			cwd: identity.canonicalRoot,
 			updatedAt: new Date().toISOString(),
 		});
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async () => ({
 				code: 0,
 				stdout: JSON.stringify({ id: "ok", result: {} }),
@@ -2361,7 +2362,7 @@ describe("starting reservation wait (no duplicate provision)", () => {
 			cwd: identity.canonicalRoot,
 			updatedAt: new Date().toISOString(),
 		});
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async () => ({
 				code: 0,
 				stdout: JSON.stringify({ id: "ok", result: {} }),
@@ -2407,7 +2408,7 @@ describe("starting reservation wait (no duplicate provision)", () => {
 		});
 		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
 		let splitCalls = 0;
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "pane" && args[1] === "split") {
 					splitCalls += 1;
@@ -2535,7 +2536,7 @@ describe("starting reservation wait (no duplicate provision)", () => {
 			releaseSplit = resolve;
 		});
 		let splitEntered = 0;
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "pane" && args[1] === "split") {
 					splitEntered += 1;
@@ -2659,7 +2660,7 @@ describe("starting reservation wait (no duplicate provision)", () => {
 		});
 		let agentStartEntered = 0;
 		const closed: string[] = [];
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "pane" && args[1] === "split") {
 					const envArgs = args.filter((_a, i) => args[i - 1] === "--env");
@@ -2785,7 +2786,7 @@ describe("starting reservation wait (no duplicate provision)", () => {
 		});
 		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
 		const closed: string[] = [];
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "pane" && args[1] === "split") {
 					const envArgs = args.filter((_a, i) => args[i - 1] === "--env");
@@ -2891,7 +2892,7 @@ describe("starting reservation wait (no duplicate provision)", () => {
 		});
 		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
 		const closed: string[] = [];
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "pane" && args[1] === "split") {
 					const envArgs = args.filter((_a, i) => args[i - 1] === "--env");
@@ -3022,7 +3023,7 @@ describe("starting reservation wait (no duplicate provision)", () => {
 			readyAt: new Date().toISOString(),
 		});
 		const closed: string[] = [];
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "pane" && args[1] === "close") {
 					closed.push(String(args[2]));
@@ -3091,7 +3092,7 @@ describe("starting reservation wait (no duplicate provision)", () => {
 			provisioningHeartbeatAt: staleAt,
 			updatedAt: staleAt,
 		});
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async () => ({
 				code: 0,
 				stdout: JSON.stringify({ id: "ok", result: {} }),
@@ -3157,7 +3158,7 @@ describe("starting reservation wait (no duplicate provision)", () => {
 			workerId: "wrong-worker",
 			readyAt: nowIso,
 		});
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async () => ({
 				code: 0,
 				stdout: JSON.stringify({ id: "ok", result: {} }),
@@ -3205,7 +3206,7 @@ describe("starting reservation wait (no duplicate provision)", () => {
 			releaseSplit = resolve;
 		});
 		let splitEntered = 0;
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "pane" && args[1] === "split") {
 					splitEntered += 1;
@@ -3291,7 +3292,7 @@ describe("starting reservation wait (no duplicate provision)", () => {
 			socketPath: "s",
 		});
 		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "pane" && args[1] === "split") {
 					const envArgs = args.filter((_a, i) => args[i - 1] === "--env");
@@ -3469,7 +3470,7 @@ describe("starting reservation wait (no duplicate provision)", () => {
 			await new Promise((r) => setTimeout(r, 40));
 		});
 
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async () => ({
 				code: 0,
 				stdout: JSON.stringify({ id: "ok", result: {} }),
@@ -3518,7 +3519,7 @@ describe("starting reservation wait (no duplicate provision)", () => {
 			releaseSplit = resolve;
 		});
 		let splitEntered = 0;
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "pane" && args[1] === "split") {
 					splitEntered += 1;
@@ -3600,7 +3601,7 @@ describe("starting reservation wait (no duplicate provision)", () => {
 		});
 		let splitEntered = 0;
 		const closed: string[] = [];
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "pane" && args[1] === "split") {
 					splitEntered += 1;
@@ -3689,7 +3690,7 @@ describe("starting reservation wait (no duplicate provision)", () => {
 			provisioningHeartbeatAt: futureAt,
 			updatedAt: futureAt,
 		});
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async () => ({
 				code: 0,
 				stdout: JSON.stringify({ id: "ok", result: {} }),
@@ -3735,7 +3736,7 @@ describe("starting reservation wait (no duplicate provision)", () => {
 		});
 		let splitEntered = false;
 		let renameSawPane = false;
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "pane" && args[1] === "split") {
 					splitEntered = true;
@@ -3839,7 +3840,7 @@ describe("starting reservation wait (no duplicate provision)", () => {
 			releaseRename = resolve;
 		});
 		let paneAtRename: string | undefined;
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "pane" && args[1] === "split") {
 					return {
@@ -4054,7 +4055,7 @@ describe("dispatch/claim durable order fault injection", () => {
 				cwd,
 				parentPaneId: "w1:p0",
 				parentId: "parent-fault",
-				client: new HerdrClient({
+				client: createTestHerdrClient({
 					runCommand: async () => ({
 						code: 0,
 						stdout: JSON.stringify({ id: "ok", result: {} }),
@@ -4135,7 +4136,7 @@ describe("dispatch/claim durable order fault injection", () => {
 				return originalUpsert(record);
 			}) as typeof pool.upsert;
 
-			const client = new HerdrClient({
+			const client = createTestHerdrClient({
 				runCommand: async () => ({
 					code: 0,
 					stdout: JSON.stringify({ id: "ok", result: {} }),
@@ -4233,7 +4234,7 @@ describe("adoption generation/worker fence", () => {
 			finishedAt: new Date().toISOString(),
 		});
 
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "agent" && args[1] === "get") {
 					pool.upsert({
@@ -4314,7 +4315,7 @@ describe("adoption generation/worker fence", () => {
 			seq: 1,
 		});
 		const notes: string[] = [];
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async () => ({
 				code: 0,
 				stdout: JSON.stringify({
@@ -4379,7 +4380,7 @@ describe("adoption generation/worker fence", () => {
 			seq: 1,
 		});
 		const notes: string[] = [];
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async () => ({
 				code: 0,
 				stdout: JSON.stringify({
@@ -4463,7 +4464,7 @@ describe("adoption generation/worker fence", () => {
 			dispatchedAt: new Date().toISOString(),
 		});
 
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "agent" && args[1] === "get") {
 					// Current advanced to idle before adoption lock runs.
@@ -4559,7 +4560,7 @@ describe("adoption generation/worker fence", () => {
 			finishedAt: new Date().toISOString(),
 		});
 
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "agent" && args[1] === "get") {
 					pool.upsert({
@@ -4647,7 +4648,7 @@ describe("adoption generation/worker fence", () => {
 		});
 
 		const notes: string[] = [];
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "agent" && args[1] === "get") {
 					// Current finished A → idle before catch lock; pane mismatch forces catch.
@@ -4741,7 +4742,7 @@ describe("adoption generation/worker fence", () => {
 		});
 
 		const notes: string[] = [];
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "agent" && args[1] === "get") {
 					pool.upsert({
@@ -4812,7 +4813,7 @@ describe("adoption generation/worker fence", () => {
 			cwd,
 			updatedAt: new Date().toISOString(),
 		});
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async () => ({ code: 0, stdout: "{}", stderr: "" }),
 		});
 		await adoptPoolWorkers(pool, client, identity.poolKey, { ui: { notify: () => undefined } });
@@ -4843,7 +4844,7 @@ describe("adoption generation/worker fence", () => {
 			cwd,
 			updatedAt: new Date().toISOString(),
 		});
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async () => ({ code: 0, stdout: "{}", stderr: "" }),
 		});
 		const notes: string[] = [];
@@ -4914,7 +4915,7 @@ describe("adoption generation/worker fence", () => {
 			at: nowIso,
 			seq: 1,
 		});
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async () => ({
 				code: 0,
 				stdout: JSON.stringify({
@@ -4946,7 +4947,7 @@ describe("adoption generation/worker fence", () => {
 		// Concurrent owner heartbeat refresh during adopt must no-op (fence mismatch),
 		// leaving the refreshed ownership pair intact — no idle transition / strip.
 		let refreshedHb: string | undefined;
-		const hbClient = new HerdrClient({
+		const hbClient = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "agent" && args[1] === "get") {
 					const current = pool.getByRole("scout")!;
@@ -5033,7 +5034,7 @@ describe("adoption generation/worker fence", () => {
 			seq: 1,
 		});
 		const notes: string[] = [];
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "agent" && args[1] === "get") {
 					return {
@@ -5082,7 +5083,7 @@ describe("adoption generation/worker fence", () => {
 			provisioningHeartbeatAt: nowIso,
 			updatedAt: nowIso,
 		});
-		const supersededClient = new HerdrClient({
+		const supersededClient = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "agent" && args[1] === "get") {
 					pool.upsert({
@@ -5144,8 +5145,9 @@ describe("adoption generation/worker fence", () => {
 			releaseAgentStart = resolve;
 		});
 		let agentStartEntered = 0;
+		let agentGetCalls = 0;
 		const closed: string[] = [];
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "pane" && args[1] === "split") {
 					const envArgs = args.filter((_a, i) => args[i - 1] === "--env");
@@ -5217,6 +5219,17 @@ describe("adoption generation/worker fence", () => {
 					};
 				}
 				if (args[0] === "agent" && args[1] === "get") {
+					agentGetCalls += 1;
+					if (agentGetCalls === 1) {
+						return {
+							code: 1,
+							stdout: JSON.stringify({
+								id: "g",
+								error: { code: "agent_not_found", message: "missing" },
+							}),
+							stderr: "",
+						};
+					}
 					return {
 						code: 0,
 						stdout: JSON.stringify({
@@ -5334,7 +5347,7 @@ describe("adoption generation/worker fence", () => {
 			at: nowIso,
 			seq: 1,
 		});
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async () => ({
 				code: 0,
 				stdout: JSON.stringify({
@@ -5406,7 +5419,7 @@ describe("adoption generation/worker fence", () => {
 		});
 
 		const notes: string[] = [];
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "agent" && args[1] === "get") {
 					pool.upsert({
@@ -5470,7 +5483,7 @@ describe("adoption generation/worker fence", () => {
 			updatedAt: new Date().toISOString(),
 		});
 
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async () => ({ code: 0, stdout: "{}", stderr: "" }),
 		});
 
@@ -6373,7 +6386,7 @@ describe("no terminal-key escalation on shared panes", () => {
 		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
 		const workerId = stableWorkerId(identity.poolKey, "scout");
 		const keys: string[][] = [];
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "agent" && args[1] === "send-keys") {
 					keys.push([...args]);
@@ -7346,7 +7359,7 @@ describe("clean-result terminal transition races", () => {
 			task: "task-b",
 		});
 
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async () => ({
 				code: 0,
 				stdout: JSON.stringify({
@@ -7699,7 +7712,7 @@ describe("implementer pre-start lease uncertain", () => {
 		});
 
 		const notes: string[] = [];
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async () => ({
 				code: 0,
 				stdout: JSON.stringify({
@@ -7798,7 +7811,7 @@ describe("implementer pre-start lease uncertain", () => {
 			parentEpoch: "e1",
 			startedAt: new Date().toISOString(),
 		});
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async () => ({
 				code: 0,
 				stdout: JSON.stringify({
@@ -7888,7 +7901,7 @@ describe("implementer pre-start lease uncertain", () => {
 			generation: 1,
 			parentEpoch: "e1",
 		});
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async () => ({
 				code: 0,
 				stdout: JSON.stringify({
@@ -7980,7 +7993,7 @@ describe("implementer pre-start lease uncertain", () => {
 			parentEpoch: "e1",
 			startedAt: new Date().toISOString(),
 		});
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async () => ({
 				code: 0,
 				stdout: JSON.stringify({
@@ -8067,7 +8080,7 @@ describe("implementer pre-start lease uncertain", () => {
 			generation: 1,
 			parentEpoch: "e1",
 		});
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async () => ({
 				code: 0,
 				stdout: JSON.stringify({
@@ -8225,6 +8238,8 @@ describe("read-only adoption active/no-result", () => {
 		corruptStarted?: boolean;
 		/** Corrupt active pointer for fail-closed tests. */
 		corruptActive?: boolean;
+		/** When set, use v3 manifest/registry/command policy fields. */
+		v3Policy?: { provider: string; model: string; reasoning: "off" | "low" | "medium" | "high" };
 	}) {
 		const { adoptPoolWorkers } = await import("../src/extensions/parent.js");
 		const cacheRoot = tempDir(`momo-ro-adopt-${options.label}-`);
@@ -8241,6 +8256,7 @@ describe("read-only adoption active/no-result", () => {
 		mkdirSync(control.root, { recursive: true, mode: 0o700 });
 		const assignmentA = "roactiveaaaaaa01";
 		const assignmentB = "roqueuedbbbbbb02";
+		const v3Policy = options.v3Policy;
 		pool.upsert({
 			workerId,
 			generation: 1,
@@ -8252,10 +8268,11 @@ describe("read-only adoption active/no-result", () => {
 			status: "busy",
 			activeAssignmentId: assignmentA,
 			activeParentEpoch: "e1",
+			...(v3Policy ? { boundPolicy: v3Policy } : {}),
 			updatedAt: new Date().toISOString(),
 		});
 		atomicWriteJson(control.manifest, {
-			version: 2,
+			version: v3Policy ? 3 : 2,
 			poolKey: identity.poolKey,
 			workerId,
 			generation: 1,
@@ -8264,6 +8281,7 @@ describe("read-only adoption active/no-result", () => {
 			paneId: "w1:p1",
 			agentName: "momo_scout",
 			createdAt: new Date().toISOString(),
+			...(v3Policy ? { boundPolicy: v3Policy } : {}),
 		});
 		atomicWriteJson(control.heartbeat, {
 			version: 1,
@@ -8304,6 +8322,9 @@ describe("read-only adoption active/no-result", () => {
 			workerId,
 			generation: 1,
 			parentEpoch: "e1",
+			...(v3Policy
+				? { capability: IPC_PROTOCOL_CAPABILITY, modelPolicy: v3Policy }
+				: {}),
 		});
 		if (options.corruptStarted) {
 			writeFileSync(pathsA.started, "{bad", { mode: 0o600 });
@@ -8328,7 +8349,7 @@ describe("read-only adoption active/no-result", () => {
 		}
 		const statusRef = options.agentStatusRef ?? { value: options.agentStatus };
 		statusRef.value = options.agentStatus;
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async () => ({
 				code: 0,
 				stdout: JSON.stringify({
@@ -8605,6 +8626,143 @@ describe("read-only adoption active/no-result", () => {
 		expect(after.activeAssignmentId).toBeUndefined();
 	});
 
+	it("started-grace v3 result without command marks unhealthy", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date("2024-01-01T00:00:00.000Z"));
+		const {
+			ADOPTION_STARTED_GRACE_MS,
+			__clearAdoptionGraceRechecksForTest,
+		} = await import("../src/extensions/parent.js");
+		__clearAdoptionGraceRechecksForTest();
+		const policy = { provider: "openai", model: "gpt-4o", reasoning: "off" as const };
+		const { pool, assignmentA, pathsA, workerId, control } = await setupBusyScout({
+			label: "grace-v3-no-cmd",
+			agentStatus: "idle",
+			dispatchAgeMs: 0,
+			v3Policy: policy,
+		});
+		await vi.advanceTimersByTimeAsync(Math.floor(ADOPTION_STARTED_GRACE_MS / 2));
+		atomicWriteJson(pathsA.started, {
+			version: 1,
+			runId: assignmentA,
+			workerId,
+			generation: 1,
+			parentEpoch: "e1",
+			startedAt: new Date().toISOString(),
+			capability: IPC_PROTOCOL_CAPABILITY,
+			modelPolicy: policy,
+		});
+		atomicWriteJson(control.heartbeat, {
+			version: 1,
+			runId: "g1",
+			workerId,
+			at: new Date().toISOString(),
+			seq: 2,
+		});
+		await vi.advanceTimersByTimeAsync(Math.floor(ADOPTION_STARTED_GRACE_MS / 2) + 1);
+		await flushMicrotasks();
+
+		rmSync(pathsA.command);
+		atomicWriteJson(pathsA.result, {
+			version: 1,
+			runId: assignmentA,
+			workerId,
+			status: "completed",
+			messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
+			finishedAt: new Date().toISOString(),
+			capability: IPC_PROTOCOL_CAPABILITY,
+			modelPolicy: policy,
+			modelPolicyApplied: true,
+		});
+		atomicWriteJson(control.heartbeat, {
+			version: 1,
+			runId: "g1",
+			workerId,
+			at: new Date().toISOString(),
+			seq: 3,
+		});
+		await vi.advanceTimersByTimeAsync(ADOPTION_STARTED_GRACE_MS + 1);
+		await flushMicrotasks();
+		const after = pool.getByRole("scout")!;
+		expect(after.status).toBe("unhealthy");
+		expect(after.activeAssignmentId).toBe(assignmentA);
+	});
+
+	it("started-grace v3 registry boundPolicy mismatch marks unhealthy", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date("2024-01-01T00:00:00.000Z"));
+		const {
+			ADOPTION_STARTED_GRACE_MS,
+			__clearAdoptionGraceRechecksForTest,
+		} = await import("../src/extensions/parent.js");
+		__clearAdoptionGraceRechecksForTest();
+		const policy = { provider: "openai", model: "gpt-4o", reasoning: "off" as const };
+		const mismatch = { provider: "openai", model: "gpt-4o-mini", reasoning: "off" as const };
+		const { pool, assignmentA, pathsA, workerId, control } = await setupBusyScout({
+			label: "grace-v3-registry",
+			agentStatus: "idle",
+			dispatchAgeMs: 0,
+			v3Policy: mismatch,
+		});
+		const manifestPath = workerControlPaths(pool.poolRoot, "scout").manifest;
+		atomicWriteJson(manifestPath, {
+			version: 3,
+			poolKey: pool.poolKey,
+			workerId,
+			generation: 1,
+			role: "scout",
+			cwd: pool.getByRole("scout")!.cwd,
+			paneId: "w1:p1",
+			agentName: "momo_scout",
+			createdAt: new Date().toISOString(),
+			boundPolicy: policy,
+		});
+		await vi.advanceTimersByTimeAsync(Math.floor(ADOPTION_STARTED_GRACE_MS / 2));
+		atomicWriteJson(pathsA.started, {
+			version: 1,
+			runId: assignmentA,
+			workerId,
+			generation: 1,
+			parentEpoch: "e1",
+			startedAt: new Date().toISOString(),
+			capability: IPC_PROTOCOL_CAPABILITY,
+			modelPolicy: policy,
+		});
+		atomicWriteJson(control.heartbeat, {
+			version: 1,
+			runId: "g1",
+			workerId,
+			at: new Date().toISOString(),
+			seq: 2,
+		});
+		await vi.advanceTimersByTimeAsync(Math.floor(ADOPTION_STARTED_GRACE_MS / 2) + 1);
+		await flushMicrotasks();
+
+		atomicWriteJson(pathsA.result, {
+			version: 1,
+			runId: assignmentA,
+			workerId,
+			status: "completed",
+			messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
+			finishedAt: new Date().toISOString(),
+			capability: IPC_PROTOCOL_CAPABILITY,
+			modelPolicy: policy,
+			modelPolicyApplied: true,
+		});
+		atomicWriteJson(control.heartbeat, {
+			version: 1,
+			runId: "g1",
+			workerId,
+			at: new Date().toISOString(),
+			seq: 3,
+		});
+		await vi.advanceTimersByTimeAsync(ADOPTION_STARTED_GRACE_MS + 1);
+		await flushMicrotasks();
+		const after = pool.getByRole("scout")!;
+		expect(after.status).toBe("unhealthy");
+		expect(after.activeAssignmentId).toBe(assignmentA);
+	});
+
 	it("started-grace recheck no-ops when successor generation replaces snapshot", async () => {
 		vi.useFakeTimers();
 		vi.setSystemTime(new Date("2024-01-01T00:00:00.000Z"));
@@ -8809,7 +8967,7 @@ describe("read-only adoption active/no-result", () => {
 				HERDR_WORKSPACE_ID: "ws",
 				HERDR_SOCKET_PATH: "s",
 			},
-			client: new HerdrClient({
+			client: createTestHerdrClient({
 				runCommand: async (_file, args) => {
 					if (args[0] === "pane" && args[1] === "close") {
 						closed.push(String(args[2]));
@@ -8855,7 +9013,7 @@ describe("read-only adoption active/no-result", () => {
 			cwd,
 			parentPaneId: "w1:p0",
 			parentId: "parent-ro-n1",
-			client: new HerdrClient({
+			client: createTestHerdrClient({
 				runCommand: async (_file, args) => {
 					if (args[0] === "pane" && args[1] === "split") {
 						const envArgs = args.filter((_a, i) => args[i - 1] === "--env");

@@ -20,6 +20,8 @@ import { IpcValidationError, EventsFileCapacityError } from "./errors.js";
 export { IpcValidationError, EventsFileCapacityError } from "./errors.js";
 
 export const IPC_VERSION = 1;
+/** Protocol capability for model-policy fencing (v3 requires modelPolicy field). */
+export const IPC_PROTOCOL_CAPABILITY = 3;
 export const MAX_IPC_JSON_BYTES = 256 * 1024;
 export const MAX_EVENTS_FILE_BYTES = 2 * 1024 * 1024;
 export const DEFAULT_HEARTBEAT_STALE_MS = 15_000;
@@ -55,9 +57,16 @@ export interface IpcReady {
 	readyAt: string;
 }
 
+export interface IpcModelPolicy {
+	provider: string;
+	model: string;
+	reasoning: string;
+}
+
 export type IpcCommand =
 	| {
 			version: number;
+			capability?: number;
 			type: "prompt";
 			task: string;
 			issuedAt: string;
@@ -65,6 +74,7 @@ export type IpcCommand =
 			workerId: string;
 			generation?: number;
 			parentEpoch?: string;
+			modelPolicy?: IpcModelPolicy;
 	  }
 	| {
 			version: number;
@@ -108,6 +118,7 @@ export interface IpcEvent {
 
 export interface IpcResult {
 	version: number;
+	capability?: number;
 	runId: string;
 	workerId: string;
 	status: "completed" | "failed" | "aborted";
@@ -117,6 +128,9 @@ export interface IpcResult {
 	errorMessage?: string;
 	uncertainWrite?: boolean;
 	finishedAt: string;
+	modelPolicy?: IpcModelPolicy;
+	/** False when assignment failed before verified prompt/start. */
+	modelPolicyApplied?: boolean;
 }
 
 /** Control-plane active pointer for the role worker. */
@@ -134,11 +148,13 @@ export interface IpcActivePointer {
  */
 export interface IpcStarted {
 	version: 1;
+	capability?: number;
 	runId: string;
 	workerId: string;
 	generation: number;
 	parentEpoch: string;
 	startedAt: string;
+	modelPolicy?: IpcModelPolicy;
 }
 
 export interface WorkerSpoolPaths {

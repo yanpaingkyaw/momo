@@ -31,8 +31,13 @@ export const LOCK_STALE_MS = 30_000;
 export const LOCK_MISSING_OWNER_GRACE_MS = 5_000;
 export const LOCK_HEARTBEAT_MS = 2_000;
 
+import type { IpcModelPolicy } from "../ipc/spool.js";
+import { IPC_PROTOCOL_CAPABILITY } from "../ipc/spool.js";
+import { assertExactKeys as assertIpcExactKeys, parseDiscriminatedIpcPolicy, validateModelPolicyField } from "../ipc/validate.js";
+
 export interface QueueEntry {
 	version: 1;
+	capability?: number;
 	assignmentId: string;
 	workerId: string;
 	generation: number;
@@ -40,6 +45,7 @@ export interface QueueEntry {
 	task: string;
 	enqueuedAt: string;
 	seq: number;
+	modelPolicy?: IpcModelPolicy;
 }
 
 export interface LockOwnerRecord {
@@ -375,7 +381,7 @@ function queueFileName(seq: number, assignmentId: string): string {
 	return `${String(seq).padStart(8, "0")}-${assignmentId}.json`;
 }
 
-function validateQueueEntry(value: unknown, label: string): QueueEntry {
+export function validateQueueEntry(value: unknown, label: string): QueueEntry {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) {
 		throw new QueueCorruptionError(`${label} must be an object`);
 	}
@@ -402,6 +408,39 @@ function validateQueueEntry(value: unknown, label: string): QueueEntry {
 	if (typeof record.seq !== "number" || !Number.isInteger(record.seq) || record.seq < 1) {
 		throw new QueueCorruptionError(`${label}.seq invalid`);
 	}
+	const capability =
+		record.capability === undefined
+			? undefined
+			: record.capability === IPC_PROTOCOL_CAPABILITY
+				? IPC_PROTOCOL_CAPABILITY
+				: (() => {
+						throw new QueueCorruptionError(`${label}.capability invalid`);
+					})();
+	const ipcPolicy = parseDiscriminatedIpcPolicy(record, label);
+	if (capability !== undefined && ipcPolicy.capability !== capability) {
+		throw new QueueCorruptionError(`${label}.capability mismatch`);
+	}
+	const modelPolicy = ipcPolicy.modelPolicy;
+	if (ipcPolicy.capability === IPC_PROTOCOL_CAPABILITY) {
+		assertIpcExactKeys(
+			record,
+			[
+				"version",
+				"capability",
+				"assignmentId",
+				"workerId",
+				"generation",
+				"parentEpoch",
+				"task",
+				"enqueuedAt",
+				"seq",
+				"modelPolicy",
+			],
+			label,
+		);
+	} else if ("capability" in record || "modelPolicy" in record) {
+		throw new QueueCorruptionError(`${label} legacy entry must omit capability and modelPolicy`);
+	}
 	return {
 		version: 1,
 		assignmentId: record.assignmentId,
@@ -411,6 +450,8 @@ function validateQueueEntry(value: unknown, label: string): QueueEntry {
 		task: record.task,
 		enqueuedAt: record.enqueuedAt,
 		seq: record.seq,
+		...(ipcPolicy.capability !== undefined ? { capability: ipcPolicy.capability } : {}),
+		...(modelPolicy !== undefined ? { modelPolicy } : {}),
 	};
 }
 
@@ -449,6 +490,8 @@ export function enqueueAssignment(
 		task: entry.task,
 		enqueuedAt: entry.enqueuedAt ?? new Date(now()).toISOString(),
 		seq,
+		...(entry.capability !== undefined ? { capability: entry.capability } : {}),
+		...(entry.modelPolicy !== undefined ? { modelPolicy: entry.modelPolicy } : {}),
 	};
 	validateQueueEntry(full, "queue entry");
 	const filePath = path.join(queueDir(poolRoot, role), queueFileName(seq, entry.assignmentId));
