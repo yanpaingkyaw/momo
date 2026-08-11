@@ -25,7 +25,10 @@ import {
 	QueueCorruptionError,
 	cancelQueuedAssignment,
 	QueueLockError,
+	RoleLockCallbackFailure,
 	__setLockAcquireHooksForTest,
+	__setLockReleaseHooksForTest,
+	__resetLockReleaseHooksForTest,
 } from "../src/herdr/role-queue.js";
 import {
 	PoolRegistry,
@@ -75,6 +78,7 @@ const tempDirs: string[] = [];
 afterEach(() => {
 	__resetProvisioningOwnershipHooksForTest();
 	__setLockAcquireHooksForTest();
+	__resetLockReleaseHooksForTest();
 	__resetCleanupRoleLockEnteredHookForTest();
 	__setOrphanEvidenceWriteForTest();
 	while (tempDirs.length > 0) {
@@ -315,6 +319,249 @@ describe("RoleTransactionLock", () => {
 		expect(existsSync(lock.lockDir)).toBe(true);
 		__setLockAcquireHooksForTest();
 		rmSync(lock.lockDir, { recursive: true, force: true });
+	});
+
+	it("releaseStrict throws QueueLockError when removal fails; lock path remains actionable", async () => {
+		const cacheRoot = tempDir("momo-lock-release-rm-");
+		const cwd = tempDir("momo-lock-release-rm-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		__setLockReleaseHooksForTest({
+			removeLockDir: () => {
+				throw new Error("release-rm-boom");
+			},
+		});
+		const lock = new RoleTransactionLock(pool.poolRoot, "scout");
+		await lock.acquire(1_000);
+		expect(() => lock.releaseStrict()).toThrow(QueueLockError);
+		expect(existsSync(lock.lockDir)).toBe(true);
+		expect(lock.isHeartbeatActiveForTest()).toBe(false);
+		__resetLockReleaseHooksForTest();
+		rmSync(lock.lockDir, { recursive: true, force: true });
+	});
+
+	it("releaseStrict refuses wrong token and leaves successor lock untouched", async () => {
+		const cacheRoot = tempDir("momo-lock-strict-token-");
+		const cwd = tempDir("momo-lock-strict-token-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const lock = new RoleTransactionLock(pool.poolRoot, "reviewer");
+		await lock.acquire(1_000);
+		const successorToken = "c".repeat(32);
+		writeFileSync(
+			path.join(lock.lockDir, "owner.json"),
+			`${JSON.stringify({
+				version: 1,
+				token: successorToken,
+				pid: process.pid,
+				at: new Date().toISOString(),
+				heartbeatAt: new Date().toISOString(),
+			})}\n`,
+			{ mode: 0o600 },
+		);
+		expect(() => lock.releaseStrict()).toThrow(/token mismatch/);
+		expect(existsSync(lock.lockDir)).toBe(true);
+		expect(readLockOwnerForTest(lock.lockDir)?.token).toBe(successorToken);
+		rmSync(lock.lockDir, { recursive: true, force: true });
+	});
+
+	it("withRoleLock surfaces release error when callback succeeds", () => {
+		const cacheRoot = tempDir("momo-lock-wrap-release-");
+		const cwd = tempDir("momo-lock-wrap-release-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		__setLockReleaseHooksForTest({
+			removeLockDir: () => {
+				throw new Error("release-rm-boom");
+			},
+		});
+		expect(() =>
+			withRoleLock(pool.poolRoot, "planner", () => "ok"),
+		).toThrow(/release-rm-boom/);
+		expect(existsSync(path.join(pool.poolRoot, "roles", "planner", "tx.lock"))).toBe(true);
+		rmSync(path.join(pool.poolRoot, "roles", "planner", "tx.lock"), {
+			recursive: true,
+			force: true,
+		});
+	});
+
+	it("withRoleLock throws AggregateError when callback and release both fail", () => {
+		const cacheRoot = tempDir("momo-lock-wrap-agg-");
+		const cwd = tempDir("momo-lock-wrap-agg-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		__setLockReleaseHooksForTest({
+			removeLockDir: () => {
+				throw new Error("release-rm-boom");
+			},
+		});
+		expect(() =>
+			withRoleLock(pool.poolRoot, "implementer", () => {
+				throw new Error("callback-boom");
+			}),
+		).toThrow(AggregateError);
+		rmSync(path.join(pool.poolRoot, "roles", "implementer", "tx.lock"), {
+			recursive: true,
+			force: true,
+		});
+	});
+
+	it("withRoleLockAsync throws AggregateError when callback and release both fail", async () => {
+		const cacheRoot = tempDir("momo-lock-wrap-agg-async-");
+		const cwd = tempDir("momo-lock-wrap-agg-async-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		__setLockReleaseHooksForTest({
+			removeLockDir: () => {
+				throw new Error("release-rm-boom");
+			},
+		});
+		await expect(
+			withRoleLockAsync(pool.poolRoot, "scout", async () => {
+				throw new Error("callback-boom");
+			}),
+		).rejects.toThrow(AggregateError);
+		rmSync(path.join(pool.poolRoot, "roles", "scout", "tx.lock"), {
+			recursive: true,
+			force: true,
+		});
+	});
+
+	it("withRoleLock rejects when callback throws undefined", () => {
+		const cacheRoot = tempDir("momo-lock-cb-undef-");
+		const cwd = tempDir("momo-lock-cb-undef-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		let caught: unknown;
+		try {
+			withRoleLock(pool.poolRoot, "planner", () => {
+				throw undefined;
+			});
+		} catch (error) {
+			caught = error;
+		}
+		expect(caught).toBeInstanceOf(RoleLockCallbackFailure);
+		expect((caught as RoleLockCallbackFailure).callbackValue).toBeUndefined();
+	});
+
+	it("withRoleLockAsync rejects when callback throws undefined", async () => {
+		const cacheRoot = tempDir("momo-lock-cb-undef-async-");
+		const cwd = tempDir("momo-lock-cb-undef-async-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		let caught: unknown;
+		try {
+			await withRoleLockAsync(pool.poolRoot, "reviewer", async () => {
+				throw undefined;
+			});
+		} catch (error) {
+			caught = error;
+		}
+		expect(caught).toBeInstanceOf(RoleLockCallbackFailure);
+		expect((caught as RoleLockCallbackFailure).callbackValue).toBeUndefined();
+	});
+
+	it("withRoleLock throws AggregateError when callback throws undefined and release fails", () => {
+		const cacheRoot = tempDir("momo-lock-agg-undef-");
+		const cwd = tempDir("momo-lock-agg-undef-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		__setLockReleaseHooksForTest({
+			removeLockDir: () => {
+				throw new Error("release-rm-boom");
+			},
+		});
+		let caught: unknown;
+		try {
+			withRoleLock(pool.poolRoot, "implementer", () => {
+				throw undefined;
+			});
+		} catch (error) {
+			caught = error;
+		}
+		expect(caught).toBeInstanceOf(AggregateError);
+		const aggregate = caught as AggregateError;
+		expect(aggregate.errors).toHaveLength(2);
+		expect(aggregate.errors[0]).toBeUndefined();
+		expect(String(aggregate.errors[1])).toMatch(/release-rm-boom/);
+		rmSync(path.join(pool.poolRoot, "roles", "implementer", "tx.lock"), {
+			recursive: true,
+			force: true,
+		});
+	});
+
+	it("withRoleLockAsync throws AggregateError when callback throws undefined and release fails", async () => {
+		const cacheRoot = tempDir("momo-lock-agg-undef-async-");
+		const cwd = tempDir("momo-lock-agg-undef-async-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		__setLockReleaseHooksForTest({
+			removeLockDir: () => {
+				throw new Error("release-rm-boom");
+			},
+		});
+		let caught: unknown;
+		try {
+			await withRoleLockAsync(pool.poolRoot, "scout", async () => {
+				throw undefined;
+			});
+		} catch (error) {
+			caught = error;
+		}
+		expect(caught).toBeInstanceOf(AggregateError);
+		const aggregate = caught as AggregateError;
+		expect(aggregate.errors).toHaveLength(2);
+		expect(aggregate.errors[0]).toBeUndefined();
+		expect(String(aggregate.errors[1])).toMatch(/release-rm-boom/);
+		rmSync(path.join(pool.poolRoot, "roles", "scout", "tx.lock"), {
+			recursive: true,
+			force: true,
+		});
 	});
 });
 

@@ -16,7 +16,7 @@ import { readMomoConfig } from "../config/momo-config.js";
 import { registerModelPolicyCommands } from "../config/model-commands.js";
 import { createDelegateTool } from "../delegation/tool.js";
 import { createDelegationRunner } from "../delegation/runner.js";
-import { AGENT_NAMES, getRole, ROLE_LIST } from "../roles.js";
+import { AGENT_NAMES, getRole, ROLE_LIST, type AgentName } from "../roles.js";
 import {
 	createHerdrChildSessionFactory,
 	createParentEpoch,
@@ -1643,67 +1643,89 @@ export async function confirmAgentStoppedForCleanup(
 }
 
 /**
+ * Under the role lock: drop matching FIFO/claiming entries and cancel exact active
+ * assignments owned by `parentEpoch`.
+ */
+function cancelEpochAssignmentsForRoleLocked(
+	pool: PoolRegistry,
+	role: AgentName,
+	parentEpoch: string,
+): void {
+	const current = pool.getByRole(role);
+	if (!current) return;
+
+	// Remove every queued entry owned by this epoch; leave foreign FIFO order untouched.
+	for (const entry of listQueue(pool.poolRoot, role)) {
+		if (entry.parentEpoch === parentEpoch) {
+			cancelQueuedAssignment(pool.poolRoot, role, entry.assignmentId);
+		}
+	}
+
+	const activeBusy =
+		current.status === "busy" ||
+		current.status === "blocked" ||
+		current.status === "starting";
+	const activeMatchesEpoch =
+		activeBusy &&
+		current.activeParentEpoch === parentEpoch &&
+		Boolean(current.activeAssignmentId);
+
+	// Claiming entries for this epoch: cancel if they are the live active
+	// assignment; otherwise remove so they cannot recover/run after quit.
+	for (const entry of listClaiming(pool.poolRoot, role)) {
+		if (entry.parentEpoch !== parentEpoch) continue;
+		const isActiveAssignment =
+			activeMatchesEpoch && current.activeAssignmentId === entry.assignmentId;
+		if (isActiveAssignment) {
+			writeAssignmentCancelIpc({
+				poolRoot: pool.poolRoot,
+				role,
+				assignmentId: entry.assignmentId,
+				workerId: current.workerId,
+				generation: current.generation,
+			});
+		} else {
+			commitClaim(pool.poolRoot, role, entry);
+		}
+	}
+
+	// Exact active assignment cancel when this epoch owns the busy pointer.
+	if (activeMatchesEpoch && current.activeAssignmentId) {
+		writeAssignmentCancelIpc({
+			poolRoot: pool.poolRoot,
+			role,
+			assignmentId: current.activeAssignmentId,
+			workerId: current.workerId,
+			generation: current.generation,
+		});
+	}
+}
+
+/**
  * Shutdown cancels only assignments owned by this parent epoch.
- * Under each role lock: drop matching FIFO/claiming entries, cancel exact active.
+ * Iterates every known role independently; one corrupt/unreadable role records
+ * an error but never prevents healthy roles from canceling durably.
  */
 export async function cancelEpochAssignmentsOnQuit(
 	pool: PoolRegistry,
 	parentEpoch: string,
 	_client: HerdrClient,
 ): Promise<void> {
-	const { snapshot } = pool.tryRead();
-	const roles = [...new Set(snapshot.workers.map((worker) => worker.role))];
-	for (const role of roles) {
-		await withRoleLockAsync(pool.poolRoot, role, () => {
-			const current = pool.getByRole(role);
-			if (!current) return;
-
-			// Remove every queued entry owned by this epoch; leave foreign FIFO order untouched.
-			for (const entry of listQueue(pool.poolRoot, role)) {
-				if (entry.parentEpoch === parentEpoch) {
-					cancelQueuedAssignment(pool.poolRoot, role, entry.assignmentId);
-				}
-			}
-
-			const activeBusy =
-				current.status === "busy" ||
-				current.status === "blocked" ||
-				current.status === "starting";
-			const activeMatchesEpoch =
-				activeBusy &&
-				current.activeParentEpoch === parentEpoch &&
-				Boolean(current.activeAssignmentId);
-
-			// Claiming entries for this epoch: cancel if they are the live active
-			// assignment; otherwise remove so they cannot recover/run after quit.
-			for (const entry of listClaiming(pool.poolRoot, role)) {
-				if (entry.parentEpoch !== parentEpoch) continue;
-				const isActiveAssignment =
-					activeMatchesEpoch && current.activeAssignmentId === entry.assignmentId;
-				if (isActiveAssignment) {
-					writeAssignmentCancelIpc({
-						poolRoot: pool.poolRoot,
-						role,
-						assignmentId: entry.assignmentId,
-						workerId: current.workerId,
-						generation: current.generation,
-					});
-				} else {
-					commitClaim(pool.poolRoot, role, entry);
-				}
-			}
-
-			// Exact active assignment cancel when this epoch owns the busy pointer.
-			if (activeMatchesEpoch && current.activeAssignmentId) {
-				writeAssignmentCancelIpc({
-					poolRoot: pool.poolRoot,
-					role,
-					assignmentId: current.activeAssignmentId,
-					workerId: current.workerId,
-					generation: current.generation,
-				});
-			}
-		});
+	const errors: unknown[] = [];
+	for (const role of AGENT_NAMES) {
+		try {
+			await withRoleLockAsync(pool.poolRoot, role, () => {
+				cancelEpochAssignmentsForRoleLocked(pool, role, parentEpoch);
+			});
+		} catch (error) {
+			errors.push(error);
+		}
+	}
+	if (errors.length > 0) {
+		throw new AggregateError(
+			errors,
+			"cancelEpochAssignmentsOnQuit failed for one or more roles",
+		);
 	}
 }
 

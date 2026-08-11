@@ -21,7 +21,7 @@ import {
 	PoolRegistry,
 	selectClosablePoolWorkers,
 } from "../src/herdr/pool-registry.js";
-import { resolvePoolIdentity } from "../src/herdr/pool-identity.js";
+import { resolvePoolIdentity, stableWorkerId } from "../src/herdr/pool-identity.js";
 import { beginClaimHead, enqueueAssignment, listClaiming, listQueue } from "../src/herdr/role-queue.js";
 import { atomicWriteJson } from "../src/ipc/spool.js";
 import {
@@ -1078,6 +1078,87 @@ describe("parent identity and quit", () => {
 		});
 		// Active claiming entry is canceled, not removed (recovery evidence).
 		expect(listClaiming(fixture.pool.poolRoot, "implementer")).toHaveLength(1);
+	});
+
+	it("cancelEpochAssignmentsOnQuit: corrupt role errors but healthy roles cancel durably", async () => {
+		const cwd = tempDir("momo-quit-corrupt-cwd-");
+		const cacheRoot = tempDir("momo-quit-corrupt-cache-");
+		const fixture = setupPoolWorkerFixture({
+			cacheRoot,
+			cwd,
+			role: "implementer",
+			assignmentId: "implactive001",
+		});
+		const exitingEpoch = "shutdown-epoch";
+		const reviewerWorkerId = stableWorkerId(fixture.identity.poolKey, "reviewer");
+		const reviewerAssignmentId = "reviewqueued01";
+
+		fixture.pool.upsert({
+			workerId: stableWorkerId(fixture.identity.poolKey, "scout"),
+			generation: 1,
+			generationTombstone: 1,
+			role: "scout",
+			paneId: "w1:p9",
+			agentName: "momo_scout",
+			status: "idle",
+			updatedAt: new Date().toISOString(),
+		});
+		writeFileSync(fixture.pool.roleFile("scout"), "{bad", { mode: 0o600 });
+
+		fixture.pool.upsert({
+			workerId: reviewerWorkerId,
+			generation: 1,
+			generationTombstone: 1,
+			role: "reviewer",
+			paneId: "w1:p3",
+			agentName: "momo_reviewer",
+			status: "idle",
+			updatedAt: new Date().toISOString(),
+		});
+		enqueueAssignment(fixture.pool.poolRoot, "reviewer", {
+			assignmentId: reviewerAssignmentId,
+			workerId: reviewerWorkerId,
+			generation: 1,
+			parentEpoch: exitingEpoch,
+			task: "review-queued",
+		});
+
+		fixture.pool.upsert({
+			workerId: fixture.workerId,
+			generation: fixture.generation,
+			generationTombstone: fixture.generation,
+			role: "implementer",
+			paneId: "w1:p2",
+			agentName: "momo_implementer",
+			status: "busy",
+			activeAssignmentId: fixture.assignmentId,
+			activeParentEpoch: exitingEpoch,
+			updatedAt: new Date().toISOString(),
+		});
+
+		const client = createTestHerdrClient({
+			runCommand: async () => ({
+				code: 0,
+				stdout: JSON.stringify({ id: "ok", result: {} }),
+				stderr: "",
+			}),
+		});
+		const { cancelEpochAssignmentsOnQuit } = await import("../src/extensions/parent.js");
+		let quitError: unknown;
+		try {
+			await cancelEpochAssignmentsOnQuit(fixture.pool, exitingEpoch, client);
+		} catch (error) {
+			quitError = error;
+		}
+		expect(quitError).toBeInstanceOf(AggregateError);
+		const aggregate = quitError as AggregateError;
+		expect(aggregate.errors.some((e) => /scout|corrupt/i.test(String(e)))).toBe(true);
+
+		expect(tryReadIpcJson(fixture.paths.cancel)).toMatchObject({
+			reason: "parent_session_shutdown",
+			runId: fixture.assignmentId,
+		});
+		expect(listQueue(fixture.pool.poolRoot, "reviewer")).toHaveLength(0);
 	});
 });
 

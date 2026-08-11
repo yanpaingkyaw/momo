@@ -74,6 +74,26 @@ export class QueueLockError extends Error {
 	}
 }
 
+/** Callback threw/rejected `undefined` — bare undefined cannot be rethrown with throw semantics. */
+export class RoleLockCallbackFailure extends Error {
+	readonly callbackValue: unknown;
+
+	constructor(callbackValue: unknown) {
+		super(
+			callbackValue === undefined
+				? "Role lock callback threw undefined"
+				: callbackValue instanceof Error
+					? callbackValue.message
+					: String(callbackValue),
+		);
+		this.name = "RoleLockCallbackFailure";
+		this.callbackValue = callbackValue;
+		if (callbackValue !== undefined) {
+			this.cause = callbackValue;
+		}
+	}
+}
+
 export class QueueCorruptionError extends Error {
 	constructor(message: string) {
 		super(message);
@@ -127,6 +147,7 @@ function formatLockError(error: unknown): string {
 /** @internal test-only: injectable acquire init / rollback primitives. */
 let writeOwnerAtomicForAcquire = writeOwnerAtomicDefault;
 let removeLockDirForAcquireRollback = removeLockDirDefault;
+let removeLockDirForRelease = removeLockDirDefault;
 let afterLockOwnerInitializedForTest: ((lockDir: string) => void) | undefined;
 
 /** @internal test-only: inject owner-write / heartbeat-init / rollback-rm faults. */
@@ -139,6 +160,18 @@ export function __setLockAcquireHooksForTest(hooks?: {
 	writeOwnerAtomicForAcquire = hooks?.writeOwnerAtomic ?? writeOwnerAtomicDefault;
 	removeLockDirForAcquireRollback = hooks?.removeLockDir ?? removeLockDirDefault;
 	afterLockOwnerInitializedForTest = hooks?.afterOwnerInitialized;
+}
+
+/** @internal test-only: inject release-time lock directory removal faults. */
+export function __setLockReleaseHooksForTest(hooks?: {
+	removeLockDir?: (lockDir: string) => void;
+}): void {
+	removeLockDirForRelease = hooks?.removeLockDir ?? removeLockDirDefault;
+}
+
+/** @internal test-only */
+export function __resetLockReleaseHooksForTest(): void {
+	removeLockDirForRelease = removeLockDirDefault;
 }
 
 function writeOwnerAtomic(lockDir: string, owner: LockOwnerRecord): void {
@@ -283,19 +316,30 @@ export class RoleTransactionLock {
 	release(): void {
 		if (!this.held || !this.token) return;
 		this.stopHeartbeat();
+		const lockDir = this.lockDir;
 		const token = this.token;
 		this.held = false;
 		this.token = undefined;
 		try {
-			const owner = readOwner(this.lockDir);
-			if (!owner || owner.token !== token) {
-				// Successor already owns the lock — never rm.
-				return;
-			}
-			rmSync(this.lockDir, { recursive: true, force: true });
+			releaseRoleTransactionLock(lockDir, token);
 		} catch {
-			// best effort
+			// best effort — lock path may remain for supervised recovery
 		}
+	}
+
+	/** Stop heartbeat, clear held state, validate token, then remove (throws on failure). */
+	releaseStrict(): void {
+		if (!this.held || !this.token) return;
+		this.stopHeartbeat();
+		const lockDir = this.lockDir;
+		const token = this.token;
+		this.held = false;
+		this.token = undefined;
+		releaseRoleTransactionLock(lockDir, token);
+	}
+
+	isHeartbeatActiveForTest(): boolean {
+		return this.heartbeatTimer !== undefined;
 	}
 
 	getTokenForTest(): string | undefined {
@@ -329,6 +373,44 @@ export class RoleTransactionLock {
 	}
 }
 
+function releaseRoleTransactionLock(lockDir: string, token: string): void {
+	const owner = readOwner(lockDir);
+	if (!owner || owner.token !== token) {
+		throw new QueueLockError("Role transaction lock release refused: token mismatch");
+	}
+	try {
+		removeLockDirForRelease(lockDir);
+	} catch (error) {
+		throw new QueueLockError(
+			`Role transaction lock release removal failed at ${lockDir}: ${formatLockError(error)}`,
+			{ cause: error },
+		);
+	}
+}
+
+function rethrowCallbackFailure(callbackError: unknown): never {
+	if (callbackError === undefined) {
+		throw new RoleLockCallbackFailure(undefined);
+	}
+	throw callbackError;
+}
+
+function finalizeReleaseFromCallback(
+	callbackFailed: boolean,
+	callbackError: unknown,
+	releaseFailed: boolean,
+	releaseError: unknown,
+): void {
+	if (callbackFailed && releaseFailed) {
+		throw new AggregateError(
+			[callbackError, releaseError],
+			"Role lock operation failed and lock release failed",
+		);
+	}
+	if (releaseFailed) throw releaseError;
+	if (callbackFailed) rethrowCallbackFailure(callbackError);
+}
+
 export function withRoleLock<T>(
 	poolRoot: string,
 	role: AgentName,
@@ -342,11 +424,25 @@ export function withRoleLock<T>(
 ): T {
 	const lock = new RoleTransactionLock(poolRoot, role, options);
 	lock.acquireSync(options?.timeoutMs ?? 10_000);
+	let callbackFailed = false;
+	let callbackError: unknown;
 	try {
 		return fn();
+	} catch (error) {
+		callbackFailed = true;
+		callbackError = error;
 	} finally {
-		lock.release();
+		let releaseFailed = false;
+		let releaseError: unknown;
+		try {
+			lock.releaseStrict();
+		} catch (error) {
+			releaseFailed = true;
+			releaseError = error;
+		}
+		finalizeReleaseFromCallback(callbackFailed, callbackError, releaseFailed, releaseError);
 	}
+	throw new Error("unreachable role lock callback");
 }
 
 export async function withRoleLockAsync<T>(
@@ -362,11 +458,26 @@ export async function withRoleLockAsync<T>(
 ): Promise<T> {
 	const lock = new RoleTransactionLock(poolRoot, role, options);
 	await lock.acquire(options?.timeoutMs ?? 10_000);
+	let callbackFailed = false;
+	let callbackError: unknown;
+	let result: T | undefined;
 	try {
-		return await fn();
+		result = await fn();
+	} catch (error) {
+		callbackFailed = true;
+		callbackError = error;
 	} finally {
-		lock.release();
+		let releaseFailed = false;
+		let releaseError: unknown;
+		try {
+			lock.releaseStrict();
+		} catch (error) {
+			releaseFailed = true;
+			releaseError = error;
+		}
+		finalizeReleaseFromCallback(callbackFailed, callbackError, releaseFailed, releaseError);
 	}
+	return result as T;
 }
 
 function queueDir(poolRoot: string, role: AgentName): string {
