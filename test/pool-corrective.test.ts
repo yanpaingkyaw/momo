@@ -8208,8 +8208,10 @@ describe("read-only adoption active/no-result", () => {
 	afterEach(async () => {
 		if (previousPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = previousPiDir;
-		const { __clearAdoptionGraceRechecksForTest } = await import("../src/extensions/parent.js");
+		const { __clearAdoptionGraceRechecksForTest, __resetAdoptionGraceRecheckHooksForTest } =
+			await import("../src/extensions/parent.js");
 		__clearAdoptionGraceRechecksForTest();
+		__resetAdoptionGraceRecheckHooksForTest();
 		vi.useRealTimers();
 	});
 
@@ -8380,6 +8382,7 @@ describe("read-only adoption active/no-result", () => {
 			control,
 			pathsA,
 			statusRef,
+			client,
 		};
 	}
 
@@ -8430,6 +8433,61 @@ describe("read-only adoption active/no-result", () => {
 		const after = pool.getByRole("scout")!;
 		expect(after.status).toBe("unhealthy");
 		expect(after.activeAssignmentId).toBe(assignmentA);
+	});
+
+	it("post-grace recheck survives injected role-lock failure without unhandled rejection", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date("2024-01-01T00:00:00.000Z"));
+		const {
+			ADOPTION_STARTED_GRACE_MS,
+			__adoptionGraceRecheckCountForTest,
+			__clearAdoptionGraceRechecksForTest,
+			__setAdoptionGraceRecheckHooksForTest,
+			adoptPoolWorkers,
+		} = await import("../src/extensions/parent.js");
+		__clearAdoptionGraceRechecksForTest();
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		const { pool, assignmentA, workerId, identity, client } = await setupBusyScout({
+			label: "grace-lock-fault",
+			agentStatus: "idle",
+			dispatchAgeMs: 0,
+		});
+		expect(__adoptionGraceRecheckCountForTest()).toBe(1);
+		__setAdoptionGraceRecheckHooksForTest({
+			onRoleLock: () => {
+				throw new Error("injected role-lock fault");
+			},
+		});
+		const unhandled: unknown[] = [];
+		const onRejection = (reason: unknown) => {
+			unhandled.push(reason);
+		};
+		process.on("unhandledRejection", onRejection);
+		try {
+			await vi.advanceTimersByTimeAsync(ADOPTION_STARTED_GRACE_MS + 1);
+			await vi.runAllTimersAsync();
+			await flushMicrotasks();
+		} finally {
+			process.off("unhandledRejection", onRejection);
+		}
+		expect(unhandled).toHaveLength(0);
+		expect(
+			errorSpy.mock.calls.some(
+				([message]) =>
+					String(message).includes("role=scout") &&
+					String(message).includes(`worker=${workerId}`) &&
+					String(message).includes("generation=1"),
+			),
+		).toBe(true);
+		errorSpy.mockRestore();
+		const after = pool.getByRole("scout")!;
+		expect(after.status).toBe("busy");
+		expect(after.activeAssignmentId).toBe(assignmentA);
+		await expect(
+			adoptPoolWorkers(pool, client, identity.poolKey, {
+				ui: { notify: () => undefined },
+			}),
+		).resolves.toBeUndefined();
 	});
 
 	it("post-grace recheck no-ops when generation advances", async () => {

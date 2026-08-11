@@ -103,6 +103,27 @@ export function __resetClaimRetryRecoveryHookForTest(): void {
 	claimRetryRecoveryHookForTest = undefined;
 }
 
+/** @internal test-only: fault injection during control/lease/assignment heartbeat writes. */
+let controlHeartbeatHookForTest: ((phase: "control" | "lease" | "assignment") => void) | undefined;
+
+/** @internal test-only: fault injection during heartbeat-failure registry fence. */
+let heartbeatFenceHookForTest: (() => void) | undefined;
+
+/** @internal test-only */
+export function __setControlHeartbeatHooksForTest(hooks?: {
+	onWrite?: (phase: "control" | "lease" | "assignment") => void;
+	onFence?: () => void;
+}): void {
+	controlHeartbeatHookForTest = hooks?.onWrite;
+	heartbeatFenceHookForTest = hooks?.onFence;
+}
+
+/** @internal test-only */
+export function __resetControlHeartbeatHooksForTest(): void {
+	controlHeartbeatHookForTest = undefined;
+	heartbeatFenceHookForTest = undefined;
+}
+
 /** @internal test-only: barrier inside writeResultDurable while holding the role lock. */
 let writeResultDurableLockHook:
 	| ((phase: "before-write" | "after-write") => void)
@@ -300,6 +321,7 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 	}
 
 	function writeControlHeartbeat(): void {
+		controlHeartbeatHookForTest?.("control");
 		controlHeartbeatSeq += 1;
 		atomicWriteJson(controlPaths.heartbeat, {
 			version: 1,
@@ -309,13 +331,11 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 			seq: controlHeartbeatSeq,
 		});
 		if (active?.leaseHeld) {
-			try {
-				lease.heartbeat(cwd, leaseOwner, active.leaseToken);
-			} catch {
-				disableMutationTools();
-			}
+			controlHeartbeatHookForTest?.("lease");
+			lease.heartbeat(cwd, leaseOwner, active.leaseToken);
 		}
 		if (active && !active.resultWritten) {
+			controlHeartbeatHookForTest?.("assignment");
 			atomicWriteJson(active.paths.heartbeat, {
 				version: 1,
 				runId: active.assignmentId,
@@ -323,6 +343,124 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 				at: new Date(now()).toISOString(),
 				seq: controlHeartbeatSeq,
 			});
+		}
+	}
+
+	function stopPeriodicTimers(): void {
+		if (heartbeatTimer !== undefined) {
+			clearInterval(heartbeatTimer);
+			heartbeatTimer = undefined;
+		}
+		if (pollTimer !== undefined) {
+			clearInterval(pollTimer);
+			pollTimer = undefined;
+		}
+		if (claimRetryTimer !== undefined) {
+			clearTimeout(claimRetryTimer);
+			claimRetryTimer = undefined;
+		}
+	}
+
+	function reportHeartbeatDiagnostic(message: string): void {
+		try {
+			console.error(message);
+		} catch {
+			// ignore console failures
+		}
+	}
+
+	function hasImplementerExecutionEvidence(assignment?: ActiveAssignment): boolean {
+		if (!role.canWrite || !assignment) return false;
+		if (assignment.mutationAttempted || assignment.leaseHeld) return true;
+		if (existsSync(assignment.paths.started)) return true;
+		try {
+			const owner = lease.peekOwner(cwd);
+			return !!(owner && owner.ownerId === workerId);
+		} catch {
+			return false;
+		}
+	}
+
+	/**
+	 * Must run under the role lock. Exact-generation fence after heartbeat I/O
+	 * failure; never advances queue or drops lease/active evidence.
+	 */
+	function fenceRegistryAfterHeartbeatFailureLocked(): void {
+		heartbeatFenceHookForTest?.();
+		const current = pool.getByRole(role.name);
+		if (!ownsCurrentGeneration(current)) {
+			failGenerationFence();
+			return;
+		}
+		if (current.status === "unhealthy" || current.status === "uncertain") {
+			return;
+		}
+		const preferUncertain =
+			role.canWrite &&
+			hasImplementerExecutionEvidence(active) &&
+			(current.status === "busy" || current.status === "blocked");
+		if (
+			active &&
+			!active.resultWritten &&
+			(current.status === "busy" || current.status === "blocked") &&
+			current.activeAssignmentId === active.assignmentId
+		) {
+			markRegistryLocked(preferUncertain ? "uncertain" : "unhealthy", {
+				activeAssignmentId: active.assignmentId,
+				...(active.parentEpoch !== undefined ? { activeParentEpoch: active.parentEpoch } : {}),
+				...(preferUncertain ? { uncertainWrite: true } : {}),
+			});
+			return;
+		}
+		if (current.status !== "busy" && current.status !== "blocked") {
+			markRegistryLocked("unhealthy");
+			return;
+		}
+		markRegistryLocked(preferUncertain ? "uncertain" : "unhealthy", {
+			...(current.activeAssignmentId !== undefined
+				? { activeAssignmentId: current.activeAssignmentId }
+				: {}),
+			...(current.activeParentEpoch !== undefined
+				? { activeParentEpoch: current.activeParentEpoch }
+				: {}),
+			...(preferUncertain ? { uncertainWrite: true } : {}),
+		});
+	}
+
+	function fenceRegistryAfterHeartbeatFailureBestEffort(): void {
+		try {
+			withRoleLock(poolRoot, role.name, () => {
+				fenceRegistryAfterHeartbeatFailureLocked();
+			});
+		} catch (error) {
+			reportHeartbeatDiagnostic(
+				`Worker heartbeat registry fence failed for role=${role.name} worker=${workerId} generation=${generation}: ${
+					error instanceof Error ? error.message : String(error)
+				}`,
+			);
+		}
+	}
+
+	function handleControlHeartbeatFailure(error: unknown, isStartup: boolean): never | void {
+		if (isStartup) {
+			throw error instanceof Error ? error : new Error(String(error));
+		}
+		stopPeriodicTimers();
+		disableMutationTools();
+		protocolUnhealthy = true;
+		fenceRegistryAfterHeartbeatFailureBestEffort();
+		reportHeartbeatDiagnostic(
+			`Worker control heartbeat failed for role=${role.name} worker=${workerId} generation=${generation}: ${
+				error instanceof Error ? error.message : String(error)
+			}`,
+		);
+	}
+
+	function runSupervisedControlHeartbeat(isStartup = false): void {
+		try {
+			writeControlHeartbeat();
+		} catch (error) {
+			handleControlHeartbeatFailure(error, isStartup);
 		}
 	}
 
@@ -1330,9 +1468,11 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 			claimNextOrIdleLocked("startup");
 		});
 
-		heartbeatTimer = setInterval(writeControlHeartbeat, 3_000);
+		heartbeatTimer = setInterval(() => {
+			runSupervisedControlHeartbeat(false);
+		}, 3_000);
 		heartbeatTimer.unref?.();
-		writeControlHeartbeat();
+		runSupervisedControlHeartbeat(true);
 
 		pollTimer = setInterval(() => {
 			void pollActive(ctx);

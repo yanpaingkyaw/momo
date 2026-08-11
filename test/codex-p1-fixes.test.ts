@@ -21,6 +21,8 @@ import {
 	__resetMaxClaimRetryAttemptsForTest,
 	__setClaimRetryRecoveryHookForTest,
 	__resetClaimRetryRecoveryHookForTest,
+	__setControlHeartbeatHooksForTest,
+	__resetControlHeartbeatHooksForTest,
 } from "../src/extensions/worker-runtime.js";
 import { installMomoParent, __setOrphanAwaitingLifecycleLockHookForTest, __resetCleanupRoleLockEnteredHookForTest } from "../src/extensions/parent.js";
 import { WriterLeaseManager } from "../src/lease/writer-lease.js";
@@ -70,6 +72,7 @@ afterEach(() => {
 	__resetActiveAtomicWriteForTest();
 	__resetMaxClaimRetryAttemptsForTest();
 	__resetClaimRetryRecoveryHookForTest();
+	__resetControlHeartbeatHooksForTest();
 	__setPaneLifecycleLockHooksForTest();
 	__resetCleanupRoleLockEnteredHookForTest();
 	if (previousPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
@@ -1641,6 +1644,373 @@ describe("P1 claim retry exhaustion", () => {
 		expect(record?.status).toBe("unhealthy");
 		expect(record?.activeAssignmentId).toBe(assignmentB);
 		expect(listClaiming(pool.poolRoot, "scout")).toHaveLength(1);
+		vi.useRealTimers();
+	});
+});
+
+describe("P2 supervised control heartbeat", () => {
+	function trackUnhandledRejections(): { unhandled: unknown[]; stop: () => void } {
+		const unhandled: unknown[] = [];
+		const onRejection = (reason: unknown) => {
+			unhandled.push(reason);
+		};
+		process.on("unhandledRejection", onRejection);
+		return {
+			unhandled,
+			stop: () => process.off("unhandledRejection", onRejection),
+		};
+	}
+
+	it("idle worker fences unhealthy on periodic control heartbeat fault without unhandled rejection", async () => {
+		vi.useFakeTimers();
+		const cacheRoot = tempDir("momo-hb-idle-");
+		const cwd = tempDir("momo-hb-idle-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const workerId = stableWorkerId(identity.poolKey, "scout");
+		const control = workerControlPaths(pool.poolRoot, "scout");
+		mkdirSync(control.root, { recursive: true, mode: 0o700 });
+		pool.upsert({
+			workerId,
+			generation: 1,
+			generationTombstone: 1,
+			role: "scout",
+			paneId: "w1:p2",
+			agentName: "momo_scout",
+			status: "idle",
+			updatedAt: new Date().toISOString(),
+		});
+		let controlWrites = 0;
+		__setControlHeartbeatHooksForTest({
+			onWrite: (phase) => {
+				if (phase === "control" && controlWrites++ > 0) {
+					throw new Error("injected control heartbeat fault");
+				}
+			},
+		});
+		const pi = createFakePi();
+		installMomoWorker(pi as unknown as ExtensionAPI, {
+			env: {
+				MOMO_WORKER: "1",
+				MOMO_ROLE: "scout",
+				MOMO_IPC_DIR: control.root,
+				MOMO_CONTROL_DIR: control.root,
+				MOMO_WORKER_ID: workerId,
+				MOMO_WORKER_GENERATION: "1",
+				MOMO_POOL_KEY: identity.poolKey,
+				MOMO_POOL_ROOT: pool.poolRoot,
+				MOMO_RUN_ID: "g1",
+				MOMO_CWD: cwd,
+			},
+			poolRegistry: pool,
+			now: () => 1_700_000_000_000,
+			sleep: async () => {},
+		});
+		const tracker = trackUnhandledRejections();
+		try {
+			await pi.emit("session_start", {}, {
+				hasUI: true,
+				isIdle: () => true,
+				abort: vi.fn(),
+				cwd,
+			} as unknown as ExtensionContext);
+			await vi.advanceTimersByTimeAsync(3_000);
+			await Promise.resolve();
+		} finally {
+			tracker.stop();
+		}
+		expect(tracker.unhandled).toHaveLength(0);
+		expect(pool.getByRole("scout")?.status).toBe("unhealthy");
+		vi.useRealTimers();
+	});
+
+	it("active implementer with lease evidence fences uncertain on lease heartbeat fault", async () => {
+		vi.useFakeTimers();
+		const cacheRoot = tempDir("momo-hb-lease-");
+		const cwd = tempDir("momo-hb-lease-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const workerId = stableWorkerId(identity.poolKey, "implementer");
+		const control = workerControlPaths(pool.poolRoot, "implementer");
+		mkdirSync(control.root, { recursive: true, mode: 0o700 });
+		const assignmentId = "hblease000000001";
+		const paths = assignmentSpoolPaths(pool.poolRoot, "implementer", assignmentId);
+		mkdirSync(paths.root, { recursive: true, mode: 0o700 });
+		pool.upsert({
+			workerId,
+			generation: 1,
+			generationTombstone: 1,
+			role: "implementer",
+			paneId: "w1:p2",
+			agentName: "momo_implementer",
+			cwd,
+			status: "idle",
+			updatedAt: new Date().toISOString(),
+		});
+		const leases = new WriterLeaseManager({ cacheRoot, now: () => 1_700_000_000_000 });
+		let leaseFaultInjected = false;
+		__setControlHeartbeatHooksForTest({
+			onWrite: (phase) => {
+				if (phase === "lease" && leaseFaultInjected) {
+					throw new Error("injected lease heartbeat fault");
+				}
+			},
+		});
+		const pi = createFakePi();
+		installMomoWorker(pi as unknown as ExtensionAPI, {
+			env: {
+				MOMO_WORKER: "1",
+				MOMO_ROLE: "implementer",
+				MOMO_IPC_DIR: control.root,
+				MOMO_CONTROL_DIR: control.root,
+				MOMO_WORKER_ID: workerId,
+				MOMO_WORKER_GENERATION: "1",
+				MOMO_POOL_KEY: identity.poolKey,
+				MOMO_POOL_ROOT: pool.poolRoot,
+				MOMO_RUN_ID: "g1",
+				MOMO_CWD: cwd,
+			},
+			poolRegistry: pool,
+			leaseManager: leases,
+			now: () => 1_700_000_000_000,
+			sleep: async () => {},
+		});
+		const ctx = {
+			hasUI: true,
+			isIdle: () => true,
+			abort: vi.fn(),
+			cwd,
+		} as unknown as ExtensionContext;
+		await pi.emit("session_start", {}, ctx);
+		atomicWriteJson(paths.command, {
+			version: 1,
+			type: "prompt",
+			task: "hold-lease",
+			issuedAt: new Date().toISOString(),
+			runId: assignmentId,
+			workerId,
+			generation: 1,
+			parentEpoch: "e1",
+		});
+		atomicWriteJson(control.active, {
+			version: 1,
+			assignmentId,
+			generation: 1,
+			parentEpoch: "e1",
+			dispatchedAt: new Date().toISOString(),
+		});
+		await vi.advanceTimersByTimeAsync(200);
+		expect(leases.isLocked(cwd)).toBe(true);
+		leaseFaultInjected = true;
+		pool.upsert({
+			...pool.getByRole("implementer")!,
+			status: "busy",
+			activeAssignmentId: assignmentId,
+			activeParentEpoch: "e1",
+			updatedAt: new Date().toISOString(),
+		});
+		const tracker = trackUnhandledRejections();
+		try {
+			await vi.advanceTimersByTimeAsync(3_000);
+			await Promise.resolve();
+		} finally {
+			tracker.stop();
+		}
+		expect(tracker.unhandled).toHaveLength(0);
+		const record = pool.getByRole("implementer")!;
+		expect(record.status).toBe("uncertain");
+		expect(record.uncertainWrite).toBe(true);
+		expect(record.activeAssignmentId).toBe(assignmentId);
+		expect(leases.peekOwner(cwd)?.ownerId).toBe(workerId);
+		expect(existsSync(control.active)).toBe(true);
+		expect(listClaiming(pool.poolRoot, "implementer")).toHaveLength(0);
+		vi.useRealTimers();
+	});
+
+	it("active read-only worker fences unhealthy on assignment heartbeat fault", async () => {
+		vi.useFakeTimers();
+		const cacheRoot = tempDir("momo-hb-no-evidence-");
+		const cwd = tempDir("momo-hb-no-evidence-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const workerId = stableWorkerId(identity.poolKey, "scout");
+		const control = workerControlPaths(pool.poolRoot, "scout");
+		mkdirSync(control.root, { recursive: true, mode: 0o700 });
+		const assignmentId = "hbnoevid00000001";
+		const paths = assignmentSpoolPaths(pool.poolRoot, "scout", assignmentId);
+		mkdirSync(paths.root, { recursive: true, mode: 0o700 });
+		pool.upsert({
+			workerId,
+			generation: 1,
+			generationTombstone: 1,
+			role: "scout",
+			paneId: "w1:p2",
+			agentName: "momo_scout",
+			cwd,
+			status: "busy",
+			activeAssignmentId: assignmentId,
+			activeParentEpoch: "e1",
+			updatedAt: new Date().toISOString(),
+		});
+		atomicWriteJson(paths.command, {
+			version: 1,
+			type: "prompt",
+			task: "pre-start",
+			issuedAt: new Date().toISOString(),
+			runId: assignmentId,
+			workerId,
+			generation: 1,
+			parentEpoch: "e1",
+		});
+		atomicWriteJson(control.active, {
+			version: 1,
+			assignmentId,
+			generation: 1,
+			parentEpoch: "e1",
+			dispatchedAt: new Date().toISOString(),
+		});
+		let assignmentFaultInjected = false;
+		__setControlHeartbeatHooksForTest({
+			onWrite: (phase) => {
+				if (phase === "assignment" && assignmentFaultInjected) {
+					throw new Error("injected assignment heartbeat fault");
+				}
+			},
+		});
+		const pi = createFakePi();
+		installMomoWorker(pi as unknown as ExtensionAPI, {
+			env: {
+				MOMO_WORKER: "1",
+				MOMO_ROLE: "scout",
+				MOMO_IPC_DIR: control.root,
+				MOMO_CONTROL_DIR: control.root,
+				MOMO_WORKER_ID: workerId,
+				MOMO_WORKER_GENERATION: "1",
+				MOMO_POOL_KEY: identity.poolKey,
+				MOMO_POOL_ROOT: pool.poolRoot,
+				MOMO_RUN_ID: "g1",
+				MOMO_CWD: cwd,
+			},
+			poolRegistry: pool,
+			now: () => 1_700_000_000_000,
+			sleep: async () => {},
+		});
+		const ctx = {
+			hasUI: true,
+			isIdle: () => true,
+			abort: vi.fn(),
+			cwd,
+		} as unknown as ExtensionContext;
+		const tracker = trackUnhandledRejections();
+		try {
+			await pi.emit("session_start", {}, ctx);
+			await vi.advanceTimersByTimeAsync(200);
+			assignmentFaultInjected = true;
+			await vi.advanceTimersByTimeAsync(3_000);
+			await Promise.resolve();
+		} finally {
+			tracker.stop();
+		}
+		expect(tracker.unhandled).toHaveLength(0);
+		const record = pool.getByRole("scout")!;
+		expect(record.status).toBe("unhealthy");
+		expect(record.uncertainWrite).toBeUndefined();
+		expect(record.activeAssignmentId).toBe(assignmentId);
+		expect(existsSync(control.active)).toBe(true);
+		expect(listClaiming(pool.poolRoot, "scout")).toHaveLength(0);
+		vi.useRealTimers();
+	});
+
+	it("survives fence-write failure on heartbeat fault without unhandled rejection", async () => {
+		vi.useFakeTimers();
+		const cacheRoot = tempDir("momo-hb-fence-fault-");
+		const cwd = tempDir("momo-hb-fence-fault-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const workerId = stableWorkerId(identity.poolKey, "scout");
+		const control = workerControlPaths(pool.poolRoot, "scout");
+		mkdirSync(control.root, { recursive: true, mode: 0o700 });
+		pool.upsert({
+			workerId,
+			generation: 1,
+			generationTombstone: 1,
+			role: "scout",
+			paneId: "w1:p2",
+			agentName: "momo_scout",
+			status: "idle",
+			updatedAt: new Date().toISOString(),
+		});
+		let controlWrites = 0;
+		__setControlHeartbeatHooksForTest({
+			onWrite: (phase) => {
+				if (phase === "control" && controlWrites++ > 0) {
+					throw new Error("injected control heartbeat fault");
+				}
+			},
+			onFence: () => {
+				throw new Error("injected fence write fault");
+			},
+		});
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		const pi = createFakePi();
+		installMomoWorker(pi as unknown as ExtensionAPI, {
+			env: {
+				MOMO_WORKER: "1",
+				MOMO_ROLE: "scout",
+				MOMO_IPC_DIR: control.root,
+				MOMO_CONTROL_DIR: control.root,
+				MOMO_WORKER_ID: workerId,
+				MOMO_WORKER_GENERATION: "1",
+				MOMO_POOL_KEY: identity.poolKey,
+				MOMO_POOL_ROOT: pool.poolRoot,
+				MOMO_RUN_ID: "g1",
+				MOMO_CWD: cwd,
+			},
+			poolRegistry: pool,
+			now: () => 1_700_000_000_000,
+			sleep: async () => {},
+		});
+		const tracker = trackUnhandledRejections();
+		try {
+			await pi.emit("session_start", {}, {
+				hasUI: true,
+				isIdle: () => true,
+				abort: vi.fn(),
+				cwd,
+			} as unknown as ExtensionContext);
+			await vi.advanceTimersByTimeAsync(3_000);
+			await Promise.resolve();
+		} finally {
+			tracker.stop();
+		}
+		expect(tracker.unhandled).toHaveLength(0);
+		expect(
+			errorSpy.mock.calls.some(([message]) =>
+				String(message).includes("registry fence failed"),
+			),
+		).toBe(true);
+		errorSpy.mockRestore();
+		expect(pool.getByRole("scout")?.status).toBe("idle");
 		vi.useRealTimers();
 	});
 });

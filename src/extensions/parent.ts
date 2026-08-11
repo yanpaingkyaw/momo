@@ -100,6 +100,82 @@ export function __adoptionGraceRecheckCountForTest(): number {
 	return adoptionGraceRechecks.size;
 }
 
+/** @internal test-only: fault injection at start of post-grace recheck. */
+let adoptionGraceRecheckHookForTest: (() => void) | undefined;
+
+/** @internal test-only: fault injection inside recheck role-lock sections. */
+let adoptionGraceRecheckRoleLockHookForTest: (() => void) | undefined;
+
+/** @internal test-only */
+export function __setAdoptionGraceRecheckHooksForTest(hooks?: {
+	onRecheck?: () => void;
+	onRoleLock?: () => void;
+}): void {
+	adoptionGraceRecheckHookForTest = hooks?.onRecheck;
+	adoptionGraceRecheckRoleLockHookForTest = hooks?.onRoleLock;
+}
+
+/** @internal test-only */
+export function __resetAdoptionGraceRecheckHooksForTest(): void {
+	adoptionGraceRecheckHookForTest = undefined;
+	adoptionGraceRecheckRoleLockHookForTest = undefined;
+}
+
+function formatAdoptionGraceError(error: unknown): string {
+	if (error instanceof IpcValidationError || error instanceof Error) return error.message;
+	return String(error);
+}
+
+/**
+ * Never throws. Reports role/worker/generation diagnostics and best-effort unhealthy
+ * fence when the snapshot still matches; preserves registry/evidence on lock failure.
+ */
+function reportAdoptionGraceRecheckFailure(
+	options: {
+		pool: PoolRegistry;
+		ctx: { ui?: { notify?: (message: string) => void } };
+		snapshot: PoolWorkerRecord;
+	},
+	error: unknown,
+): void {
+	const { pool, ctx, snapshot: worker } = options;
+	const message = `Adoption grace recheck failed for role=${worker.role} worker=${worker.workerId} generation=${worker.generation}: ${formatAdoptionGraceError(error)}`;
+	try {
+		ctx.ui?.notify?.(message);
+	} catch {
+		// ignore notify failures
+	}
+	try {
+		console.error(message);
+	} catch {
+		// ignore console failures
+	}
+	try {
+		adoptionGraceRecheckRoleLockHookForTest?.();
+		withRoleLock(pool.poolRoot, worker.role, () => {
+			const current = pool.getByRole(worker.role);
+			if (!matchesExactSnapshot(current, worker)) return;
+			pool.upsert({
+				...current,
+				status: "unhealthy",
+				updatedAt: new Date().toISOString(),
+			});
+		});
+	} catch (lockError) {
+		const lockMessage = `Adoption grace recheck registry fence failed for role=${worker.role} worker=${worker.workerId} generation=${worker.generation}: ${formatAdoptionGraceError(lockError)}`;
+		try {
+			ctx.ui?.notify?.(lockMessage);
+		} catch {
+			// ignore
+		}
+		try {
+			console.error(lockMessage);
+		} catch {
+			// ignore
+		}
+	}
+}
+
 /**
  * @internal test-only: runs under each cleanup role lock after acquire, before
  * fresh eligibility / closePane / agentGet / terminalize / lease operations.
@@ -1233,7 +1309,9 @@ function scheduleReadOnlyAdoptionGraceRecheck(options: {
 
 	const timer = setTimeout(() => {
 		adoptionGraceRechecks.delete(key);
-		void recheckReadOnlyAdoptionAfterGrace(options);
+		void recheckReadOnlyAdoptionAfterGrace(options).catch((error) => {
+			reportAdoptionGraceRecheckFailure(options, error);
+		});
 	}, Math.max(0, options.delayMs));
 	// Keep the event loop alive under Vitest fake timers; unref in production.
 	if (process.env.VITEST !== "true") {
@@ -1263,6 +1341,8 @@ async function recheckReadOnlyAdoptionAfterGrace(options: {
 }): Promise<void> {
 	const { pool, client, poolKey, ctx, snapshot: worker, evidenceKind } = options;
 	if (!worker.paneId || !worker.agentName || !worker.activeAssignmentId) return;
+
+	adoptionGraceRecheckHookForTest?.();
 
 	const control = workerControlPaths(pool.poolRoot, worker.role);
 	try {
@@ -1294,6 +1374,7 @@ async function recheckReadOnlyAdoptionAfterGrace(options: {
 		}
 
 		await withRoleLockAsync(pool.poolRoot, worker.role, () => {
+			adoptionGraceRecheckRoleLockHookForTest?.();
 			const current = pool.getByRole(worker.role);
 			if (!matchesExactSnapshot(current, worker)) return;
 
@@ -1400,22 +1481,7 @@ async function recheckReadOnlyAdoptionAfterGrace(options: {
 			markUnhealthy();
 		});
 	} catch (error) {
-		await withRoleLockAsync(pool.poolRoot, worker.role, () => {
-			const current = pool.getByRole(worker.role);
-			if (!matchesExactSnapshot(current, worker)) return;
-			pool.upsert({
-				...current,
-				status: "unhealthy",
-				updatedAt: new Date().toISOString(),
-			});
-		});
-		ctx.ui?.notify?.(
-			`Adoption grace recheck failed for ${worker.workerId}: ${
-				error instanceof IpcValidationError || error instanceof Error
-					? error.message
-					: String(error)
-			}`,
-		);
+		reportAdoptionGraceRecheckFailure(options, error);
 	}
 }
 
