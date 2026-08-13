@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createDelegationRunner } from "../src/delegation/runner.js";
 import { createHerdrChildSessionFactory } from "../src/delegation/herdr-factory.js";
 import { HerdrClient } from "../src/herdr/client.js";
+import { createTestHerdrClient } from "./helpers/herdr-mock-client.js";
 import { PaneRegistry } from "../src/herdr/registry.js";
 import { ROLE_LIST, getRole } from "../src/roles.js";
 import { atomicWriteJson } from "../src/ipc/spool.js";
@@ -57,7 +58,7 @@ describe("herdr factory + runner integration", () => {
 		const calls: string[][] = [];
 		let paneCounter = 0;
 
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				calls.push([...args]);
 				if (args[0] === "pane" && args[1] === "split") {
@@ -579,7 +580,7 @@ describe("herdr factory + runner integration", () => {
 		const cacheRoot = tempDir("momo-term-cache-");
 		const cwd = tempDir("momo-term-cwd-");
 		let splits = 0;
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "pane" && args[1] === "split") {
 					splits += 1;
@@ -628,7 +629,7 @@ describe("herdr factory + runner integration", () => {
 		const cacheRoot = tempDir("momo-miss-hb-cache-");
 		const cwd = tempDir("momo-miss-hb-cwd-");
 		let now = 1_000_000;
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "pane" && args[1] === "split") {
 					const envArgs = args.filter((arg, index) => args[index - 1] === "--env");
@@ -710,7 +711,7 @@ describe("herdr factory + runner integration", () => {
 		installFakeHerdrExtension();
 		const cacheRoot = tempDir("momo-evt-result-cache-");
 		const cwd = tempDir("momo-evt-result-cwd-");
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "pane" && args[1] === "split") {
 					const envArgs = args.filter((arg, index) => args[index - 1] === "--env");
@@ -819,7 +820,7 @@ describe("herdr factory + runner integration", () => {
 		const { tryReadIpcJson: realTryRead } = await import("../src/ipc/validate.js");
 		const cacheRoot = tempDir("momo-evt-race-cache-");
 		const cwd = tempDir("momo-evt-race-cwd-");
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "pane" && args[1] === "split") {
 					const envArgs = args.filter((arg, index) => args[index - 1] === "--env");
@@ -952,7 +953,7 @@ describe("herdr factory + runner integration", () => {
 		const cwd = tempDir("momo-stale-hb-race-cwd-");
 		let now = 1_000_000;
 		const hbAt = now;
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "pane" && args[1] === "split") {
 					const envArgs = args.filter((arg, index) => args[index - 1] === "--env");
@@ -1083,7 +1084,7 @@ describe("herdr factory + runner integration", () => {
 		const cwd = tempDir("momo-miss-hb-race-cwd-");
 		let now = 1_000_000;
 		const start = now;
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "pane" && args[1] === "split") {
 					const envArgs = args.filter((arg, index) => args[index - 1] === "--env");
@@ -1207,7 +1208,7 @@ describe("herdr factory + runner integration", () => {
 		const cwd = tempDir("momo-invalid-race-cwd-");
 		let now = 1_000_000;
 		const start = now;
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "pane" && args[1] === "split") {
 					const envArgs = args.filter((arg, index) => args[index - 1] === "--env");
@@ -1352,7 +1353,7 @@ describe("herdr factory + runner integration", () => {
 			activeParentEpoch: "other-epoch",
 			updatedAt: new Date(now).toISOString(),
 		});
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async () => ({
 				code: 0,
 				stdout: JSON.stringify({ id: "ok", result: {} }),
@@ -1403,7 +1404,7 @@ describe("herdr factory + runner integration", () => {
 		installFakeHerdrExtension();
 		const cacheRoot = tempDir("momo-reenter-cache-");
 		const cwd = tempDir("momo-reenter-cwd-");
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async () => ({
 				code: 0,
 				stdout: JSON.stringify({ id: "ok", result: {} }),
@@ -1479,7 +1480,7 @@ describe("herdr factory + runner integration", () => {
 		});
 		let splitEntered = 0;
 		let agentStartEntered = 0;
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "pane" && args[1] === "split") {
 					splitEntered += 1;
@@ -1625,7 +1626,7 @@ describe("herdr factory + runner integration", () => {
 			const cwd = tempDir(`momo-unresolved-abort-${options.label}-cwd-`);
 			let now = 1_000_000;
 			let controlDir = "";
-			const client = new HerdrClient({
+			const client = createTestHerdrClient({
 				runCommand: async (_file, args) => {
 					if (args[0] === "pane" && args[1] === "split") {
 						const envArgs = args.filter((_a, i) => args[i - 1] === "--env");
@@ -1843,7 +1844,7 @@ describe("herdr factory + runner integration", () => {
 			const control = workerControlPaths(pool.poolRoot, "implementer");
 			mkdirSync(control.root, { recursive: true, mode: 0o700 });
 
-			const client = new HerdrClient({
+			const client = createTestHerdrClient({
 				runCommand: async () => ({
 					code: 0,
 					stdout: JSON.stringify({ id: "ok", result: {} }),
@@ -2032,7 +2033,7 @@ describe("herdr factory + runner integration", () => {
 			});
 			const pool = new PoolRegistry(identity.poolKey, cacheRoot);
 			const workerId = stableWorkerId(identity.poolKey, "scout");
-			const client = new HerdrClient({
+			const client = createTestHerdrClient({
 				runCommand: async () => ({
 					code: 0,
 					stdout: JSON.stringify({ id: "ok", result: {} }),
@@ -2298,7 +2299,7 @@ describe("herdr factory + runner integration", () => {
 			});
 			const pool = new PoolRegistry(identity.poolKey, cacheRoot);
 			const workerId = stableWorkerId(identity.poolKey, "scout");
-			const client = new HerdrClient({
+			const client = createTestHerdrClient({
 				runCommand: async () => ({
 					code: 0,
 					stdout: JSON.stringify({ id: "ok", result: {} }),
@@ -2509,6 +2510,257 @@ describe("herdr factory + runner integration", () => {
 				{ role: "assistant", content: [{ type: "text", text: "commit" }] },
 			]);
 		});
+	});
+
+	describe("frozen assignment policy at allocation", () => {
+		it("uses factory input policy and ignores config changes before prompt", async () => {
+			const cacheRoot = tempDir("momo-frozen-policy-");
+			const cwd = tempDir("momo-frozen-policy-cwd-");
+			const { HerdrClient } = await import("../src/herdr/client.js");
+			const client = createTestHerdrClient({ env: { HERDR_SOCKET_PATH: "/tmp/s" } });
+			const { PoolRegistry } = await import("../src/herdr/pool-registry.js");
+			const { resolvePoolIdentity } = await import("../src/herdr/pool-identity.js");
+			const { getRole } = await import("../src/roles.js");
+			const identity = resolvePoolIdentity({
+				cwd,
+				canonicalRoot: cwd,
+				workspaceId: "ws",
+				socketPath: "s",
+			});
+			const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+			const factory = createHerdrChildSessionFactory({
+				cwd,
+				parentPaneId: "w1:p1",
+				parentId: "parent-frozen",
+				client,
+				poolRegistry: pool,
+				cacheRoot,
+				canonicalRoot: cwd,
+				workspaceId: "ws",
+				socketPath: "s",
+			});
+
+			const policyAtAllocation = {
+				provider: "openai",
+				model: "gpt-4o",
+				reasoning: "off" as const,
+			};
+			const session = await factory({
+				cwd,
+				role: getRole("scout"),
+				assignmentPolicy: policyAtAllocation,
+				policyFeatureActive: true,
+			});
+			const proxy = session as unknown as {
+				getAssignmentPolicyForTest(): typeof policyAtAllocation | undefined;
+				getPolicyFeatureActiveForTest(): boolean;
+			};
+			expect(proxy.getAssignmentPolicyForTest()).toEqual(policyAtAllocation);
+			expect(proxy.getPolicyFeatureActiveForTest()).toBe(true);
+
+			const { setScopePolicy } = await import("../src/config/momo-config.js");
+			const configDir = tempDir("momo-frozen-policy-config-");
+			setScopePolicy(
+				"default",
+				{ provider: "anthropic", model: "claude-sonnet-4-5", reasoning: "high" },
+				{ configDir },
+			);
+			setScopePolicy(
+				"scout",
+				{ provider: "anthropic", model: "claude-sonnet-4-5", reasoning: "high" },
+				{ configDir },
+			);
+			void configDir;
+
+			expect(proxy.getAssignmentPolicyForTest()).toEqual(policyAtAllocation);
+		});
+
+		it("rejects completed v3 result without matching started.json", async () => {
+			const cacheRoot = tempDir("momo-v3-started-");
+			const cwd = tempDir("momo-v3-started-cwd-");
+			const { PoolRegistry } = await import("../src/herdr/pool-registry.js");
+			const { resolvePoolIdentity, stableWorkerId } = await import("../src/herdr/pool-identity.js");
+			const { workerControlPaths, assignmentSpoolPaths } = await import(
+				"../src/herdr/assignment-spool.js"
+			);
+			const { getRole } = await import("../src/roles.js");
+			const identity = resolvePoolIdentity({
+				cwd,
+				canonicalRoot: cwd,
+				workspaceId: "ws",
+				socketPath: "s",
+			});
+			const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+			const client = createTestHerdrClient({ env: { HERDR_SOCKET_PATH: "/tmp/s" } });
+			const factory = createHerdrChildSessionFactory({
+				cwd,
+				parentPaneId: "w1:p1",
+				parentId: "parent-v3-started",
+				client,
+				poolRegistry: pool,
+				cacheRoot,
+				canonicalRoot: cwd,
+				workspaceId: "ws",
+				socketPath: "s",
+			});
+			const policy = {
+				provider: "openai",
+				model: "gpt-4o",
+				reasoning: "off" as const,
+			};
+			const session = await factory({
+				cwd,
+				role: getRole("scout"),
+				assignmentPolicy: policy,
+				policyFeatureActive: true,
+			});
+			const proxy = session as unknown as {
+				assignmentId: string;
+				workerId: string;
+				generation: number;
+				promptStarted: boolean;
+				physicalEnsured: boolean;
+				paths: { result: string };
+				trySettleAuthoritativeResultForTest(): boolean;
+			};
+			const workerId = stableWorkerId(identity.poolKey, "scout");
+			pool.upsert({
+				workerId,
+				generation: 1,
+				generationTombstone: 1,
+				role: "scout",
+				paneId: "w1:p1",
+				agentName: "momo_scout",
+				cwd,
+				status: "busy",
+				activeAssignmentId: proxy.assignmentId,
+				activeParentEpoch: "epoch1",
+				boundPolicy: policy,
+				updatedAt: new Date().toISOString(),
+			});
+			proxy.generation = 1;
+			proxy.promptStarted = true;
+			proxy.physicalEnsured = true;
+			const control = workerControlPaths(pool.poolRoot, "scout");
+			mkdirSync(control.root, { recursive: true, mode: 0o700 });
+			const paths = assignmentSpoolPaths(pool.poolRoot, "scout", proxy.assignmentId);
+			mkdirSync(paths.root, { recursive: true, mode: 0o700 });
+			atomicWriteJson(paths.result, {
+				version: 1,
+				capability: 3,
+				runId: proxy.assignmentId,
+				workerId,
+				status: "completed",
+				modelPolicy: policy,
+				modelPolicyApplied: true,
+				messages: [{ role: "assistant", content: [{ type: "text", text: "ok" }] }],
+				finishedAt: new Date().toISOString(),
+			});
+			expect(() => proxy.trySettleAuthoritativeResultForTest()).toThrow(/started/i);
+		});
+	});
+
+	it("fail-closed when live Herdr agent appears during absent-registry provision", async () => {
+		installFakeHerdrExtension();
+		const cacheRoot = tempDir("momo-live-agent-race-");
+		const cwd = tempDir("momo-live-agent-race-cwd-");
+		const { PoolRegistry } = await import("../src/herdr/pool-registry.js");
+		const { resolvePoolIdentity } = await import("../src/herdr/pool-identity.js");
+		const { RolePoolEvidenceError } = await import("../src/herdr/role-pool-evidence.js");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		let agentGetCalls = 0;
+		const client = createTestHerdrClient({
+			runCommand: async (_file, args) => {
+				if (args[0] === "agent" && args[1] === "get") {
+					agentGetCalls += 1;
+					return {
+						code: 0,
+						stdout: JSON.stringify({
+							id: "g",
+							result: {
+								type: "agent_info",
+								agent: {
+									agent_status: "idle",
+									pane_id: "w1:live",
+									name: args[2],
+								},
+							},
+						}),
+						stderr: "",
+					};
+				}
+				return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+			},
+		});
+		const factory = createHerdrChildSessionFactory({
+			cwd,
+			parentPaneId: "w1:p1",
+			parentId: "parent-race",
+			client,
+			poolRegistry: pool,
+			cacheRoot,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+			pollIntervalMs: 20,
+			readyTimeoutMs: 2_000,
+			sleep: async () => {},
+		});
+		const session = await factory({ cwd, role: getRole("scout") });
+		await expect(session.prompt("race")).rejects.toBeInstanceOf(RolePoolEvidenceError);
+		expect(agentGetCalls).toBe(1);
+		expect(pool.list()).toHaveLength(0);
+	});
+
+	it("fail-closed when agent get succeeds with empty/invalid info (not absent)", async () => {
+		installFakeHerdrExtension();
+		const cacheRoot = tempDir("momo-empty-agent-get-");
+		const cwd = tempDir("momo-empty-agent-get-cwd-");
+		const { PoolRegistry } = await import("../src/herdr/pool-registry.js");
+		const { resolvePoolIdentity } = await import("../src/herdr/pool-identity.js");
+		const { RolePoolEvidenceError } = await import("../src/herdr/role-pool-evidence.js");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		const client = new HerdrClient({
+			runCommand: async (_file, args) => {
+				if (args[0] === "agent" && args[1] === "get") {
+					return {
+						code: 0,
+						stdout: JSON.stringify({ id: "g", result: {} }),
+						stderr: "",
+					};
+				}
+				return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
+			},
+		});
+		const factory = createHerdrChildSessionFactory({
+			cwd,
+			parentPaneId: "w1:p1",
+			parentId: "parent-empty-get",
+			client,
+			poolRegistry: pool,
+			cacheRoot,
+			canonicalRoot: cwd,
+			workspaceId: "ws",
+			socketPath: "s",
+			pollIntervalMs: 20,
+			readyTimeoutMs: 2_000,
+			sleep: async () => {},
+		});
+		const session = await factory({ cwd, role: getRole("scout") });
+		await expect(session.prompt("empty-get")).rejects.toBeInstanceOf(RolePoolEvidenceError);
+		expect(pool.list()).toHaveLength(0);
 	});
 
 });

@@ -9,6 +9,16 @@ import {
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import type { AgentName, AgentRole } from "../roles.js";
+import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
+import {
+	findAuthenticatedModel,
+	freezeConfigSnapshot,
+	isConfigPolicyFeatureActive,
+	resolveConcreteAssignmentPolicy,
+	type ModelPolicySnapshot,
+	type MomoConfigV1,
+	type MomoConfigSnapshot,
+} from "../config/model-policy.js";
 import {
 	addUsage,
 	calculateDelegationStatus,
@@ -19,6 +29,7 @@ import {
 	type DelegationResult,
 	type TaskResult,
 } from "./results.js";
+import { readMomoConfig } from "../config/momo-config.js";
 import { mapWithConcurrency } from "./scheduler.js";
 
 export const MAX_DELEGATED_TASKS = 8;
@@ -81,6 +92,12 @@ export interface ChildSession {
 export interface ChildSessionFactoryInput {
 	cwd: string;
 	role: AgentRole;
+	model?: CreateAgentSessionOptions["model"];
+	thinkingLevel?: CreateAgentSessionOptions["thinkingLevel"];
+	/** Concrete assignment policy when configured; omitted in legacy mode. */
+	assignmentPolicy?: ModelPolicySnapshot;
+	/** Whether config policy feature is active for this assignment (frozen at allocation). */
+	policyFeatureActive?: boolean;
 }
 
 export type ChildSessionFactory = (input: ChildSessionFactoryInput) => Promise<ChildSession>;
@@ -102,6 +119,8 @@ export interface DelegationRunnerOptions {
 	createChildSession: ChildSessionFactory;
 	maxParallelConcurrency?: number;
 	abortTimeoutMs?: number;
+	readConfig?: () => MomoConfigV1 | undefined;
+	getModelRegistry?: () => import("@earendil-works/pi-coding-agent").ModelRegistry;
 }
 
 export interface DelegationRunner {
@@ -132,7 +151,7 @@ export function createPiChildSessionFactory(options: PiChildSessionFactoryOption
 	const agentsFiles = options.agentsFiles ?? [];
 	const reviewerTools = options.reviewerTools ?? [];
 
-	return async ({ cwd: childCwd, role }) => {
+	return async ({ cwd: childCwd, role, model, thinkingLevel }) => {
 		if (childCwd !== cwd) {
 			throw new Error("Child working directory must match the parent working directory");
 		}
@@ -142,8 +161,12 @@ export function createPiChildSessionFactory(options: PiChildSessionFactoryOption
 		const { session } = await createAgentSession({
 			cwd,
 			...(options.agentDir === undefined ? {} : { agentDir: options.agentDir }),
-			...(options.model === undefined ? {} : { model: options.model }),
-			...(options.thinkingLevel === undefined ? {} : { thinkingLevel: options.thinkingLevel }),
+			...(model === undefined ? {} : { model }),
+			...(thinkingLevel === undefined ? {} : { thinkingLevel }),
+			...(options.model === undefined || model !== undefined ? {} : { model: options.model }),
+			...(options.thinkingLevel === undefined || thinkingLevel !== undefined
+				? {}
+				: { thinkingLevel: options.thinkingLevel }),
 			modelRuntime: options.modelRuntime,
 			settingsManager: options.settingsManager,
 			resourceLoader,
@@ -284,6 +307,7 @@ export function createDelegationRunner(options: DelegationRunnerOptions): Delega
 	const roles = roleMap(options.roles);
 	const concurrency = options.maxParallelConcurrency ?? MAX_PARALLEL_CONCURRENCY;
 	const abortTimeoutMs = options.abortTimeoutMs ?? CHILD_ABORT_TIMEOUT_MS;
+	const readConfig = options.readConfig ?? readMomoConfig;
 	let writerTail = Promise.resolve();
 	const reportProgress = (runOptions: RunDelegationOptions, progress: DelegationProgress) => {
 		try {
@@ -298,6 +322,7 @@ export function createDelegationRunner(options: DelegationRunnerOptions): Delega
 		task: DelegatedTask,
 		index: number,
 		runOptions: RunDelegationOptions,
+		runConfig: MomoConfigSnapshot | undefined,
 	): Promise<TaskResult> => {
 		const role = roles.get(task.agent);
 		if (!role) throw new Error(`Unknown agent: ${task.agent}`);
@@ -347,8 +372,65 @@ export function createDelegationRunner(options: DelegationRunnerOptions): Delega
 		};
 
 		try {
+			const registry = options.getModelRegistry?.();
+			const policyFeatureActive = runConfig !== undefined;
+			let sessionInput: ChildSessionFactoryInput = { cwd, role, policyFeatureActive };
+			const assignmentPolicy = resolveConcreteAssignmentPolicy(task.agent, runConfig);
+			if (assignmentPolicy && !registry) {
+				return {
+					agent: task.agent,
+					task: task.task,
+					status: "failed",
+					output: "",
+					outputTruncated: false,
+					usage: emptyUsage(),
+					error: {
+						message: "Model registry unavailable for configured assignment policy",
+					},
+				};
+			}
+			if (registry && assignmentPolicy) {
+				const model = findAuthenticatedModel(registry, assignmentPolicy);
+				if (!model) {
+					return {
+						agent: task.agent,
+						task: task.task,
+						status: "failed",
+						output: "",
+						outputTruncated: false,
+						usage: emptyUsage(),
+						error: {
+							message: `Model unavailable or auth missing: ${assignmentPolicy.provider}/${assignmentPolicy.model}`,
+						},
+					};
+				}
+				const levels = getSupportedThinkingLevels(model);
+				if (!levels.includes(assignmentPolicy.reasoning)) {
+					return {
+						agent: task.agent,
+						task: task.task,
+						status: "failed",
+						output: "",
+						outputTruncated: false,
+						usage: emptyUsage(),
+						error: {
+							message: `Reasoning ${assignmentPolicy.reasoning} unsupported for ${assignmentPolicy.provider}/${assignmentPolicy.model}`,
+						},
+					};
+				}
+				sessionInput = {
+					...sessionInput,
+					model,
+					thinkingLevel: assignmentPolicy.reasoning,
+					assignmentPolicy,
+					policyFeatureActive: true,
+				};
+			} else if (assignmentPolicy) {
+				sessionInput = { ...sessionInput, assignmentPolicy, policyFeatureActive: true };
+			}
+
 			// Allocate lazily when the concurrency slot (or single/chain step) runs.
-			session = await options.createChildSession({ cwd, role });
+			session = await options.createChildSession(sessionInput);
 			unsubscribe = session.subscribe(onEvent);
 			const abortChild = () => {
 				if (!abortPromise && session) abortPromise = session.abort().catch(() => {});
@@ -484,9 +566,10 @@ export function createDelegationRunner(options: DelegationRunnerOptions): Delega
 		task: DelegatedTask,
 		index: number,
 		runOptions: RunDelegationOptions,
+		runConfig: MomoConfigSnapshot | undefined,
 	): Promise<TaskResult> => {
 		const role = roles.get(task.agent);
-		if (!role?.canWrite) return executeTask(mode, task, index, runOptions);
+		if (!role?.canWrite) return executeTask(mode, task, index, runOptions, runConfig);
 
 		let release!: () => void;
 		const lock = new Promise<void>((resolve) => {
@@ -496,10 +579,16 @@ export function createDelegationRunner(options: DelegationRunnerOptions): Delega
 		writerTail = precedingWriter.then(() => lock);
 		await precedingWriter;
 		try {
-			return await executeTask(mode, task, index, runOptions);
+			return await executeTask(mode, task, index, runOptions, runConfig);
 		} finally {
 			release();
 		}
+	};
+
+	const snapshotRunConfig = (): MomoConfigSnapshot | undefined => {
+		const raw = readConfig();
+		if (!raw || !isConfigPolicyFeatureActive(raw)) return undefined;
+		return freezeConfigSnapshot(raw);
 	};
 
 	const finish = (mode: DelegationRequest["mode"], results: TaskResult[]): DelegationResult => ({
@@ -516,26 +605,25 @@ export function createDelegationRunner(options: DelegationRunnerOptions): Delega
 
 		async run(request, runOptions = {}) {
 			validateDelegationRequest(request, roles);
+			const runConfig = snapshotRunConfig();
 
 			if (request.mode === "single") {
 				const task = { agent: request.agent, task: request.task };
 				reportProgress(runOptions, { mode: request.mode, phase: "queued", index: 0, agent: task.agent, message: `${task.agent} queued` });
-				return finish(request.mode, [await runTask(request.mode, task, 0, runOptions)]);
+				return finish(request.mode, [await runTask(request.mode, task, 0, runOptions, runConfig)]);
 			}
 
 			if (request.mode === "parallel") {
 				for (const [index, task] of request.tasks.entries()) {
 					reportProgress(runOptions, { mode: request.mode, phase: "queued", index, agent: task.agent, message: `${task.agent} queued` });
 				}
-				// Lazy createChildSession inside mapWithConcurrency so maxParallelConcurrency
-				// bounds both session allocation and execution; abort skips queued slots.
 				const scheduled = await mapWithConcurrency(
 					request.tasks,
 					async (task, index, signal) =>
 						runTask(request.mode, task, index, {
 							...runOptions,
 							...(signal === undefined ? {} : { signal }),
-						}),
+						}, runConfig),
 					{
 						concurrency,
 						...(runOptions.signal === undefined ? {} : { signal: runOptions.signal }),
@@ -603,7 +691,7 @@ export function createDelegationRunner(options: DelegationRunnerOptions): Delega
 					task: step.task.replaceAll("{previous}", previous),
 				};
 				reportProgress(runOptions, { mode: request.mode, phase: "queued", index, agent: task.agent, message: `${task.agent} queued` });
-				const result = await runTask(request.mode, task, index, runOptions);
+				const result = await runTask(request.mode, task, index, runOptions, runConfig);
 				results.push(result);
 				if (result.status !== "completed") {
 					for (let rest = index + 1; rest < request.steps.length; rest += 1) {

@@ -7,7 +7,9 @@ import {
 	ensurePrivateDir,
 	momoCacheRoot,
 } from "../ipc/spool.js";
-import { parseJsonFile } from "../ipc/validate.js";
+import { parseJsonFile, assertExactKeys } from "../ipc/validate.js";
+import { validateModelPolicySnapshot } from "../config/model-policy.js";
+import type { IpcModelPolicy } from "../ipc/spool.js";
 import {
 	POOL_REGISTRY_VERSION,
 	poolRootPath,
@@ -55,6 +57,8 @@ export interface PoolWorkerRecord {
 	provisioningOwnerId?: string;
 	/** ISO timestamp of the latest generation-fenced provisioning owner heartbeat. */
 	provisioningHeartbeatAt?: string;
+	/** Generation-bound concrete model policy (v3). Omitted on legacy v2 rows. */
+	boundPolicy?: import("../ipc/spool.js").IpcModelPolicy;
 	updatedAt: string;
 }
 
@@ -78,11 +82,46 @@ function requireNonEmptyString(value: unknown, label: string, max = 4096): strin
 	return value;
 }
 
+function parseRegistryBoundPolicy(value: unknown, label: string): IpcModelPolicy {
+	const snapshot = validateModelPolicySnapshot(value, label);
+	return {
+		provider: snapshot.provider,
+		model: snapshot.model,
+		reasoning: snapshot.reasoning,
+	};
+}
+
 export function validatePoolWorkerRecord(value: unknown, label = "worker"): PoolWorkerRecord {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) {
 		throw new PoolRegistryCorruptionError(`Pool registry ${label} must be an object`);
 	}
 	const record = value as Record<string, unknown>;
+	const optionalRegistryKeys = [
+		"generationTombstone",
+		"paneId",
+		"agentName",
+		"activeAssignmentId",
+		"activeParentEpoch",
+		"uncertainWrite",
+		"paneClosed",
+		"recoveryRequired",
+		"cwd",
+		"boundPolicy",
+		"provisioningOwnerId",
+		"provisioningHeartbeatAt",
+	] as const;
+	assertExactKeys(
+		record,
+		[
+			"workerId",
+			"generation",
+			"role",
+			"status",
+			"updatedAt",
+			...optionalRegistryKeys.filter((key) => key in record),
+		],
+		label,
+	);
 	const roleRaw = requireNonEmptyString(record.role, `${label}.role`, 32);
 	if (!isAgentName(roleRaw)) {
 		throw new PoolRegistryCorruptionError(`Pool registry ${label}.role invalid`);
@@ -117,6 +156,14 @@ export function validatePoolWorkerRecord(value: unknown, label = "worker"): Pool
 	if (typeof record.paneClosed === "boolean") out.paneClosed = record.paneClosed;
 	if (typeof record.recoveryRequired === "boolean") out.recoveryRequired = record.recoveryRequired;
 	if (typeof record.cwd === "string" && record.cwd) out.cwd = record.cwd;
+	if ("boundPolicy" in record) {
+		if (record.boundPolicy === null || record.boundPolicy === undefined) {
+			throw new PoolRegistryCorruptionError(
+				`${label}.boundPolicy null/undefined forbidden; omit key for legacy rows`,
+			);
+		}
+		out.boundPolicy = parseRegistryBoundPolicy(record.boundPolicy, `${label}.boundPolicy`);
+	}
 
 	const ownerRaw = record.provisioningOwnerId;
 	const heartbeatRaw = record.provisioningHeartbeatAt;
@@ -186,6 +233,8 @@ export function withoutProvisioningOwnership(
 	const recoveryRequired =
 		patch.recoveryRequired !== undefined ? patch.recoveryRequired : record.recoveryRequired;
 	const cwd = patch.cwd !== undefined ? patch.cwd : record.cwd;
+	const boundPolicy =
+		patch.boundPolicy !== undefined ? patch.boundPolicy : record.boundPolicy;
 	if (paneId !== undefined) merged.paneId = paneId;
 	if (agentName !== undefined) merged.agentName = agentName;
 	if (activeAssignmentId !== undefined) merged.activeAssignmentId = activeAssignmentId;
@@ -194,6 +243,7 @@ export function withoutProvisioningOwnership(
 	if (paneClosed !== undefined) merged.paneClosed = paneClosed;
 	if (recoveryRequired !== undefined) merged.recoveryRequired = recoveryRequired;
 	if (cwd !== undefined) merged.cwd = cwd;
+	if (boundPolicy !== undefined) merged.boundPolicy = boundPolicy;
 	return merged;
 }
 
@@ -406,7 +456,7 @@ export function selectClosablePoolWorkers(
 ): { closable: PoolWorkerRecord[]; refused: PoolWorkerRecord[] } {
 	const force = options.force === true;
 	const closable = workers.filter((worker) => {
-		if (worker.generation === 0 && !worker.paneId) return false; // tombstone-only
+		if (isArchivalTombstone(worker)) return false;
 		if (worker.status === "busy" || worker.status === "blocked" || worker.status === "starting") {
 			return false;
 		}
@@ -423,7 +473,9 @@ export function selectClosablePoolWorkers(
 	});
 	const closableIds = new Set(closable.map((worker) => worker.workerId + ":" + worker.generation));
 	const refused = workers.filter(
-		(worker) => !closableIds.has(worker.workerId + ":" + worker.generation),
+		(worker) =>
+			!isArchivalTombstone(worker) &&
+			!closableIds.has(worker.workerId + ":" + worker.generation),
 	);
 	return { closable, refused };
 }

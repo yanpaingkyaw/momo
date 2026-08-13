@@ -13,10 +13,18 @@ import {
 	type IpcEventType,
 	type IpcHeartbeat,
 	type IpcManifest,
+	type IpcModelPolicy,
 	type IpcReady,
 	type IpcResult,
 	type IpcStarted,
 } from "./spool.js";
+import {
+	ipcPoliciesEqual,
+	IPC_PROTOCOL_CAPABILITY,
+	policySnapshotsEqual,
+	type ModelPolicySnapshot,
+	validateModelPolicySnapshot,
+} from "../config/model-policy.js";
 
 export { IpcValidationError } from "./errors.js";
 export { DEFAULT_HEARTBEAT_CLOCK_SKEW_MS, MAX_EVENTS_FILE_BYTES } from "./spool.js";
@@ -112,6 +120,202 @@ function optionalBoundedString(
 ): string | undefined {
 	if (!(key in record) || record[key] === undefined) return undefined;
 	return requireString(record, key, label, max);
+}
+
+export function validateModelPolicyField(value: unknown, label: string): IpcModelPolicy {
+	const snapshot = validateModelPolicySnapshot(value, label);
+	return {
+		provider: snapshot.provider,
+		model: snapshot.model,
+		reasoning: snapshot.reasoning,
+	};
+}
+
+export function assertExactKeys(record: Record<string, unknown>, allowed: readonly string[], label: string): void {
+	const unexpected = Object.keys(record).filter((key) => !allowed.includes(key));
+	if (unexpected.length > 0) {
+		throw new IpcValidationError(
+			`${label} contains unknown key${unexpected.length === 1 ? "" : "s"}: ${unexpected.join(", ")}`,
+		);
+	}
+}
+
+/**
+ * Strict discriminated protocol: legacy has no capability/modelPolicy keys;
+ * v3 requires capability 3 + concrete modelPolicy object (never null).
+ */
+export function parseDiscriminatedIpcPolicy(
+	record: Record<string, unknown>,
+	label: string,
+): { capability?: number; modelPolicy?: IpcModelPolicy } {
+	const hasCapability = "capability" in record && record.capability !== undefined;
+	const hasModelPolicy = "modelPolicy" in record && record.modelPolicy !== undefined;
+
+	if (hasCapability !== hasModelPolicy) {
+		throw new IpcValidationError(
+			`${label} must include capability and modelPolicy together or omit both (legacy)`,
+		);
+	}
+	if (!hasCapability) {
+		if ("modelPolicy" in record) {
+			throw new IpcValidationError(`${label}.modelPolicy forbidden without capability (legacy)`);
+		}
+		return {};
+	}
+	if (record.capability !== IPC_PROTOCOL_CAPABILITY) {
+		throw new IpcValidationError(`${label}.capability invalid`);
+	}
+	if (record.modelPolicy === null) {
+		throw new IpcValidationError(`${label}.modelPolicy null is forbidden under capability v3`);
+	}
+	const snapshot = validateModelPolicySnapshot(record.modelPolicy, `${label}.modelPolicy`);
+	return {
+		capability: IPC_PROTOCOL_CAPABILITY,
+		modelPolicy: {
+			provider: snapshot.provider,
+			model: snapshot.model,
+			reasoning: snapshot.reasoning,
+		},
+	};
+}
+
+export function assertIpcModelPolicyMatches(
+	expected: ModelPolicySnapshot | undefined,
+	actual: IpcModelPolicy | undefined,
+	label: string,
+): void {
+	if (expected === undefined) {
+		if (actual !== undefined) {
+			throw new IpcValidationError(`${label}.modelPolicy unexpected on legacy assignment`);
+		}
+		return;
+	}
+	if (!ipcPoliciesEqual(toIpcFromSnapshot(expected), actual)) {
+		throw new IpcValidationError(`${label}.modelPolicy mismatch`);
+	}
+}
+
+function toIpcFromSnapshot(snapshot: ModelPolicySnapshot): IpcModelPolicy {
+	return {
+		provider: snapshot.provider,
+		model: snapshot.model,
+		reasoning: snapshot.reasoning,
+	};
+}
+
+export function assertIpcPoliciesEqualRecords(
+	a: IpcModelPolicy | undefined,
+	b: IpcModelPolicy | undefined,
+	label: string,
+): void {
+	if (!ipcPoliciesEqual(a, b)) {
+		throw new IpcValidationError(`${label} modelPolicy mismatch`);
+	}
+}
+
+export interface ValidatedWorkerManifest {
+	version: 2 | 3;
+	poolKey: string;
+	workerId: string;
+	generation: number;
+	role: AgentName;
+	cwd: string;
+	paneId?: string;
+	agentName?: string;
+	createdAt: string;
+	boundPolicy?: IpcModelPolicy;
+}
+
+export function validateWorkerManifest(
+	value: unknown,
+	expected: {
+		poolKey: string;
+		workerId: string;
+		generation: number;
+		role: AgentName;
+	},
+): ValidatedWorkerManifest {
+	const record = asRecord(value, "manifest");
+	const version = record.version;
+	if (version !== 2 && version !== 3) {
+		throw new IpcValidationError("manifest.version must be 2 or 3");
+	}
+	const poolKey = requireString(record, "poolKey", "manifest", 128);
+	const workerId = requireString(record, "workerId", "manifest", 64);
+	const role = requireString(record, "role", "manifest", 32);
+	if (!isAgentName(role)) throw new IpcValidationError("manifest.role invalid");
+	const generation = record.generation;
+	if (typeof generation !== "number" || !Number.isInteger(generation) || generation < 1) {
+		throw new IpcValidationError("manifest.generation invalid");
+	}
+	if (
+		poolKey !== expected.poolKey ||
+		workerId !== expected.workerId ||
+		generation !== expected.generation ||
+		role !== expected.role
+	) {
+		throw new IpcValidationError("manifest identity mismatch");
+	}
+	const cwd = requireString(record, "cwd", "manifest", 4096);
+	const createdAt = requireString(record, "createdAt", "manifest", 64);
+	const paneId = optionalBoundedString(record, "paneId", "manifest", 128);
+	const agentName = optionalBoundedString(record, "agentName", "manifest", 64);
+
+	let boundPolicy: IpcModelPolicy | undefined;
+	if (version === 3) {
+		if (!("boundPolicy" in record) || record.boundPolicy === undefined || record.boundPolicy === null) {
+			throw new IpcValidationError("manifest v3 requires concrete boundPolicy");
+		}
+		boundPolicy = validateModelPolicyField(record.boundPolicy, "manifest.boundPolicy");
+		assertExactKeys(
+			record,
+			[
+				"version",
+				"poolKey",
+				"workerId",
+				"generation",
+				"role",
+				"cwd",
+				"createdAt",
+				"paneId",
+				"agentName",
+				"boundPolicy",
+			],
+			"manifest",
+		);
+	} else {
+		if ("boundPolicy" in record) {
+			throw new IpcValidationError("manifest v2 must not include boundPolicy");
+		}
+		assertExactKeys(
+			record,
+			[
+				"version",
+				"poolKey",
+				"workerId",
+				"generation",
+				"role",
+				"cwd",
+				"createdAt",
+				"paneId",
+				"agentName",
+			],
+			"manifest",
+		);
+	}
+
+	return {
+		version,
+		poolKey,
+		workerId,
+		generation,
+		role: role as AgentName,
+		cwd,
+		createdAt,
+		...(paneId !== undefined ? { paneId } : {}),
+		...(agentName !== undefined ? { agentName } : {}),
+		...(boundPolicy !== undefined ? { boundPolicy } : {}),
+	};
 }
 
 export function validateManifest(value: unknown, expected?: { runId: string; workerId: string }): IpcManifest {
@@ -213,7 +417,54 @@ export function validateCommand(
 
 	if (type === "prompt") {
 		const task = requireString(record, "task", "command", MAX_TASK_CHARS);
-		return { version: IPC_VERSION, type, task, issuedAt, runId, workerId, ...epochFields };
+		const policyFields = parseDiscriminatedIpcPolicy(record, "command");
+		if (policyFields.capability === IPC_PROTOCOL_CAPABILITY) {
+			assertExactKeys(
+				record,
+				[
+					"version",
+					"capability",
+					"type",
+					"task",
+					"issuedAt",
+					"runId",
+					"workerId",
+					"generation",
+					"parentEpoch",
+					"modelPolicy",
+				],
+				"command",
+			);
+		} else {
+			assertExactKeys(
+				record,
+				[
+					"version",
+					"type",
+					"task",
+					"issuedAt",
+					"runId",
+					"workerId",
+					"generation",
+					"parentEpoch",
+				],
+				"command",
+			);
+		}
+		return {
+			version: IPC_VERSION,
+			type,
+			task,
+			issuedAt,
+			runId,
+			workerId,
+			...epochFields,
+			...(policyFields.capability !== undefined ? { capability: policyFields.capability } : {}),
+			...(policyFields.modelPolicy !== undefined ? { modelPolicy: policyFields.modelPolicy } : {}),
+		};
+	}
+	if ("capability" in record || "modelPolicy" in record) {
+		throw new IpcValidationError("command skip/cancel must not include capability or modelPolicy");
 	}
 	const reason = requireString(record, "reason", "command", 1024);
 	return { version: IPC_VERSION, type, reason, issuedAt, runId, workerId, ...epochFields };
@@ -292,6 +543,29 @@ export function validateStarted(
 		throw new IpcValidationError("started.parentEpoch mismatch");
 	}
 	const startedAt = requireString(record, "startedAt", "started", 64);
+	const policyFields = parseDiscriminatedIpcPolicy(record, "started");
+	if (policyFields.capability === IPC_PROTOCOL_CAPABILITY) {
+		assertExactKeys(
+			record,
+			[
+				"version",
+				"capability",
+				"runId",
+				"workerId",
+				"generation",
+				"parentEpoch",
+				"startedAt",
+				"modelPolicy",
+			],
+			"started",
+		);
+	} else {
+		assertExactKeys(
+			record,
+			["version", "runId", "workerId", "generation", "parentEpoch", "startedAt"],
+			"started",
+		);
+	}
 	return {
 		version: 1,
 		runId,
@@ -299,6 +573,8 @@ export function validateStarted(
 		generation,
 		parentEpoch,
 		startedAt,
+		...(policyFields.capability !== undefined ? { capability: policyFields.capability } : {}),
+		...(policyFields.modelPolicy !== undefined ? { modelPolicy: policyFields.modelPolicy } : {}),
 	};
 }
 
@@ -457,6 +733,36 @@ export function validateResult(value: unknown, expected: { runId: string; worker
 	}
 	if (typeof record.uncertainWrite === "boolean") result.uncertainWrite = record.uncertainWrite;
 	if (record.usage !== undefined) result.usage = validateUsage(record.usage);
+	const policyFields = parseDiscriminatedIpcPolicy(record, "result");
+	if (policyFields.capability === IPC_PROTOCOL_CAPABILITY) {
+		assertExactKeys(
+			record,
+			[
+				"version",
+				"capability",
+				"runId",
+				"workerId",
+				"status",
+				"messages",
+				"finishedAt",
+				"modelPolicy",
+				"modelPolicyApplied",
+				"stopReason",
+				"errorMessage",
+				"uncertainWrite",
+				"usage",
+			],
+			"result",
+		);
+		if (typeof record.modelPolicyApplied !== "boolean") {
+			throw new IpcValidationError("result.modelPolicyApplied required for capability v3");
+		}
+		result.modelPolicyApplied = record.modelPolicyApplied;
+	} else if ("modelPolicyApplied" in record) {
+		throw new IpcValidationError("result.modelPolicyApplied forbidden without capability v3");
+	}
+	if (policyFields.capability !== undefined) result.capability = policyFields.capability;
+	if (policyFields.modelPolicy !== undefined) result.modelPolicy = policyFields.modelPolicy;
 	return result;
 }
 

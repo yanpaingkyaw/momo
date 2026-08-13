@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { installMomoParent, PARENT_ACTIVE_TOOLS } from "../src/extensions/parent.js";
 import { HerdrClient } from "../src/herdr/client.js";
+import { createTestHerdrClient } from "./helpers/herdr-mock-client.js";
 import { PaneRegistry } from "../src/herdr/registry.js";
 import { planLaunch } from "../src/launch.js";
 
@@ -87,7 +88,7 @@ describe("canonical Herdr parent extension", () => {
 					HERDR_PANE_ID: "w1:p1",
 					MOMO_BACKEND: "auto",
 				},
-				client: new HerdrClient({
+				client: createTestHerdrClient({
 					runCommand: async () => ({
 						code: 0,
 						stdout: JSON.stringify({ id: "ok", result: {} }),
@@ -118,7 +119,7 @@ describe("canonical Herdr parent extension", () => {
 	});
 
 	it("launch --tools includes delegate for canonical Herdr parent", async () => {
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args.includes("--version")) return { code: 0, stdout: "herdr 0.7.5\n", stderr: "" };
 				if (args[0] === "api") {

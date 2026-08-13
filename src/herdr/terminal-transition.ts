@@ -1,12 +1,8 @@
 import { existsSync, rmSync } from "node:fs";
 import type { AgentName } from "../roles.js";
-import { atomicWriteJson } from "../ipc/spool.js";
-import { tryReadIpcJson, validateActivePointer } from "../ipc/validate.js";
-import {
-	assignmentSpoolPaths,
-	workerControlPaths,
-} from "./assignment-spool.js";
-import type { PoolRegistry } from "./pool-registry.js";
+import { assertIpcPoliciesEqualRecords, tryReadIpcJson, validateActivePointer } from "../ipc/validate.js";
+import { workerControlPaths } from "./assignment-spool.js";
+import type { PoolRegistry, PoolWorkerRecord } from "./pool-registry.js";
 import {
 	beginClaimHead,
 	commitClaim,
@@ -14,11 +10,29 @@ import {
 	recoverClaiming,
 	type QueueEntry,
 } from "./role-queue.js";
+import { publishAssignmentCommandLocked } from "./dispatch-publish.js";
 
 export type CleanTerminalOutcome =
 	| { kind: "advanced"; nextAssignmentId: string }
 	| { kind: "idle" }
-	| { kind: "noop_superseded" };
+	| { kind: "noop_superseded" }
+	| { kind: "retry_pending"; nextAssignmentId: string }
+	| { kind: "publish_fenced"; nextAssignmentId: string };
+
+function idleRollbackRecord(still: PoolWorkerRecord, now: () => number): PoolWorkerRecord {
+	return {
+		workerId: still.workerId,
+		generation: still.generation,
+		generationTombstone: Math.max(still.generationTombstone, still.generation),
+		role: still.role,
+		status: "idle",
+		updatedAt: new Date(now()).toISOString(),
+		...(still.paneId ? { paneId: still.paneId } : {}),
+		...(still.agentName ? { agentName: still.agentName } : {}),
+		...(still.cwd ? { cwd: still.cwd } : {}),
+		...(still.boundPolicy ? { boundPolicy: still.boundPolicy } : {}),
+	};
+}
 
 /**
  * Idempotent clean-result terminal transition under the per-role lock.
@@ -112,21 +126,26 @@ export function completeCleanAssignmentLocked(options: {
 	const claimed = recoverClaiming(pool.poolRoot, role, generation);
 	const next = claimed[0] ?? beginClaimHead(pool.poolRoot, role, generation);
 	if (!next) {
-		pool.upsert({
-			workerId,
-			generation,
-			generationTombstone: Math.max(still.generationTombstone, generation),
-			role,
-			status: "idle",
-			updatedAt: new Date(now()).toISOString(),
-			...(still.paneId ? { paneId: still.paneId } : {}),
-			...(still.agentName ? { agentName: still.agentName } : {}),
-			...(still.cwd ? { cwd: still.cwd } : {}),
-		});
+		pool.upsert(idleRollbackRecord(still, now));
 		return { kind: "idle" };
 	}
 
-	publishNextAssignmentLocked(pool, role, workerId, generation, next, now);
+	const rollbackRecord = idleRollbackRecord(still, now);
+	const outcome = publishNextAssignmentLocked(
+		pool,
+		role,
+		workerId,
+		generation,
+		next,
+		rollbackRecord,
+		now,
+	);
+	if (!outcome.ok) {
+		if (outcome.reason === "rolled_back") {
+			return { kind: "retry_pending", nextAssignmentId: next.assignmentId };
+		}
+		return { kind: "publish_fenced", nextAssignmentId: next.assignmentId };
+	}
 	return { kind: "advanced", nextAssignmentId: next.assignmentId };
 }
 
@@ -140,41 +159,35 @@ function publishNextAssignmentLocked(
 	workerId: string,
 	generation: number,
 	next: QueueEntry,
+	rollbackRecord: PoolWorkerRecord,
 	now: () => number,
-): void {
-	const current = pool.getByRole(role);
-	if (
-		!current ||
-		current.generation !== generation ||
-		current.workerId !== workerId
-	) {
-		throw new Error("publishNextAssignmentLocked generation/worker fence mismatch");
+): { ok: true } | { ok: false; reason: "rolled_back" | "fenced" } {
+	if (next.capability !== undefined && next.modelPolicy !== undefined) {
+		const record = pool.getByRole(role);
+		if (!record?.boundPolicy) {
+			throw new Error("publishNextAssignmentLocked missing registry boundPolicy for v3 queue entry");
+		}
+		assertIpcPoliciesEqualRecords(next.modelPolicy, record.boundPolicy, "queue→registry");
 	}
-	const paths = assignmentSpoolPaths(pool.poolRoot, role, next.assignmentId);
-	atomicWriteJson(paths.command, {
-		version: 1,
-		type: "prompt",
-		task: next.task,
-		issuedAt: new Date(now()).toISOString(),
-		runId: next.assignmentId,
+	return publishAssignmentCommandLocked({
+		pool,
+		poolRoot: pool.poolRoot,
+		role,
 		workerId,
 		generation,
-		parentEpoch: next.parentEpoch,
-	});
-	pool.upsert({
-		...current,
-		status: "busy",
-		activeAssignmentId: next.assignmentId,
-		activeParentEpoch: next.parentEpoch,
-		updatedAt: new Date(now()).toISOString(),
-	});
-	const control = workerControlPaths(pool.poolRoot, role);
-	atomicWriteJson(control.active, {
-		version: 1,
 		assignmentId: next.assignmentId,
-		generation,
 		parentEpoch: next.parentEpoch,
-		dispatchedAt: new Date(now()).toISOString(),
+		task: next.task,
+		now,
+		rollbackRecord,
+		...(next.capability !== undefined || next.modelPolicy !== undefined
+			? {
+					commandExtras: {
+						...(next.capability !== undefined ? { capability: next.capability } : {}),
+						...(next.modelPolicy !== undefined ? { modelPolicy: next.modelPolicy } : {}),
+					},
+				}
+			: {}),
+		onCommitted: () => commitClaim(pool.poolRoot, role, next),
 	});
-	commitClaim(pool.poolRoot, role, next);
 }

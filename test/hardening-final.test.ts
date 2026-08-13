@@ -14,13 +14,15 @@ import { installMomoParent } from "../src/extensions/parent.js";
 import { WriterLeaseManager, createLeaseToken } from "../src/lease/writer-lease.js";
 import { createHerdrChildSessionFactory, createStableParentId } from "../src/delegation/herdr-factory.js";
 import { HerdrClient, parseAgentGetResult, AGENT_PANE_BUSY_CODE } from "../src/herdr/client.js";
+import { createTestHerdrClient } from "./helpers/herdr-mock-client.js";
 import { PaneRegistry, RegistryCorruptionError } from "../src/herdr/registry.js";
 import {
 	isArchivalTombstone,
 	PoolRegistry,
 	selectClosablePoolWorkers,
+	type PoolWorkerRecord,
 } from "../src/herdr/pool-registry.js";
-import { resolvePoolIdentity } from "../src/herdr/pool-identity.js";
+import { resolvePoolIdentity, stableWorkerId } from "../src/herdr/pool-identity.js";
 import { beginClaimHead, enqueueAssignment, listClaiming, listQueue } from "../src/herdr/role-queue.js";
 import { atomicWriteJson } from "../src/ipc/spool.js";
 import {
@@ -31,6 +33,7 @@ import {
 	validateResult,
 } from "../src/ipc/validate.js";
 import { getRole } from "../src/roles.js";
+import type { AgentName } from "../src/roles.js";
 import { dispatchAssignment, setupPoolWorkerFixture } from "./helpers/pool-fixture.js";
 
 const tempDirs: string[] = [];
@@ -91,7 +94,7 @@ function createFakePi() {
 }
 
 describe("writer settlement ordering", () => {
-	it("releases lease before a clean completed result", async () => {
+	it("releases lease after durable completed result", async () => {
 		vi.useFakeTimers();
 		const cwd = tempDir("momo-settle-cwd-");
 		const cacheRoot = tempDir("momo-settle-cache-");
@@ -327,7 +330,7 @@ describe("factory rollback", () => {
 			cwd,
 			parentPaneId: "w1:p1",
 			parentId: `parent-${options.label}`,
-			client: new HerdrClient({ runCommand: options.runCommand }),
+			client: createTestHerdrClient({ runCommand: options.runCommand }),
 			poolRegistry: pool,
 			cacheRoot: pool.cacheRoot,
 			canonicalRoot: cwd,
@@ -559,7 +562,7 @@ describe("factory rollback", () => {
 				HERDR_WORKSPACE_ID: "test-ws",
 				HERDR_SOCKET_PATH: "test-sock",
 			},
-			client: new HerdrClient({
+			client: createTestHerdrClient({
 				runCommand: async (_file, args) => {
 					if (args[0] === "pane" && args[1] === "close") {
 						closed.push(String(args[2]));
@@ -580,11 +583,14 @@ describe("factory rollback", () => {
 			}),
 			poolRegistry: pool,
 		});
+		const notifications: string[] = [];
 		await commands.get("momo-cleanup")!.handler("", {
-			ui: { notify: () => undefined },
+			ui: { notify: (msg: string) => notifications.push(msg) },
 		} as never);
 		expect(closed).toEqual([]);
 		expect(isArchivalTombstone(pool.getByRole("scout")!)).toBe(true);
+		expect(notifications.join(" ")).not.toMatch(/Refused/i);
+		expect(notifications.join(" ")).toMatch(/Closed 1 worker pane\(s\)/);
 	});
 
 	it("no-pane provision failure archives reservation so N+1 can reprovision", async () => {
@@ -690,6 +696,217 @@ describe("factory rollback", () => {
 	});
 });
 
+describe("selectClosablePoolWorkers eligibility", () => {
+	function archivalTombstone(poolKey: string, role: AgentName): PoolWorkerRecord {
+		return {
+			workerId: stableWorkerId(poolKey, role),
+			generation: 0,
+			generationTombstone: 1,
+			role,
+			status: "unhealthy",
+			updatedAt: new Date().toISOString(),
+		};
+	}
+
+	it("two archival tombstones => closable 0, refused 0", () => {
+		const poolKey = "test-pool-key";
+		const { closable, refused } = selectClosablePoolWorkers([
+			archivalTombstone(poolKey, "scout"),
+			archivalTombstone(poolKey, "planner"),
+		]);
+		expect(closable).toHaveLength(0);
+		expect(refused).toHaveLength(0);
+	});
+
+	it("mixed tombstone, busy, and uncertain refuses only live ineligible rows", () => {
+		const poolKey = "test-pool-key";
+		const busy: PoolWorkerRecord = {
+			workerId: stableWorkerId(poolKey, "implementer"),
+			generation: 2,
+			generationTombstone: 2,
+			role: "implementer",
+			paneId: "w1:p2",
+			status: "busy",
+			updatedAt: new Date().toISOString(),
+		};
+		const uncertain: PoolWorkerRecord = {
+			workerId: stableWorkerId(poolKey, "reviewer"),
+			generation: 1,
+			generationTombstone: 1,
+			role: "reviewer",
+			paneId: "w1:p3",
+			status: "uncertain",
+			updatedAt: new Date().toISOString(),
+		};
+		const withoutForce = selectClosablePoolWorkers([
+			archivalTombstone(poolKey, "scout"),
+			busy,
+			uncertain,
+		]);
+		expect(withoutForce.closable).toHaveLength(0);
+		expect(withoutForce.refused).toHaveLength(2);
+		expect(withoutForce.refused.map((worker) => worker.status).sort()).toEqual(["busy", "uncertain"]);
+
+		const withForce = selectClosablePoolWorkers(
+			[archivalTombstone(poolKey, "scout"), busy, uncertain],
+			{ force: true },
+		);
+		expect(withForce.closable).toHaveLength(1);
+		expect(withForce.closable[0]?.status).toBe("uncertain");
+		expect(withForce.refused).toHaveLength(1);
+		expect(withForce.refused[0]?.status).toBe("busy");
+	});
+
+	it("/momo-cleanup notify omits refused count when pool is only archival tombstones", async () => {
+		installFakeHerdrExtension();
+		const cacheRoot = tempDir("momo-tomb-notify-cache-");
+		const cwd = tempDir("momo-tomb-notify-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "test-ws",
+			socketPath: "test-sock",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		for (const role of ["scout", "planner"] as const) {
+			pool.upsert({
+				workerId: stableWorkerId(identity.poolKey, role),
+				generation: 0,
+				generationTombstone: 1,
+				role,
+				status: "unhealthy",
+				updatedAt: new Date().toISOString(),
+			});
+		}
+		const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
+		const pi = {
+			handlers: new Map<string, Function[]>(),
+			commands,
+			registerTool: vi.fn(),
+			setActiveTools: vi.fn(),
+			sendUserMessage: vi.fn(),
+			sendMessage: vi.fn(),
+			registerCommand: vi.fn(
+				(name: string, def: { handler: (args: string, ctx: unknown) => Promise<void> }) => {
+					commands.set(name, def);
+				},
+			),
+			on() {},
+		};
+		installMomoParent(pi as unknown as ExtensionAPI, {
+			cwd: identity.canonicalRoot,
+			env: {
+				MOMO_PARENT: "1",
+				MOMO_PARENT_ID: "parent-tomb-notify",
+				HERDR_ENV: "1",
+				HERDR_PANE_ID: "w1:p1",
+				HERDR_WORKSPACE_ID: "test-ws",
+				HERDR_SOCKET_PATH: "test-sock",
+			},
+			client: createTestHerdrClient({
+				runCommand: async () => ({
+					code: 0,
+					stdout: JSON.stringify({ id: "ok", result: {} }),
+					stderr: "",
+				}),
+			}),
+			poolRegistry: pool,
+		});
+		const notifications: string[] = [];
+		await commands.get("momo-cleanup")!.handler("", {
+			ui: { notify: (msg: string) => notifications.push(msg) },
+		} as never);
+		const summary = notifications.join(" ");
+		expect(summary).toMatch(/Closed 0 worker pane\(s\)/);
+		expect(summary).not.toMatch(/Refused/i);
+	});
+
+	it("/momo-cleanup notify reports exact refused statuses for live ineligible workers", async () => {
+		installFakeHerdrExtension();
+		const cacheRoot = tempDir("momo-mixed-notify-cache-");
+		const cwd = tempDir("momo-mixed-notify-cwd-");
+		const identity = resolvePoolIdentity({
+			cwd,
+			canonicalRoot: cwd,
+			workspaceId: "test-ws",
+			socketPath: "test-sock",
+		});
+		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
+		pool.upsert({
+			workerId: stableWorkerId(identity.poolKey, "scout"),
+			generation: 0,
+			generationTombstone: 1,
+			role: "scout",
+			status: "unhealthy",
+			updatedAt: new Date().toISOString(),
+		});
+		pool.upsert({
+			workerId: stableWorkerId(identity.poolKey, "implementer"),
+			generation: 2,
+			generationTombstone: 2,
+			role: "implementer",
+			paneId: "w1:p2",
+			agentName: "momo_implementer",
+			cwd: identity.canonicalRoot,
+			status: "busy",
+			activeAssignmentId: "busy000000000001",
+			updatedAt: new Date().toISOString(),
+		});
+		pool.upsert({
+			workerId: stableWorkerId(identity.poolKey, "reviewer"),
+			generation: 1,
+			generationTombstone: 1,
+			role: "reviewer",
+			paneId: "w1:p3",
+			agentName: "momo_reviewer",
+			cwd: identity.canonicalRoot,
+			status: "uncertain",
+			updatedAt: new Date().toISOString(),
+		});
+		const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
+		const pi = {
+			handlers: new Map<string, Function[]>(),
+			commands,
+			registerTool: vi.fn(),
+			setActiveTools: vi.fn(),
+			sendUserMessage: vi.fn(),
+			sendMessage: vi.fn(),
+			registerCommand: vi.fn(
+				(name: string, def: { handler: (args: string, ctx: unknown) => Promise<void> }) => {
+					commands.set(name, def);
+				},
+			),
+			on() {},
+		};
+		installMomoParent(pi as unknown as ExtensionAPI, {
+			cwd: identity.canonicalRoot,
+			env: {
+				MOMO_PARENT: "1",
+				MOMO_PARENT_ID: "parent-mixed-notify",
+				HERDR_ENV: "1",
+				HERDR_PANE_ID: "w1:p1",
+				HERDR_WORKSPACE_ID: "test-ws",
+				HERDR_SOCKET_PATH: "test-sock",
+			},
+			client: createTestHerdrClient({
+				runCommand: async () => ({
+					code: 0,
+					stdout: JSON.stringify({ id: "ok", result: {} }),
+					stderr: "",
+				}),
+			}),
+			poolRegistry: pool,
+		});
+		const notifications: string[] = [];
+		await commands.get("momo-cleanup")!.handler("", {
+			ui: { notify: (msg: string) => notifications.push(msg) },
+		} as never);
+		const summary = notifications.join(" ");
+		expect(summary).toMatch(/Refused 2 ineligible live worker\(s\) \(1 busy, 1 uncertain\)/);
+		expect(summary).not.toMatch(/Refused 3/);
+	});
+});
+
 describe("agent get / cancel statuses", () => {
 	it("parses nested agent_info envelope", () => {
 		const info = parseAgentGetResult({
@@ -706,7 +923,7 @@ describe("agent get / cancel statuses", () => {
 		const cwd = tempDir("momo-cancel-cwd-");
 		let gets = 0;
 		let now = 1_000_000;
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			agentStartBusyRetryMs: 0,
 			runCommand: async (_file, args) => {
 				if (args[0] === "pane" && args[1] === "split") {
@@ -754,6 +971,16 @@ describe("agent get / cancel statuses", () => {
 				}
 				if (args[0] === "agent" && args[1] === "get") {
 					gets += 1;
+					if (gets <= 2) {
+						return {
+							code: 1,
+							stdout: JSON.stringify({
+								id: "g",
+								error: { code: "agent_not_found", message: "missing" },
+							}),
+							stderr: "",
+						};
+					}
 					return {
 						code: 0,
 						stdout: JSON.stringify({
@@ -818,7 +1045,7 @@ describe("agent get / cancel statuses", () => {
 		expect(tryReadIpcJson(implProxy.paths.cancel)).toBeTruthy();
 		expect(implProxy.uncertainWrite).toBe(false);
 		// No terminal-key / agentWait escalation on shared panes.
-		expect(gets).toBe(0);
+		expect(gets).toBe(2);
 		void AGENT_PANE_BUSY_CODE;
 	});
 });
@@ -851,7 +1078,7 @@ describe("parent identity and quit", () => {
 			updatedAt: new Date().toISOString(),
 		});
 		const keys: string[][] = [];
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "agent" && args[1] === "send-keys") {
 					keys.push([...args]);
@@ -923,7 +1150,7 @@ describe("parent identity and quit", () => {
 			updatedAt: new Date().toISOString(),
 		});
 		const keys: string[][] = [];
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "agent" && args[1] === "send-keys") {
 					keys.push([...args]);
@@ -1003,7 +1230,7 @@ describe("parent identity and quit", () => {
 			task: "foreign-still-queued",
 		});
 
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async () => ({
 				code: 0,
 				stdout: JSON.stringify({ id: "ok", result: {} }),
@@ -1052,7 +1279,7 @@ describe("parent identity and quit", () => {
 			activeParentEpoch: exitingEpoch,
 			updatedAt: new Date().toISOString(),
 		});
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async () => ({
 				code: 0,
 				stdout: JSON.stringify({ id: "ok", result: {} }),
@@ -1067,6 +1294,87 @@ describe("parent identity and quit", () => {
 		});
 		// Active claiming entry is canceled, not removed (recovery evidence).
 		expect(listClaiming(fixture.pool.poolRoot, "implementer")).toHaveLength(1);
+	});
+
+	it("cancelEpochAssignmentsOnQuit: corrupt role errors but healthy roles cancel durably", async () => {
+		const cwd = tempDir("momo-quit-corrupt-cwd-");
+		const cacheRoot = tempDir("momo-quit-corrupt-cache-");
+		const fixture = setupPoolWorkerFixture({
+			cacheRoot,
+			cwd,
+			role: "implementer",
+			assignmentId: "implactive001",
+		});
+		const exitingEpoch = "shutdown-epoch";
+		const reviewerWorkerId = stableWorkerId(fixture.identity.poolKey, "reviewer");
+		const reviewerAssignmentId = "reviewqueued01";
+
+		fixture.pool.upsert({
+			workerId: stableWorkerId(fixture.identity.poolKey, "scout"),
+			generation: 1,
+			generationTombstone: 1,
+			role: "scout",
+			paneId: "w1:p9",
+			agentName: "momo_scout",
+			status: "idle",
+			updatedAt: new Date().toISOString(),
+		});
+		writeFileSync(fixture.pool.roleFile("scout"), "{bad", { mode: 0o600 });
+
+		fixture.pool.upsert({
+			workerId: reviewerWorkerId,
+			generation: 1,
+			generationTombstone: 1,
+			role: "reviewer",
+			paneId: "w1:p3",
+			agentName: "momo_reviewer",
+			status: "idle",
+			updatedAt: new Date().toISOString(),
+		});
+		enqueueAssignment(fixture.pool.poolRoot, "reviewer", {
+			assignmentId: reviewerAssignmentId,
+			workerId: reviewerWorkerId,
+			generation: 1,
+			parentEpoch: exitingEpoch,
+			task: "review-queued",
+		});
+
+		fixture.pool.upsert({
+			workerId: fixture.workerId,
+			generation: fixture.generation,
+			generationTombstone: fixture.generation,
+			role: "implementer",
+			paneId: "w1:p2",
+			agentName: "momo_implementer",
+			status: "busy",
+			activeAssignmentId: fixture.assignmentId,
+			activeParentEpoch: exitingEpoch,
+			updatedAt: new Date().toISOString(),
+		});
+
+		const client = createTestHerdrClient({
+			runCommand: async () => ({
+				code: 0,
+				stdout: JSON.stringify({ id: "ok", result: {} }),
+				stderr: "",
+			}),
+		});
+		const { cancelEpochAssignmentsOnQuit } = await import("../src/extensions/parent.js");
+		let quitError: unknown;
+		try {
+			await cancelEpochAssignmentsOnQuit(fixture.pool, exitingEpoch, client);
+		} catch (error) {
+			quitError = error;
+		}
+		expect(quitError).toBeInstanceOf(AggregateError);
+		const aggregate = quitError as AggregateError;
+		expect(aggregate.errors.some((e) => /scout|corrupt/i.test(String(e)))).toBe(true);
+
+		expect(tryReadIpcJson(fixture.paths.cancel)).toMatchObject({
+			reason: "parent_session_shutdown",
+			runId: fixture.assignmentId,
+		});
+		expect(listQueue(fixture.pool.poolRoot, "reviewer")).toHaveLength(0);
 	});
 });
 

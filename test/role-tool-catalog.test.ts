@@ -12,6 +12,7 @@ import { WriterLeaseManager } from "../src/lease/writer-lease.js";
 import { getRole, ROLE_LIST } from "../src/roles.js";
 import { atomicWriteJson } from "../src/ipc/spool.js";
 import { HerdrClient } from "../src/herdr/client.js";
+import { createTestHerdrClient } from "./helpers/herdr-mock-client.js";
 import { PoolRegistry } from "../src/herdr/pool-registry.js";
 import { resolvePoolIdentity } from "../src/herdr/pool-identity.js";
 import { dispatchAssignment, setupPoolWorkerFixture } from "./helpers/pool-fixture.js";
@@ -109,7 +110,7 @@ describe("role launch tool catalogs", () => {
 		});
 		const pool = new PoolRegistry(identity.poolKey, cacheRoot);
 
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args[0] === "pane" && args[1] === "split") {
 					const envArgs = args.filter((arg, index) => args[index - 1] === "--env");

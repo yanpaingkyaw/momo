@@ -1,6 +1,14 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { existsSync, rmSync } from "node:fs";
 import path from "node:path";
+import {
+	verifySessionModelPolicy,
+	ModelPolicyApplyError,
+	toIpcModelPolicy,
+	verifiedPolicyFromSession,
+	IPC_PROTOCOL_CAPABILITY,
+	type ModelPolicySnapshot,
+} from "../config/model-policy.js";
 import { createWorkspaceDiffTool } from "../delegation/workspace-diff.js";
 import { assignmentSpoolPaths } from "../herdr/assignment-spool.js";
 import {
@@ -11,6 +19,7 @@ import {
 	withRoleLock,
 	type QueueEntry,
 } from "../herdr/role-queue.js";
+import { publishAssignmentCommandLocked } from "../herdr/dispatch-publish.js";
 import type { PoolWorkerRecord } from "../herdr/pool-registry.js";
 import { PoolRegistry } from "../herdr/pool-registry.js";
 import { completeCleanAssignmentLocked } from "../herdr/terminal-transition.js";
@@ -30,7 +39,12 @@ import {
 	validateCommand,
 	validateResult,
 	validateStarted,
+	validateWorkerManifest,
 } from "../ipc/validate.js";
+import {
+	inferRecoveryProtocolVersion,
+	validateAssignmentRecoveryChain,
+} from "../ipc/recovery-validator.js";
 import {
 	appendEvent,
 	atomicWriteJson,
@@ -63,6 +77,53 @@ const MUTATION_TOOLS = new Set(["bash", "edit", "write"]);
 /** @deprecated Context isolation now uses the latest user message. */
 export const ASSIGNMENT_BOUNDARY_TYPE = "momo-assignment-boundary";
 
+/** @internal test-only */
+let maxClaimRetryAttemptsForTest: number | undefined;
+
+/** @internal test-only */
+export function __setMaxClaimRetryAttemptsForTest(n?: number): void {
+	maxClaimRetryAttemptsForTest = n;
+}
+
+/** @internal test-only */
+export function __resetMaxClaimRetryAttemptsForTest(): void {
+	maxClaimRetryAttemptsForTest = undefined;
+}
+
+/** @internal test-only: fault injection inside claim-retry timer recovery (under role lock). */
+let claimRetryRecoveryHookForTest: (() => void) | undefined;
+
+/** @internal test-only */
+export function __setClaimRetryRecoveryHookForTest(hook?: () => void): void {
+	claimRetryRecoveryHookForTest = hook;
+}
+
+/** @internal test-only */
+export function __resetClaimRetryRecoveryHookForTest(): void {
+	claimRetryRecoveryHookForTest = undefined;
+}
+
+/** @internal test-only: fault injection during control/lease/assignment heartbeat writes. */
+let controlHeartbeatHookForTest: ((phase: "control" | "lease" | "assignment") => void) | undefined;
+
+/** @internal test-only: fault injection during heartbeat-failure registry fence. */
+let heartbeatFenceHookForTest: (() => void) | undefined;
+
+/** @internal test-only */
+export function __setControlHeartbeatHooksForTest(hooks?: {
+	onWrite?: (phase: "control" | "lease" | "assignment") => void;
+	onFence?: () => void;
+}): void {
+	controlHeartbeatHookForTest = hooks?.onWrite;
+	heartbeatFenceHookForTest = hooks?.onFence;
+}
+
+/** @internal test-only */
+export function __resetControlHeartbeatHooksForTest(): void {
+	controlHeartbeatHookForTest = undefined;
+	heartbeatFenceHookForTest = undefined;
+}
+
 /** @internal test-only: barrier inside writeResultDurable while holding the role lock. */
 let writeResultDurableLockHook:
 	| ((phase: "before-write" | "after-write") => void)
@@ -78,6 +139,30 @@ export function __setWriteResultDurableLockHookForTest(
 /** @internal test-only */
 export function __resetWriteResultDurableLockHookForTest(): void {
 	writeResultDurableLockHook = undefined;
+}
+
+/** @internal test-only: inject result.json atomic write (fault injection). */
+let resultAtomicWriteForTest: typeof atomicWriteJson | undefined;
+
+/** @internal test-only */
+export function __setResultAtomicWriteForTest(
+	impl?: typeof atomicWriteJson,
+): void {
+	resultAtomicWriteForTest = impl;
+}
+
+/** @internal test-only */
+export function __resetResultAtomicWriteForTest(): void {
+	resultAtomicWriteForTest = undefined;
+}
+
+function writeResultAtomic(
+	targetPath: string,
+	payload: Parameters<typeof atomicWriteJson>[1],
+	maxBytes?: number,
+): void {
+	const write = resultAtomicWriteForTest ?? atomicWriteJson;
+	write(targetPath, payload, maxBytes);
 }
 
 export interface WorkerRuntimeOptions {
@@ -103,6 +188,12 @@ interface ActiveAssignment {
 	parentEpoch?: string;
 	/** A cancellation is terminal even when Pi settles without an assistant message. */
 	cancelRequested?: string;
+	/** Requested v3 policy from durable command (immutable for assignment). */
+	requestedModelPolicy?: ModelPolicySnapshot;
+	/** Verified effective policy from live session after fence checks. */
+	verifiedModelPolicy?: ModelPolicySnapshot;
+	/** IPC capability when policy feature active. */
+	ipcCapability?: number;
 	/** Progress event log hit the byte cap; further non-authoritative events are dropped. */
 	eventsCapacityExhausted?: boolean;
 }
@@ -168,6 +259,10 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 	let controlHeartbeatSeq = 0;
 	let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
 	let pollTimer: ReturnType<typeof setInterval> | undefined;
+	let claimRetryTimer: ReturnType<typeof setTimeout> | undefined;
+	let claimRetryAttempts = 0;
+	const MAX_CLAIM_RETRY_ATTEMPTS = 8;
+	const CLAIM_RETRY_BASE_MS = 50;
 	let protocolUnhealthy = false;
 
 	const readOnlyTools = role.tools.filter((tool) => !MUTATION_TOOLS.has(tool) && tool !== "workspace_diff");
@@ -226,6 +321,7 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 	}
 
 	function writeControlHeartbeat(): void {
+		controlHeartbeatHookForTest?.("control");
 		controlHeartbeatSeq += 1;
 		atomicWriteJson(controlPaths.heartbeat, {
 			version: 1,
@@ -235,13 +331,11 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 			seq: controlHeartbeatSeq,
 		});
 		if (active?.leaseHeld) {
-			try {
-				lease.heartbeat(cwd, leaseOwner, active.leaseToken);
-			} catch {
-				disableMutationTools();
-			}
+			controlHeartbeatHookForTest?.("lease");
+			lease.heartbeat(cwd, leaseOwner, active.leaseToken);
 		}
 		if (active && !active.resultWritten) {
+			controlHeartbeatHookForTest?.("assignment");
 			atomicWriteJson(active.paths.heartbeat, {
 				version: 1,
 				runId: active.assignmentId,
@@ -249,6 +343,124 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 				at: new Date(now()).toISOString(),
 				seq: controlHeartbeatSeq,
 			});
+		}
+	}
+
+	function stopPeriodicTimers(): void {
+		if (heartbeatTimer !== undefined) {
+			clearInterval(heartbeatTimer);
+			heartbeatTimer = undefined;
+		}
+		if (pollTimer !== undefined) {
+			clearInterval(pollTimer);
+			pollTimer = undefined;
+		}
+		if (claimRetryTimer !== undefined) {
+			clearTimeout(claimRetryTimer);
+			claimRetryTimer = undefined;
+		}
+	}
+
+	function reportHeartbeatDiagnostic(message: string): void {
+		try {
+			console.error(message);
+		} catch {
+			// ignore console failures
+		}
+	}
+
+	function hasImplementerExecutionEvidence(assignment?: ActiveAssignment): boolean {
+		if (!role.canWrite || !assignment) return false;
+		if (assignment.mutationAttempted || assignment.leaseHeld) return true;
+		if (existsSync(assignment.paths.started)) return true;
+		try {
+			const owner = lease.peekOwner(cwd);
+			return !!(owner && owner.ownerId === workerId);
+		} catch {
+			return false;
+		}
+	}
+
+	/**
+	 * Must run under the role lock. Exact-generation fence after heartbeat I/O
+	 * failure; never advances queue or drops lease/active evidence.
+	 */
+	function fenceRegistryAfterHeartbeatFailureLocked(): void {
+		heartbeatFenceHookForTest?.();
+		const current = pool.getByRole(role.name);
+		if (!ownsCurrentGeneration(current)) {
+			failGenerationFence();
+			return;
+		}
+		if (current.status === "unhealthy" || current.status === "uncertain") {
+			return;
+		}
+		const preferUncertain =
+			role.canWrite &&
+			hasImplementerExecutionEvidence(active) &&
+			(current.status === "busy" || current.status === "blocked");
+		if (
+			active &&
+			!active.resultWritten &&
+			(current.status === "busy" || current.status === "blocked") &&
+			current.activeAssignmentId === active.assignmentId
+		) {
+			markRegistryLocked(preferUncertain ? "uncertain" : "unhealthy", {
+				activeAssignmentId: active.assignmentId,
+				...(active.parentEpoch !== undefined ? { activeParentEpoch: active.parentEpoch } : {}),
+				...(preferUncertain ? { uncertainWrite: true } : {}),
+			});
+			return;
+		}
+		if (current.status !== "busy" && current.status !== "blocked") {
+			markRegistryLocked("unhealthy");
+			return;
+		}
+		markRegistryLocked(preferUncertain ? "uncertain" : "unhealthy", {
+			...(current.activeAssignmentId !== undefined
+				? { activeAssignmentId: current.activeAssignmentId }
+				: {}),
+			...(current.activeParentEpoch !== undefined
+				? { activeParentEpoch: current.activeParentEpoch }
+				: {}),
+			...(preferUncertain ? { uncertainWrite: true } : {}),
+		});
+	}
+
+	function fenceRegistryAfterHeartbeatFailureBestEffort(): void {
+		try {
+			withRoleLock(poolRoot, role.name, () => {
+				fenceRegistryAfterHeartbeatFailureLocked();
+			});
+		} catch (error) {
+			reportHeartbeatDiagnostic(
+				`Worker heartbeat registry fence failed for role=${role.name} worker=${workerId} generation=${generation}: ${
+					error instanceof Error ? error.message : String(error)
+				}`,
+			);
+		}
+	}
+
+	function handleControlHeartbeatFailure(error: unknown, isStartup: boolean): never | void {
+		if (isStartup) {
+			throw error instanceof Error ? error : new Error(String(error));
+		}
+		stopPeriodicTimers();
+		disableMutationTools();
+		protocolUnhealthy = true;
+		fenceRegistryAfterHeartbeatFailureBestEffort();
+		reportHeartbeatDiagnostic(
+			`Worker control heartbeat failed for role=${role.name} worker=${workerId} generation=${generation}: ${
+				error instanceof Error ? error.message : String(error)
+			}`,
+		);
+	}
+
+	function runSupervisedControlHeartbeat(isStartup = false): void {
+		try {
+			writeControlHeartbeat();
+		} catch (error) {
+			handleControlHeartbeatFailure(error, isStartup);
 		}
 	}
 
@@ -423,8 +635,53 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 			let uncertainWrite = partial.uncertainWrite === true;
 			let errorMessage = partial.errorMessage;
 
-			// Exact-token release only after the fence; never touch a foreign lease.
-			// Worker-first path: release-before-result remains ordered inside this lock.
+			const messages = sanitizeAssistantMessages(
+				partial.messages ?? assignment.assistantMessages,
+				Math.floor(MAX_IPC_JSON_BYTES * 0.75),
+			);
+			const buildPayload = (): IpcResult => {
+				const payload: IpcResult = {
+					version: 1,
+					runId: assignment.assignmentId,
+					workerId,
+					status,
+					messages,
+					finishedAt: new Date(now()).toISOString(),
+				};
+				if (partial.stopReason !== undefined) payload.stopReason = partial.stopReason;
+				if (errorMessage !== undefined) payload.errorMessage = errorMessage;
+				if (uncertainWrite) payload.uncertainWrite = true;
+				if (partial.usage !== undefined) payload.usage = partial.usage;
+				const policyForResult = assignment.verifiedModelPolicy ?? assignment.requestedModelPolicy;
+				if (policyForResult !== undefined && assignment.ipcCapability !== undefined) {
+					payload.capability = assignment.ipcCapability;
+					payload.modelPolicy = toIpcModelPolicy(policyForResult);
+					payload.modelPolicyApplied =
+						status === "completed" && assignment.verifiedModelPolicy !== undefined;
+				}
+				if (uncertainWrite && payload.status === "completed") {
+					payload.status = "failed";
+				}
+				return payload;
+			};
+
+			let written = false;
+			for (let attempt = 0; attempt < 3; attempt += 1) {
+				try {
+					writeResultAtomic(assignment.paths.result, buildPayload(), MAX_IPC_JSON_BYTES);
+					written = true;
+					break;
+				} catch {
+					// retry
+				}
+			}
+			if (!written) {
+				// Exact implementer lease remains for uncertain cleanup verification.
+				return false;
+			}
+			assignment.resultWritten = true;
+
+			// Release exact token only after durable result; never before.
 			if (assignment.leaseHeld && !uncertainWrite) {
 				try {
 					lease.release(cwd, leaseOwner, assignment.leaseToken);
@@ -433,47 +690,37 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 					}
 					assignment.leaseHeld = false;
 				} catch (error) {
-					status = "failed";
 					uncertainWrite = true;
+					status = "failed";
 					errorMessage = `Writer lease release failed: ${
 						error instanceof Error ? error.message : String(error)
 					}`;
+					for (let attempt = 0; attempt < 3; attempt += 1) {
+						try {
+							atomicWriteJson(
+								assignment.paths.result,
+								buildPayload(),
+								MAX_IPC_JSON_BYTES,
+							);
+							break;
+						} catch {
+							// retry fenced rewrite
+						}
+					}
+					markRegistryLocked("uncertain", {
+						activeAssignmentId: assignment.assignmentId,
+						...(assignment.parentEpoch !== undefined
+							? { activeParentEpoch: assignment.parentEpoch }
+							: {}),
+						uncertainWrite: true,
+					});
+					protocolUnhealthy = true;
+					if (writeResultDurableLockHook) {
+						writeResultDurableLockHook("after-write");
+					}
+					return true;
 				}
 			}
-
-			const messages = sanitizeAssistantMessages(
-				partial.messages ?? assignment.assistantMessages,
-				Math.floor(MAX_IPC_JSON_BYTES * 0.75),
-			);
-			const payload: IpcResult = {
-				version: 1,
-				runId: assignment.assignmentId,
-				workerId,
-				status,
-				messages,
-				finishedAt: new Date(now()).toISOString(),
-			};
-			if (partial.stopReason !== undefined) payload.stopReason = partial.stopReason;
-			if (errorMessage !== undefined) payload.errorMessage = errorMessage;
-			if (uncertainWrite) payload.uncertainWrite = true;
-			if (partial.usage !== undefined) payload.usage = partial.usage;
-
-			if (uncertainWrite && payload.status === "completed") {
-				payload.status = "failed";
-			}
-
-			let written = false;
-			for (let attempt = 0; attempt < 3; attempt += 1) {
-				try {
-					atomicWriteJson(assignment.paths.result, payload, MAX_IPC_JSON_BYTES);
-					written = true;
-					break;
-				} catch {
-					// retry
-				}
-			}
-			if (!written) return false;
-			assignment.resultWritten = true;
 
 			if (uncertainWrite) {
 				markRegistryLocked("uncertain", {
@@ -679,6 +926,69 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 			}
 		}
 
+		let manifestInfo: { version: 2 | 3; boundPolicy?: import("../ipc/spool.js").IpcModelPolicy } | undefined;
+		if (existsSync(controlPaths.manifest)) {
+			try {
+				const manifestRaw = tryReadIpcJson(controlPaths.manifest);
+				if (manifestRaw) {
+					const manifest = validateWorkerManifest(manifestRaw, {
+						poolKey,
+						workerId,
+						generation,
+						role: role.name,
+					});
+					manifestInfo = {
+						version: manifest.version,
+						...(manifest.boundPolicy ? { boundPolicy: manifest.boundPolicy } : {}),
+					};
+				}
+			} catch {
+				markProtocolCorruptLocked("invalid manifest");
+				return "handled";
+			}
+		}
+
+		const protocolVersion = inferRecoveryProtocolVersion({
+			...(manifestInfo?.version !== undefined ? { manifestVersion: manifestInfo.version } : {}),
+			...(current.boundPolicy !== undefined ? { registryBoundPolicy: current.boundPolicy } : {}),
+			command,
+			...(result !== undefined ? { result } : {}),
+		});
+
+		let hasLeaseEvidence = false;
+		if (role.canWrite) {
+			try {
+				const owner = lease.peekOwner(cwd);
+				hasLeaseEvidence = !!(owner && owner.ownerId === workerId);
+			} catch {
+				// lease corruption handled below for in-flight without result
+			}
+		}
+
+		const recovery = validateAssignmentRecoveryChain({
+			role,
+			protocolVersion,
+			command,
+			...(manifestInfo !== undefined ? { manifest: manifestInfo } : {}),
+			...(current.boundPolicy !== undefined ? { registryBoundPolicy: current.boundPolicy } : {}),
+			...(started !== undefined ? { started } : {}),
+			...(result !== undefined ? { result } : {}),
+			...(hasLeaseEvidence ? { hasLeaseEvidence: true } : {}),
+		});
+		if (!recovery.ok) {
+			disableMutationTools();
+			protocolUnhealthy = true;
+			pool.upsert({
+				...current,
+				status: recovery.fence === "uncertain" ? "uncertain" : "unhealthy",
+				...(recovery.fence === "uncertain" ? { uncertainWrite: true } : {}),
+				activeAssignmentId: assignmentId,
+				activeParentEpoch: parentEpoch,
+				updatedAt: new Date(now()).toISOString(),
+			});
+			return "handled";
+		}
+
 		// 1) Valid result => never rerun.
 		if (result) {
 			if (result.uncertainWrite === true) {
@@ -785,6 +1095,92 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 		return "handled";
 	}
 
+	function maxClaimRetryAttempts(): number {
+		return maxClaimRetryAttemptsForTest ?? MAX_CLAIM_RETRY_ATTEMPTS;
+	}
+
+	/**
+	 * Must run under the role lock. Claim publish retries exhausted while still
+	 * pre-execution (command/active rolled back; no started/lease) — fence
+	 * unhealthy (never uncertain/uncertainWrite), retain claiming evidence for
+	 * normal /momo-cleanup.
+	 */
+	function fenceClaimRetryExhaustedLocked(): void {
+		if (protocolUnhealthy) return;
+		protocolUnhealthy = true;
+		const current = pool.getByRole(role.name);
+		if (!ownsCurrentGeneration(current)) {
+			failGenerationFence();
+			return;
+		}
+		if (current.status === "unhealthy" || current.status === "uncertain") {
+			return;
+		}
+		const head = listClaiming(poolRoot, role.name)[0];
+		if (head && head.generation === generation) {
+			markRegistryLocked("unhealthy", {
+				activeAssignmentId: head.assignmentId,
+				...(head.parentEpoch !== undefined ? { activeParentEpoch: head.parentEpoch } : {}),
+			});
+			return;
+		}
+		markRegistryLocked("unhealthy");
+	}
+
+	function fenceClaimRetryExhaustedBestEffort(): void {
+		try {
+			withRoleLock(poolRoot, role.name, () => {
+				fenceClaimRetryExhaustedLocked();
+			});
+		} catch {
+			protocolUnhealthy = true;
+		}
+	}
+
+	/**
+	 * Claim-retry timer I/O failure (role lock or recovery). Count toward the
+	 * retry budget, reschedule when bounded, otherwise visible unhealthy fence.
+	 */
+	function handleClaimRetryIoFailure(): void {
+		if (protocolUnhealthy) return;
+		if (claimRetryAttempts >= maxClaimRetryAttempts()) {
+			fenceClaimRetryExhaustedBestEffort();
+			return;
+		}
+		scheduleClaimRetry();
+	}
+
+	function runClaimRetryFromTimer(): void {
+		if (protocolUnhealthy) return;
+		try {
+			withRoleLock(poolRoot, role.name, () => {
+				claimRetryRecoveryHookForTest?.();
+				claimNextOrIdleLocked("startup");
+			});
+		} catch {
+			handleClaimRetryIoFailure();
+		}
+	}
+
+	/**
+	 * Must run under the role lock. `afterFinish` clears the completed active
+	 * pointer; startup must never delete a parent-dispatched active (race).
+	 */
+	function scheduleClaimRetry(): void {
+		if (protocolUnhealthy || claimRetryTimer) return;
+		if (claimRetryAttempts >= maxClaimRetryAttempts()) {
+			fenceClaimRetryExhaustedLocked();
+			return;
+		}
+		claimRetryAttempts += 1;
+		const delay = CLAIM_RETRY_BASE_MS * claimRetryAttempts;
+		claimRetryTimer = setTimeout(() => {
+			claimRetryTimer = undefined;
+			runClaimRetryFromTimer();
+		}, delay);
+		claimRetryTimer.unref?.();
+	}
+
 	/**
 	 * Must run under the role lock. `afterFinish` clears the completed active
 	 * pointer; startup must never delete a parent-dispatched active (race).
@@ -833,6 +1229,18 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 					disableMutationTools();
 					return;
 				}
+				if (outcome.kind === "retry_pending") {
+					active = undefined;
+					disableMutationTools();
+					scheduleClaimRetry();
+					return;
+				}
+				if (outcome.kind === "publish_fenced") {
+					protocolUnhealthy = true;
+					active = undefined;
+					disableMutationTools();
+					return;
+				}
 				active = undefined;
 				disableMutationTools();
 				return;
@@ -847,7 +1255,9 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 			resetForNextAssignment();
 			return;
 		}
-		publishClaimLocked(next);
+		if (publishClaimLocked(next)) {
+			claimRetryAttempts = 0;
+		}
 	}
 
 	/**
@@ -862,35 +1272,37 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 			failGenerationFence();
 			return false;
 		}
-		const paths = assignmentSpoolPaths(poolRoot, role.name, next.assignmentId);
-		atomicWriteJson(paths.command, {
-			version: 1,
-			type: "prompt",
-			task: next.task,
-			issuedAt: new Date(now()).toISOString(),
-			runId: next.assignmentId,
+		const outcome = publishAssignmentCommandLocked({
+			pool,
+			poolRoot,
+			role: role.name,
 			workerId,
 			generation,
-			parentEpoch: next.parentEpoch,
-		});
-		if (
-			!markRegistryLocked("busy", {
-				activeAssignmentId: next.assignmentId,
-				activeParentEpoch: next.parentEpoch,
-			})
-		) {
-			// Command may exist; active.json and commitClaim must not run.
-			return false;
-		}
-		atomicWriteJson(controlPaths.active, {
-			version: 1,
 			assignmentId: next.assignmentId,
-			generation,
 			parentEpoch: next.parentEpoch,
-			dispatchedAt: new Date(now()).toISOString(),
+			task: next.task,
+			now,
+			rollbackRecord: current,
+			...(next.capability !== undefined || next.modelPolicy !== undefined
+				? {
+						commandExtras: {
+							...(next.capability !== undefined ? { capability: next.capability } : {}),
+							...(next.modelPolicy !== undefined ? { modelPolicy: next.modelPolicy } : {}),
+						},
+					}
+				: {}),
+			onCommitted: () => commitClaim(poolRoot, role.name, next),
 		});
-		commitClaim(poolRoot, role.name, next);
-		return true;
+		if (outcome.ok) {
+			claimRetryAttempts = 0;
+			return true;
+		}
+		if (outcome.reason === "fenced") {
+			protocolUnhealthy = true;
+		} else if (outcome.reason === "rolled_back") {
+			scheduleClaimRetry();
+		}
+		return false;
 	}
 
 	function claimNextOrIdle(
@@ -965,26 +1377,12 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 		}
 	}
 
-	/** Cancel before mutation/start: release exact lease or fail uncertain. */
+	/** Cancel before mutation/start: durable result then exact lease release inside writeResultDurable. */
 	async function finishCancelledBeforeWork(
 		assignment: ActiveAssignment,
 		cancelReason: string,
 	): Promise<void> {
 		disableMutationTools();
-		const release = releaseExactLeaseForCancel(assignment);
-		if (!release.released) {
-			await finishAssignment(
-				assignment,
-				{
-					status: "failed",
-					messages: assignment.assistantMessages,
-					errorMessage: `${cancelReason}; ${release.errorMessage}`,
-					uncertainWrite: true,
-				},
-				"failed",
-			);
-			return;
-		}
 		await finishAssignment(
 			assignment,
 			{
@@ -1070,9 +1468,11 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 			claimNextOrIdleLocked("startup");
 		});
 
-		heartbeatTimer = setInterval(writeControlHeartbeat, 3_000);
+		heartbeatTimer = setInterval(() => {
+			runSupervisedControlHeartbeat(false);
+		}, 3_000);
 		heartbeatTimer.unref?.();
-		writeControlHeartbeat();
+		runSupervisedControlHeartbeat(true);
 
 		pollTimer = setInterval(() => {
 			void pollActive(ctx);
@@ -1150,10 +1550,33 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 
 	async function runAssignment(ctx: ExtensionContext, assignment: ActiveAssignment): Promise<void> {
 		try {
+			const commandRaw = tryReadIpcJson(assignment.paths.command);
+			if (!commandRaw) {
+				// Active pointer without command yet — wait.
+				active = undefined;
+				return;
+			}
+			const command = validateCommand(commandRaw, {
+				runId: assignment.assignmentId,
+				workerId,
+				generation,
+				...(assignment.parentEpoch ? { parentEpoch: assignment.parentEpoch } : {}),
+			});
+
+			// Authoritative v3 policy from durable command before cancel/skip/lease/terminal paths.
+			if (command.type === "prompt") {
+				if (command.capability === IPC_PROTOCOL_CAPABILITY && command.modelPolicy) {
+					assignment.requestedModelPolicy = {
+						provider: command.modelPolicy.provider,
+						model: command.modelPolicy.model,
+						reasoning: command.modelPolicy.reasoning as ModelPolicySnapshot["reasoning"],
+					};
+					assignment.ipcCapability = command.capability;
+				}
+			}
+
 			const cancelReason = cancelPending(assignment);
 			if (cancelReason) {
-				// Publish only when production dispatch already left busy|blocked
-				// for this exact assignment; never manufacture busy from idle/starting.
 				await finishAssignment(
 					assignment,
 					{
@@ -1167,18 +1590,6 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 				return;
 			}
 
-			const commandRaw = tryReadIpcJson(assignment.paths.command);
-			if (!commandRaw) {
-				// Active pointer without command yet — wait.
-				active = undefined;
-				return;
-			}
-			const command = validateCommand(commandRaw, {
-				runId: assignment.assignmentId,
-				workerId,
-				generation,
-				...(assignment.parentEpoch ? { parentEpoch: assignment.parentEpoch } : {}),
-			});
 			if (command.type === "skip" || command.type === "cancel") {
 				await finishAssignment(
 					assignment,
@@ -1198,6 +1609,33 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 				throw new Error("Persistent assignment command missing parentEpoch");
 			}
 			assignment.parentEpoch = parentEpoch;
+
+			if (command.type === "prompt" && assignment.requestedModelPolicy !== undefined) {
+				try {
+					const sessionView: import("../config/model-policy.js").SessionModelView = {};
+					if (ctx.model !== undefined) sessionView.model = ctx.model;
+					if (ctx.thinkingLevel !== undefined) sessionView.thinkingLevel = ctx.thinkingLevel;
+					verifySessionModelPolicy(sessionView, assignment.requestedModelPolicy);
+					assignment.verifiedModelPolicy = verifiedPolicyFromSession(sessionView);
+				} catch (error) {
+					const message =
+						error instanceof ModelPolicyApplyError || error instanceof Error
+							? error.message
+							: String(error);
+					await finishAssignment(
+						assignment,
+						{
+							status: "failed",
+							messages: assignment.assistantMessages,
+							errorMessage: message,
+							uncertainWrite: false,
+							modelPolicyApplied: false,
+						},
+						"failed",
+					);
+					return;
+				}
+			}
 
 			markRegistry("busy", {
 				activeAssignmentId: assignment.assignmentId,
@@ -1226,8 +1664,6 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 						},
 					});
 					assignment.leaseHeld = true;
-					// Close cancel-vs-acquire race: cancel may land after shouldCancel
-					// cleared but before enableMutationTools.
 					const cancelAfterAcquire = cancelPending(assignment);
 					if (cancelAfterAcquire) {
 						await finishCancelledBeforeWork(assignment, cancelAfterAcquire);
@@ -1268,7 +1704,6 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 				}
 			}
 
-			// Narrow cancel window before durable start / prompt.
 			const cancelBeforeStart = cancelPending(assignment);
 			if (cancelBeforeStart) {
 				await finishCancelledBeforeWork(assignment, cancelBeforeStart);
@@ -1280,11 +1715,10 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 				throw new Error("Expected prompt command after skip/cancel filter");
 			}
 
-			// At-most-once: if started marker already exists, never re-prompt.
 			if (existsSync(assignment.paths.started)) {
 				throw new Error("Assignment already started; refusing duplicate prompt");
 			}
-			// Durable start fence immediately BEFORE sendUserMessage.
+
 			atomicWriteJson(assignment.paths.started, {
 				version: 1,
 				runId: assignment.assignmentId,
@@ -1292,6 +1726,12 @@ export function installMomoWorker(pi: ExtensionAPI, options: WorkerRuntimeOption
 				generation,
 				parentEpoch,
 				startedAt: new Date(now()).toISOString(),
+				...(assignment.ipcCapability !== undefined
+					? { capability: assignment.ipcCapability }
+					: {}),
+				...(assignment.verifiedModelPolicy !== undefined
+					? { modelPolicy: toIpcModelPolicy(assignment.verifiedModelPolicy) }
+					: {}),
 			});
 			pi.sendUserMessage(command.task);
 		} catch (error) {

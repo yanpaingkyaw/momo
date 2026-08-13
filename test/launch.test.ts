@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { HerdrClient } from "../src/herdr/client.js";
+import { createTestHerdrClient } from "./helpers/herdr-mock-client.js";
 import { planLaunch } from "../src/launch.js";
 
 describe("planLaunch", () => {
@@ -11,7 +12,7 @@ describe("planLaunch", () => {
 	});
 
 	it("fail-closes on incompatible Herdr preflight", async () => {
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args.includes("--version")) {
 					return { code: 0, stdout: "herdr 0.6.0\n", stderr: "" };
@@ -39,7 +40,7 @@ describe("planLaunch", () => {
 	});
 
 	it("fail-closes when official Herdr Pi extension is missing", async () => {
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args.includes("--version")) return { code: 0, stdout: "herdr 0.7.5\n", stderr: "" };
 				if (args[0] === "api") {
@@ -65,7 +66,7 @@ describe("planLaunch", () => {
 	});
 
 	it("fail-closes on incompatible MOMO_PI_BINARY / Pi version", async () => {
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args.includes("--version")) return { code: 0, stdout: "herdr 0.7.5\n", stderr: "" };
 				if (args[0] === "api") {
@@ -94,7 +95,7 @@ describe("planLaunch", () => {
 	});
 
 	it("fail-closes when MOMO_PI_BINARY resolves to a different executable than PATH pi", async () => {
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args.includes("--version")) return { code: 0, stdout: "herdr 0.7.5\n", stderr: "" };
 				if (args[0] === "api") {
@@ -122,7 +123,7 @@ describe("planLaunch", () => {
 	});
 
 	it("plans exec-pi when Herdr preflight passes", async () => {
-		const client = new HerdrClient({
+		const client = createTestHerdrClient({
 			runCommand: async (_file, args) => {
 				if (args.includes("--version")) {
 					return { code: 0, stdout: "herdr 0.7.5\n", stderr: "" };

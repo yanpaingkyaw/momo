@@ -31,8 +31,13 @@ export const LOCK_STALE_MS = 30_000;
 export const LOCK_MISSING_OWNER_GRACE_MS = 5_000;
 export const LOCK_HEARTBEAT_MS = 2_000;
 
+import type { IpcModelPolicy } from "../ipc/spool.js";
+import { IPC_PROTOCOL_CAPABILITY } from "../ipc/spool.js";
+import { assertExactKeys as assertIpcExactKeys, parseDiscriminatedIpcPolicy, validateModelPolicyField } from "../ipc/validate.js";
+
 export interface QueueEntry {
 	version: 1;
+	capability?: number;
 	assignmentId: string;
 	workerId: string;
 	generation: number;
@@ -40,6 +45,7 @@ export interface QueueEntry {
 	task: string;
 	enqueuedAt: string;
 	seq: number;
+	modelPolicy?: IpcModelPolicy;
 }
 
 export interface LockOwnerRecord {
@@ -65,6 +71,26 @@ export class QueueLockError extends Error {
 		this.name = "QueueLockError";
 		if (options?.initError !== undefined) this.initError = options.initError;
 		if (options?.rollbackError !== undefined) this.rollbackError = options.rollbackError;
+	}
+}
+
+/** Callback threw/rejected `undefined` — bare undefined cannot be rethrown with throw semantics. */
+export class RoleLockCallbackFailure extends Error {
+	readonly callbackValue: unknown;
+
+	constructor(callbackValue: unknown) {
+		super(
+			callbackValue === undefined
+				? "Role lock callback threw undefined"
+				: callbackValue instanceof Error
+					? callbackValue.message
+					: String(callbackValue),
+		);
+		this.name = "RoleLockCallbackFailure";
+		this.callbackValue = callbackValue;
+		if (callbackValue !== undefined) {
+			this.cause = callbackValue;
+		}
 	}
 }
 
@@ -121,6 +147,7 @@ function formatLockError(error: unknown): string {
 /** @internal test-only: injectable acquire init / rollback primitives. */
 let writeOwnerAtomicForAcquire = writeOwnerAtomicDefault;
 let removeLockDirForAcquireRollback = removeLockDirDefault;
+let removeLockDirForRelease = removeLockDirDefault;
 let afterLockOwnerInitializedForTest: ((lockDir: string) => void) | undefined;
 
 /** @internal test-only: inject owner-write / heartbeat-init / rollback-rm faults. */
@@ -133,6 +160,18 @@ export function __setLockAcquireHooksForTest(hooks?: {
 	writeOwnerAtomicForAcquire = hooks?.writeOwnerAtomic ?? writeOwnerAtomicDefault;
 	removeLockDirForAcquireRollback = hooks?.removeLockDir ?? removeLockDirDefault;
 	afterLockOwnerInitializedForTest = hooks?.afterOwnerInitialized;
+}
+
+/** @internal test-only: inject release-time lock directory removal faults. */
+export function __setLockReleaseHooksForTest(hooks?: {
+	removeLockDir?: (lockDir: string) => void;
+}): void {
+	removeLockDirForRelease = hooks?.removeLockDir ?? removeLockDirDefault;
+}
+
+/** @internal test-only */
+export function __resetLockReleaseHooksForTest(): void {
+	removeLockDirForRelease = removeLockDirDefault;
 }
 
 function writeOwnerAtomic(lockDir: string, owner: LockOwnerRecord): void {
@@ -277,19 +316,30 @@ export class RoleTransactionLock {
 	release(): void {
 		if (!this.held || !this.token) return;
 		this.stopHeartbeat();
+		const lockDir = this.lockDir;
 		const token = this.token;
 		this.held = false;
 		this.token = undefined;
 		try {
-			const owner = readOwner(this.lockDir);
-			if (!owner || owner.token !== token) {
-				// Successor already owns the lock — never rm.
-				return;
-			}
-			rmSync(this.lockDir, { recursive: true, force: true });
+			releaseRoleTransactionLock(lockDir, token);
 		} catch {
-			// best effort
+			// best effort — lock path may remain for supervised recovery
 		}
+	}
+
+	/** Stop heartbeat, clear held state, validate token, then remove (throws on failure). */
+	releaseStrict(): void {
+		if (!this.held || !this.token) return;
+		this.stopHeartbeat();
+		const lockDir = this.lockDir;
+		const token = this.token;
+		this.held = false;
+		this.token = undefined;
+		releaseRoleTransactionLock(lockDir, token);
+	}
+
+	isHeartbeatActiveForTest(): boolean {
+		return this.heartbeatTimer !== undefined;
 	}
 
 	getTokenForTest(): string | undefined {
@@ -323,6 +373,44 @@ export class RoleTransactionLock {
 	}
 }
 
+function releaseRoleTransactionLock(lockDir: string, token: string): void {
+	const owner = readOwner(lockDir);
+	if (!owner || owner.token !== token) {
+		throw new QueueLockError("Role transaction lock release refused: token mismatch");
+	}
+	try {
+		removeLockDirForRelease(lockDir);
+	} catch (error) {
+		throw new QueueLockError(
+			`Role transaction lock release removal failed at ${lockDir}: ${formatLockError(error)}`,
+			{ cause: error },
+		);
+	}
+}
+
+function rethrowCallbackFailure(callbackError: unknown): never {
+	if (callbackError === undefined) {
+		throw new RoleLockCallbackFailure(undefined);
+	}
+	throw callbackError;
+}
+
+function finalizeReleaseFromCallback(
+	callbackFailed: boolean,
+	callbackError: unknown,
+	releaseFailed: boolean,
+	releaseError: unknown,
+): void {
+	if (callbackFailed && releaseFailed) {
+		throw new AggregateError(
+			[callbackError, releaseError],
+			"Role lock operation failed and lock release failed",
+		);
+	}
+	if (releaseFailed) throw releaseError;
+	if (callbackFailed) rethrowCallbackFailure(callbackError);
+}
+
 export function withRoleLock<T>(
 	poolRoot: string,
 	role: AgentName,
@@ -336,11 +424,25 @@ export function withRoleLock<T>(
 ): T {
 	const lock = new RoleTransactionLock(poolRoot, role, options);
 	lock.acquireSync(options?.timeoutMs ?? 10_000);
+	let callbackFailed = false;
+	let callbackError: unknown;
 	try {
 		return fn();
+	} catch (error) {
+		callbackFailed = true;
+		callbackError = error;
 	} finally {
-		lock.release();
+		let releaseFailed = false;
+		let releaseError: unknown;
+		try {
+			lock.releaseStrict();
+		} catch (error) {
+			releaseFailed = true;
+			releaseError = error;
+		}
+		finalizeReleaseFromCallback(callbackFailed, callbackError, releaseFailed, releaseError);
 	}
+	throw new Error("unreachable role lock callback");
 }
 
 export async function withRoleLockAsync<T>(
@@ -356,11 +458,26 @@ export async function withRoleLockAsync<T>(
 ): Promise<T> {
 	const lock = new RoleTransactionLock(poolRoot, role, options);
 	await lock.acquire(options?.timeoutMs ?? 10_000);
+	let callbackFailed = false;
+	let callbackError: unknown;
+	let result: T | undefined;
 	try {
-		return await fn();
+		result = await fn();
+	} catch (error) {
+		callbackFailed = true;
+		callbackError = error;
 	} finally {
-		lock.release();
+		let releaseFailed = false;
+		let releaseError: unknown;
+		try {
+			lock.releaseStrict();
+		} catch (error) {
+			releaseFailed = true;
+			releaseError = error;
+		}
+		finalizeReleaseFromCallback(callbackFailed, callbackError, releaseFailed, releaseError);
 	}
+	return result as T;
 }
 
 function queueDir(poolRoot: string, role: AgentName): string {
@@ -375,7 +492,7 @@ function queueFileName(seq: number, assignmentId: string): string {
 	return `${String(seq).padStart(8, "0")}-${assignmentId}.json`;
 }
 
-function validateQueueEntry(value: unknown, label: string): QueueEntry {
+export function validateQueueEntry(value: unknown, label: string): QueueEntry {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) {
 		throw new QueueCorruptionError(`${label} must be an object`);
 	}
@@ -402,6 +519,39 @@ function validateQueueEntry(value: unknown, label: string): QueueEntry {
 	if (typeof record.seq !== "number" || !Number.isInteger(record.seq) || record.seq < 1) {
 		throw new QueueCorruptionError(`${label}.seq invalid`);
 	}
+	const capability =
+		record.capability === undefined
+			? undefined
+			: record.capability === IPC_PROTOCOL_CAPABILITY
+				? IPC_PROTOCOL_CAPABILITY
+				: (() => {
+						throw new QueueCorruptionError(`${label}.capability invalid`);
+					})();
+	const ipcPolicy = parseDiscriminatedIpcPolicy(record, label);
+	if (capability !== undefined && ipcPolicy.capability !== capability) {
+		throw new QueueCorruptionError(`${label}.capability mismatch`);
+	}
+	const modelPolicy = ipcPolicy.modelPolicy;
+	if (ipcPolicy.capability === IPC_PROTOCOL_CAPABILITY) {
+		assertIpcExactKeys(
+			record,
+			[
+				"version",
+				"capability",
+				"assignmentId",
+				"workerId",
+				"generation",
+				"parentEpoch",
+				"task",
+				"enqueuedAt",
+				"seq",
+				"modelPolicy",
+			],
+			label,
+		);
+	} else if ("capability" in record || "modelPolicy" in record) {
+		throw new QueueCorruptionError(`${label} legacy entry must omit capability and modelPolicy`);
+	}
 	return {
 		version: 1,
 		assignmentId: record.assignmentId,
@@ -411,6 +561,8 @@ function validateQueueEntry(value: unknown, label: string): QueueEntry {
 		task: record.task,
 		enqueuedAt: record.enqueuedAt,
 		seq: record.seq,
+		...(ipcPolicy.capability !== undefined ? { capability: ipcPolicy.capability } : {}),
+		...(modelPolicy !== undefined ? { modelPolicy } : {}),
 	};
 }
 
@@ -449,6 +601,8 @@ export function enqueueAssignment(
 		task: entry.task,
 		enqueuedAt: entry.enqueuedAt ?? new Date(now()).toISOString(),
 		seq,
+		...(entry.capability !== undefined ? { capability: entry.capability } : {}),
+		...(entry.modelPolicy !== undefined ? { modelPolicy: entry.modelPolicy } : {}),
 	};
 	validateQueueEntry(full, "queue entry");
 	const filePath = path.join(queueDir(poolRoot, role), queueFileName(seq, entry.assignmentId));
@@ -554,6 +708,38 @@ export function peekHead(poolRoot: string, role: AgentName): QueueEntry | undefi
 	const claiming = listClaiming(poolRoot, role);
 	if (claiming[0]) return claiming[0];
 	return listQueue(poolRoot, role)[0];
+}
+
+/**
+ * FIFO queue/claim priority head (claiming precedes queue). Use under the role
+ * lock when deciding idle direct dispatch vs enqueue.
+ */
+export function pendingRoleQueueHead(
+	poolRoot: string,
+	role: AgentName,
+): QueueEntry | undefined {
+	return peekHead(poolRoot, role);
+}
+
+/**
+ * True when claiming or queued work for the same generation would be overtaken
+ * by a direct idle dispatch of assignmentId.
+ */
+export function roleHasPendingWorkAheadOfAssignment(
+	poolRoot: string,
+	role: AgentName,
+	generation: number,
+	assignmentId: string,
+): boolean {
+	for (const entry of listClaiming(poolRoot, role)) {
+		if (entry.generation !== generation) continue;
+		if (entry.assignmentId !== assignmentId) return true;
+	}
+	for (const entry of listQueue(poolRoot, role)) {
+		if (entry.generation !== generation) continue;
+		if (entry.assignmentId !== assignmentId) return true;
+	}
+	return false;
 }
 
 export function newQueuedAssignmentId(): string {

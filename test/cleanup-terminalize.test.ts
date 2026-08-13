@@ -10,6 +10,7 @@ import {
 	__setCleanupRoleLockEnteredHookForTest,
 } from "../src/extensions/parent.js";
 import { HerdrClient } from "../src/herdr/client.js";
+import { createTestHerdrClient } from "./helpers/herdr-mock-client.js";
 import { PoolRegistry, isArchivalTombstone } from "../src/herdr/pool-registry.js";
 import { resolvePoolIdentity, stableWorkerId } from "../src/herdr/pool-identity.js";
 import {
@@ -136,7 +137,7 @@ describe("cleanup terminalizes old-generation queue/claim", () => {
 				HERDR_WORKSPACE_ID: "test-ws",
 				HERDR_SOCKET_PATH: "test-sock",
 			},
-			client: new HerdrClient({
+			client: createTestHerdrClient({
 				runCommand: async (_file, args) => {
 					if (args[0] === "pane" && args[1] === "close") {
 						return { code: 0, stdout: JSON.stringify({ id: "ok", result: {} }), stderr: "" };
@@ -180,7 +181,7 @@ describe("cleanup terminalizes old-generation queue/claim", () => {
 			cwd,
 			parentPaneId: "w1:p1",
 			parentId: "parent-clean-q",
-			client: new HerdrClient({
+			client: createTestHerdrClient({
 				runCommand: async (_file, args) => {
 					if (args[0] === "pane" && args[1] === "split") {
 						splits += 1;
@@ -421,7 +422,7 @@ describe("momo-cleanup live eligibility under role lock", () => {
 				HERDR_WORKSPACE_ID: "test-ws",
 				HERDR_SOCKET_PATH: "test-sock",
 			},
-			client: new HerdrClient({
+			client: createTestHerdrClient({
 				runCommand: async (_file, args) => {
 					if (args[0] === "pane" && args[1] === "close") {
 						closed.push(String(args[2]));

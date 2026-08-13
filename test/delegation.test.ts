@@ -429,4 +429,25 @@ describe("delegation runner", () => {
 		expect(result.results[0]?.error?.message).toBe("Delegation aborted");
 		expect(result.results[0]?.error?.stopReason).toBe("aborted");
 	});
+
+	it("returns structured failure when configured policy exists but registry is absent", async () => {
+		const current = state();
+		const runner = createDelegationRunner({
+			cwd: "/repo",
+			roles: ROLE_LIST,
+			readConfig: () => ({
+				version: 1,
+				policies: {
+					default: { provider: "openai", model: "gpt-4o", reasoning: "off" },
+				},
+			}),
+			createChildSession: fakeFactory(current),
+		});
+
+		const result = await runner.run({ mode: "single", agent: "scout", task: "inspect" });
+		expect(result.status).toBe("failed");
+		expect(result.results[0]?.status).toBe("failed");
+		expect(result.results[0]?.error?.message).toMatch(/registry unavailable/i);
+		expect(current.prompts).toEqual([]);
+	});
 });

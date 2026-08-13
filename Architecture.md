@@ -74,7 +74,8 @@ flowchart LR
 | Results | `src/delegation/results.ts` | Text extraction, usage, 50 KiB truncation, status aggregation |
 | Workspace diff | `src/delegation/workspace-diff.ts` | Fixed reviewer-only Git status/diff tool |
 | Spec / docs | `SPEC.md`, `README.md`, `Architecture.md` | Contract, user setup, current architecture |
-| Tests | `test/cli.test.ts`, `test/roles.test.ts`, `test/delegation.test.ts`, `test/scheduler.test.ts`, `test/results.test.ts`, `test/workspace-diff.test.ts` | Automated contract coverage |
+| Tests | `test/cli.test.ts`, `test/roles.test.ts`, `test/delegation.test.ts`, `test/scheduler.test.ts`, `test/results.test.ts`, `test/workspace-diff.test.ts`, `test/model-policy.test.ts` | Automated contract coverage |
+| Model policy | `src/config/model-policy.ts`, `src/config/momo-config.ts`, `src/config/model-commands.ts`, `src/extensions/model-policy.ts` | Credential-free global policies; `/momo-model` / `/momo-models`; Herdr IPC carry + worker apply |
 
 ## 4. Startup and execution flows
 
@@ -128,6 +129,47 @@ git diff --cached --no-ext-diff --no-color
 **Verified:** Children do not inherit parent extensions or skills.
 
 **Risk:** Parent-enabled Pi extensions can still affect the parent session. Tool allowlisting in `src/runtime.ts` is the primary guard against parent mutation tools; extension behavior beyond that allowlist is not fully covered by Momo-owned tests.
+
+### 5.1 Model policy (implementation candidate)
+
+Credential-free policies at `$XDG_CONFIG_HOME/momo/config.json` (fallback
+`~/.config/momo/config.json`), schema version `1`. Scopes: `default`, `parent`,
+`scout`, `planner`, `implementer`, `reviewer` with exact
+`{ provider, model, reasoning }`. Storage is atomic `0600`, owner-private,
+non-symlink, strict schema (no unknown keys, no control chars), cross-process
+config lock (fail closed). Absent file ⇒ legacy Pi defaults. Momo never reads or
+writes Pi credential files.
+
+**Selector / apply rules:** `/momo-model` and `/momo-models` register in Herdr
+parent and in-process (`src/extensions/model-policy.ts`). Model discovery uses
+`modelRegistry.getAvailable()` and `.find()` only; `.hasConfiguredAuth(model)` gates
+selection. No `getProviderAuth`, no probing requests. Reasoning uses Pi
+`getSupportedThinkingLevels(model)` pre-check and post-`setThinkingLevel`
+verification — unsupported levels fail closed (Pi would otherwise clamp).
+
+**Precedence:** role override → `default`; `parent` override → `default`.
+Delegation reads config once per `runner.run()`; chain/parallel tasks share that
+immutable snapshot, which is passed to both in-process and Herdr assignment proxies.
+A same-session `/momo-model` change affects the next delegation run.
+IPC capability **v3** carries concrete `modelPolicy` on queue/command/started/result;
+legacy omits both fields. Terminal FIFO advance copies queue `capability`/`modelPolicy`
+into the next command under lock with registry `boundPolicy` equality check.
+
+**Generation-bound workers:** policy binds at worker **launch** (CLI args) and in
+manifest/registry `boundPolicy` (v3 concrete only). Workers parse authoritative policy
+from durable command before cancel/skip/lease/terminal paths, verify session
+model/reasoning, and store verified effective snapshots in started/result. Early
+failures carry requested policy with `modelPolicyApplied: false`; completed success
+requires `modelPolicyApplied: true` and cross-record policy equality.
+
+**Parent apply:** parent/default effective changes use token-fenced `mutateMomoConfig`,
+session capture, prevalidate-before-mutate, persist-after-apply, rollback on failure;
+refuse parent-affecting clear/legacy while `!ctx.isIdle()`. Config with any policies
+requires `default`; clearing sole/default atomically returns legacy mode.
+
+**Auth matrix (operator):** Codex Plus/Pro yes; Claude Pro/Max third-party usage
+billed per token; OpenRouter OAuth credits; direct OpenAI/Anthropic/Google/OpenCode
+keys; Cursor subscription unsupported.
 
 ## 6. Role and tool trust boundaries
 
@@ -420,7 +462,7 @@ Persistent role panes remain until explicit cleanup:
 
 - Initial support target: **macOS and Linux** only.
 - Required versions for this candidate: **Pi** `0.82.1` and **Herdr CLI** `0.7.5` (protocol `17`).
-- Parent relaunch **adopts** a pool worker only when registry + v2 manifest + heartbeat + Herdr identity match. **Never** adopt arbitrary or legacy v1 workers.
+- Parent relaunch **adopts** a pool worker only when registry + a durable-state-compatible v2/v3 manifest + heartbeat + Herdr identity match. V3 additionally requires exact manifest/registry policy agreement. **Never** adopt arbitrary or legacy v1 workers.
 - One-time migration closes terminal/ready legacy pane-per-task duplicates safely; active/uncertain legacy panes fail clearly for manual cleanup.
 - **Operator evidence (macOS, partial):** earlier pane-per-task smoke remains historical. Automated unit/integration tests cover lock token-safe release and fail-closed stale locks (no automatic takeover), per-role registry, durable FIFO claim/recovery, sequential same-pane assignments, result-publish failure (no queue advance), cancel→aborted, stale-heartbeat adoption refusal, generation tombstone, and lease-first uncertain cleanup refusal. Live Herdr re-smoke of reuse/FIFO/context isolation is still required. Do **not** claim full `SPEC.md` §32.11.
 

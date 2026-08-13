@@ -7,15 +7,23 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { MOMO_SYSTEM_PROMPT } from "../prompts.js";
+import {
+	effectivePolicyForScope,
+	findAuthenticatedModel,
+	isConfigPolicyFeatureActive,
+} from "../config/model-policy.js";
+import { readMomoConfig } from "../config/momo-config.js";
+import { registerModelPolicyCommands } from "../config/model-commands.js";
 import { createDelegateTool } from "../delegation/tool.js";
 import { createDelegationRunner } from "../delegation/runner.js";
-import { AGENT_NAMES, getRole, ROLE_LIST } from "../roles.js";
+import { AGENT_NAMES, getRole, ROLE_LIST, type AgentName } from "../roles.js";
 import {
 	createHerdrChildSessionFactory,
 	createParentEpoch,
 	createStableParentId,
 } from "../delegation/herdr-factory.js";
 import { HerdrClient, HerdrCliError, isAgentNotFoundError, isPaneNotFoundError } from "../herdr/client.js";
+import { withPaneLifecycleLockAsync } from "../herdr/pane-lifecycle-lock.js";
 import {
 	formatWorkerStatusLine,
 	PoolRegistry,
@@ -43,16 +51,23 @@ import {
 	type OrphanPaneEvidence,
 } from "../herdr/orphan-panes.js";
 import { WriterLeaseManager, LeaseCorruptionError } from "../lease/writer-lease.js";
-import { atomicWriteJson, DEFAULT_HEARTBEAT_STALE_MS, DEFAULT_HEARTBEAT_CLOCK_SKEW_MS } from "../ipc/spool.js";
+import { atomicWriteJson, DEFAULT_HEARTBEAT_STALE_MS, DEFAULT_HEARTBEAT_CLOCK_SKEW_MS, type IpcResult } from "../ipc/spool.js";
 import {
 	IpcValidationError,
 	assertHeartbeatFreshness,
 	tryReadIpcJson,
 	validateActivePointer,
+	validateCommand,
 	validateHeartbeat,
 	validateResult,
 	validateStarted,
+	validateWorkerManifest,
+	assertIpcPoliciesEqualRecords,
 } from "../ipc/validate.js";
+import {
+	inferRecoveryProtocolVersion,
+	validateAssignmentRecoveryChain,
+} from "../ipc/recovery-validator.js";
 import {
 	cancelQueuedAssignment,
 	commitClaim,
@@ -85,6 +100,82 @@ export function __adoptionGraceRecheckCountForTest(): number {
 	return adoptionGraceRechecks.size;
 }
 
+/** @internal test-only: fault injection at start of post-grace recheck. */
+let adoptionGraceRecheckHookForTest: (() => void) | undefined;
+
+/** @internal test-only: fault injection inside recheck role-lock sections. */
+let adoptionGraceRecheckRoleLockHookForTest: (() => void) | undefined;
+
+/** @internal test-only */
+export function __setAdoptionGraceRecheckHooksForTest(hooks?: {
+	onRecheck?: () => void;
+	onRoleLock?: () => void;
+}): void {
+	adoptionGraceRecheckHookForTest = hooks?.onRecheck;
+	adoptionGraceRecheckRoleLockHookForTest = hooks?.onRoleLock;
+}
+
+/** @internal test-only */
+export function __resetAdoptionGraceRecheckHooksForTest(): void {
+	adoptionGraceRecheckHookForTest = undefined;
+	adoptionGraceRecheckRoleLockHookForTest = undefined;
+}
+
+function formatAdoptionGraceError(error: unknown): string {
+	if (error instanceof IpcValidationError || error instanceof Error) return error.message;
+	return String(error);
+}
+
+/**
+ * Never throws. Reports role/worker/generation diagnostics and best-effort unhealthy
+ * fence when the snapshot still matches; preserves registry/evidence on lock failure.
+ */
+function reportAdoptionGraceRecheckFailure(
+	options: {
+		pool: PoolRegistry;
+		ctx: { ui?: { notify?: (message: string) => void } };
+		snapshot: PoolWorkerRecord;
+	},
+	error: unknown,
+): void {
+	const { pool, ctx, snapshot: worker } = options;
+	const message = `Adoption grace recheck failed for role=${worker.role} worker=${worker.workerId} generation=${worker.generation}: ${formatAdoptionGraceError(error)}`;
+	try {
+		ctx.ui?.notify?.(message);
+	} catch {
+		// ignore notify failures
+	}
+	try {
+		console.error(message);
+	} catch {
+		// ignore console failures
+	}
+	try {
+		adoptionGraceRecheckRoleLockHookForTest?.();
+		withRoleLock(pool.poolRoot, worker.role, () => {
+			const current = pool.getByRole(worker.role);
+			if (!matchesExactSnapshot(current, worker)) return;
+			pool.upsert({
+				...current,
+				status: "unhealthy",
+				updatedAt: new Date().toISOString(),
+			});
+		});
+	} catch (lockError) {
+		const lockMessage = `Adoption grace recheck registry fence failed for role=${worker.role} worker=${worker.workerId} generation=${worker.generation}: ${formatAdoptionGraceError(lockError)}`;
+		try {
+			ctx.ui?.notify?.(lockMessage);
+		} catch {
+			// ignore
+		}
+		try {
+			console.error(lockMessage);
+		} catch {
+			// ignore
+		}
+	}
+}
+
 /**
  * @internal test-only: runs under each cleanup role lock after acquire, before
  * fresh eligibility / closePane / agentGet / terminalize / lease operations.
@@ -104,6 +195,7 @@ export function __setCleanupRoleLockEnteredHookForTest(
 export function __resetCleanupRoleLockEnteredHookForTest(): void {
 	cleanupRoleLockEnteredHook = undefined;
 	orphanPreCloseRecheckHook = undefined;
+	orphanAwaitingLifecycleLockHook = undefined;
 }
 
 /**
@@ -117,6 +209,19 @@ export function __setOrphanPreCloseRecheckHookForTest(
 	hook?: () => void | Promise<void>,
 ): void {
 	orphanPreCloseRecheckHook = hook;
+}
+
+/**
+ * @internal test-only: runs after orphan candidates are chosen and immediately
+ * before attempting to acquire the pool-wide pane lifecycle lock for close.
+ */
+let orphanAwaitingLifecycleLockHook: (() => void | Promise<void>) | undefined;
+
+/** @internal test-only: observe orphan cleanup waiting on pane lifecycle lock. */
+export function __setOrphanAwaitingLifecycleLockHookForTest(
+	hook?: () => void | Promise<void>,
+): void {
+	orphanAwaitingLifecycleLockHook = hook;
 }
 
 function adoptionGraceRecheckKey(poolRoot: string, worker: PoolWorkerRecord): string {
@@ -182,15 +287,26 @@ export function installMomoParent(pi: ExtensionAPI, options: InstallMomoParentOp
 		...(env.HERDR_WORKSPACE_ID ? { workspaceId: env.HERDR_WORKSPACE_ID } : {}),
 		...(env.HERDR_SOCKET_PATH ? { socketPath: env.HERDR_SOCKET_PATH } : {}),
 	});
+
+	let getModelRegistry: (() => import("@earendil-works/pi-coding-agent").ModelRegistry) | undefined;
 	const runner = createDelegationRunner({
 		cwd,
 		roles: ROLE_LIST,
 		createChildSession,
+		readConfig: readMomoConfig,
+		getModelRegistry: () => {
+			if (!getModelRegistry) {
+				throw new Error("Model registry unavailable before session_start");
+			}
+			return getModelRegistry();
+		},
 	});
 
 	pi.registerTool(createDelegateTool(runner));
+	registerModelPolicyCommands(pi);
 
 	pi.on("session_start", async (_event, ctx) => {
+		getModelRegistry = () => ctx.modelRegistry;
 		if (ctx.hasUI !== true) return;
 		pi.setActiveTools([...PARENT_ACTIVE_TOOLS]);
 
@@ -265,6 +381,19 @@ export function installMomoParent(pi: ExtensionAPI, options: InstallMomoParentOp
 			ctx.ui?.notify?.(lines.join("\n"));
 		},
 	});
+
+	function formatCleanupRefusedSummary(refused: readonly PoolWorkerRecord[]): string {
+		if (refused.length === 0) return "";
+		const counts = new Map<string, number>();
+		for (const worker of refused) {
+			counts.set(worker.status, (counts.get(worker.status) ?? 0) + 1);
+		}
+		const detail = [...counts.entries()]
+			.sort(([a], [b]) => a.localeCompare(b))
+			.map(([status, count]) => `${count} ${status}`)
+			.join(", ");
+		return `Refused ${refused.length} ineligible live worker(s) (${detail}).`;
+	}
 
 	pi.registerCommand("momo-cleanup", {
 		description:
@@ -476,13 +605,9 @@ export function installMomoParent(pi: ExtensionAPI, options: InstallMomoParentOp
 			}
 
 			// Role-scoped orphan panes from superseded provision close failures.
-			// Never await Herdr/network while holding the role lock:
-			//   1) under lock: list + strict-validate + refuse any live paneId collision
-			//      across every non-archival pool role
-			//   2) outside lock: recheck collision, then closePane
-			//   3) reacquire lock: remove only if exact evidence unchanged and still
-			//      does not collide; concurrent cleanups are idempotent (close/not-found)
-			//      and never delete replaced evidence.
+			// Pool-wide pane lifecycle lock spans global collision recheck + closePane;
+			// role lock (nested global→role) removes unchanged evidence. No role lock
+			// is held across Herdr network I/O.
 			let orphanClosed = 0;
 			for (const roleName of AGENT_NAMES) {
 				if (!roleHasOrphanPaneEvidence(pool.poolRoot, roleName)) continue;
@@ -531,93 +656,96 @@ export function installMomoParent(pi: ExtensionAPI, options: InstallMomoParentOp
 
 				for (const candidate of candidates) {
 					const { evidence } = candidate;
-					// Recheck immediately before close — no role lock held across network.
-					if (orphanPreCloseRecheckHook) {
-						await orphanPreCloseRecheckHook();
-					}
-					const preClose = findLivePaneIdCollision(pool, evidence.paneId);
-					if (preClose.kind === "collision") {
-						notes.push(
-							`retained orphan evidence for ${evidence.paneId}: paneId collides with live registry pane before close (role=${preClose.role} status=${preClose.status} gen=${preClose.generation})`,
-						);
-						continue;
-					}
-					if (preClose.kind === "error") {
-						notes.push(
-							`retained orphan evidence for ${evidence.paneId}: live pane collision scan failed before close (${preClose.reason})`,
-						);
-						continue;
-					}
-
 					try {
-						await herdrClient.closePane(evidence.paneId);
-					} catch (closeError) {
-						if (!isPaneNotFoundError(closeError)) {
-							notes.push(
-								`retained orphan pane ${evidence.paneId} (gen=${evidence.generation}): ${
-									closeError instanceof Error
-										? closeError.message
-										: String(closeError)
-								}`,
-							);
-							continue;
+						if (orphanAwaitingLifecycleLockHook) {
+							await orphanAwaitingLifecycleLockHook();
 						}
-					}
+						await withPaneLifecycleLockAsync(pool.poolRoot, async () => {
+							if (orphanPreCloseRecheckHook) {
+								await orphanPreCloseRecheckHook();
+							}
+							const preClose = findLivePaneIdCollision(pool, evidence.paneId);
+							if (preClose.kind === "collision") {
+								notes.push(
+									`retained orphan evidence for ${evidence.paneId}: paneId collides with live registry pane before close (role=${preClose.role} status=${preClose.status} gen=${preClose.generation})`,
+								);
+								return;
+							}
+							if (preClose.kind === "error") {
+								notes.push(
+									`retained orphan evidence for ${evidence.paneId}: live pane collision scan failed before close (${preClose.reason})`,
+								);
+								return;
+							}
 
-					try {
-						const removeOutcome = withRoleLock(pool.poolRoot, roleName, () => {
-							const postClose = findLivePaneIdCollision(pool, evidence.paneId);
-							if (postClose.kind === "collision") {
-								return {
-									kind: "collide" as const,
-									role: postClose.role,
-									status: postClose.status,
-									generation: postClose.generation,
-								};
+							try {
+								await herdrClient.closePane(evidence.paneId);
+							} catch (closeError) {
+								if (!isPaneNotFoundError(closeError)) {
+									notes.push(
+										`retained orphan pane ${evidence.paneId} (gen=${evidence.generation}): ${
+											closeError instanceof Error
+												? closeError.message
+												: String(closeError)
+										}`,
+									);
+									return;
+								}
 							}
-							if (postClose.kind === "error") {
-								return {
-									kind: "scan_error" as const,
-									reason: postClose.reason,
-								};
+
+							const removeOutcome = withRoleLock(pool.poolRoot, roleName, () => {
+								const postClose = findLivePaneIdCollision(pool, evidence.paneId);
+								if (postClose.kind === "collision") {
+									return {
+										kind: "collide" as const,
+										role: postClose.role,
+										status: postClose.status,
+										generation: postClose.generation,
+									};
+								}
+								if (postClose.kind === "error") {
+									return {
+										kind: "scan_error" as const,
+										reason: postClose.reason,
+									};
+								}
+								const removed = removeOrphanPaneEvidenceIfUnchanged(
+									pool.poolRoot,
+									roleName,
+									evidence,
+								);
+								return { kind: "remove" as const, removed };
+							});
+							if (removeOutcome.kind === "collide") {
+								notes.push(
+									`retained orphan evidence for ${evidence.paneId}: paneId collides with live registry pane after close (role=${removeOutcome.role} status=${removeOutcome.status} gen=${removeOutcome.generation})`,
+								);
+								return;
 							}
-							const removed = removeOrphanPaneEvidenceIfUnchanged(
-								pool.poolRoot,
-								roleName,
-								evidence,
+							if (removeOutcome.kind === "scan_error") {
+								notes.push(
+									`retained orphan evidence for ${evidence.paneId}: live pane collision scan failed after close (${removeOutcome.reason})`,
+								);
+								return;
+							}
+							const { removed } = removeOutcome;
+							if (removed.status === "removed" || removed.status === "missing") {
+								orphanClosed += 1;
+								return;
+							}
+							if (removed.status === "changed") {
+								notes.push(
+									`retained orphan evidence for ${evidence.paneId}: evidence replaced during close`,
+								);
+								return;
+							}
+							notes.push(
+								`retained orphan evidence for ${evidence.paneId}: ${removed.reason}`,
 							);
-							return { kind: "remove" as const, removed };
 						});
-						if (removeOutcome.kind === "collide") {
-							notes.push(
-								`retained orphan evidence for ${evidence.paneId}: paneId collides with live registry pane after close (role=${removeOutcome.role} status=${removeOutcome.status} gen=${removeOutcome.generation})`,
-							);
-							continue;
-						}
-						if (removeOutcome.kind === "scan_error") {
-							notes.push(
-								`retained orphan evidence for ${evidence.paneId}: live pane collision scan failed after close (${removeOutcome.reason})`,
-							);
-							continue;
-						}
-						const { removed } = removeOutcome;
-						if (removed.status === "removed" || removed.status === "missing") {
-							// missing ⇒ concurrent cleanup already cleared the same evidence.
-							orphanClosed += 1;
-							continue;
-						}
-						if (removed.status === "changed") {
-							notes.push(
-								`retained orphan evidence for ${evidence.paneId}: evidence replaced during close`,
-							);
-							continue;
-						}
-						notes.push(
-							`retained orphan evidence for ${evidence.paneId}: ${removed.reason}`,
-						);
 					} catch (error) {
 						notes.push(
-							`orphan cleanup ${roleName} failed after close of ${evidence.paneId}: ${
+							`orphan cleanup ${roleName} failed for ${evidence.paneId}: ${
 								error instanceof Error ? error.message : String(error)
 							}`,
 						);
@@ -629,9 +757,7 @@ export function installMomoParent(pi: ExtensionAPI, options: InstallMomoParentOp
 				[
 					`Closed ${closed} worker pane(s).`,
 					orphanClosed > 0 ? `Closed ${orphanClosed} orphan pane(s).` : "",
-					refused.length
-						? `Refused ${refused.length} busy/blocked/starting${force ? "" : "/uncertain"} worker(s).`
-						: "",
+					refused.length ? formatCleanupRefusedSummary(refused) : "",
 					...notes,
 				]
 					.filter(Boolean)
@@ -646,6 +772,154 @@ export function installMomoParent(pi: ExtensionAPI, options: InstallMomoParentOp
  * Never adopts arbitrary or legacy v1 workers.
  * Registry writes run under the per-role lock with generation/worker/snapshot fences.
  */
+function validateAdoptionManifest(
+	manifestRaw: unknown,
+	options: { poolKey: string; worker: PoolWorkerRecord },
+): ReturnType<typeof validateWorkerManifest> {
+	const manifest = validateWorkerManifest(manifestRaw, {
+		poolKey: options.poolKey,
+		workerId: options.worker.workerId,
+		generation: options.worker.generation,
+		role: options.worker.role,
+	});
+	if (options.worker.cwd === undefined) {
+		throw new Error("missing canonical cwd on registry or manifest");
+	}
+	if (manifest.cwd !== options.worker.cwd) {
+		throw new Error("manifest cwd mismatch");
+	}
+	if (manifest.version === 3) {
+		if (!manifest.boundPolicy) {
+			throw new Error("v3 manifest missing boundPolicy");
+		}
+		if (!options.worker.boundPolicy) {
+			throw new Error("registry missing boundPolicy for v3 worker");
+		}
+		assertIpcPoliciesEqualRecords(
+			manifest.boundPolicy,
+			options.worker.boundPolicy,
+			"manifest→registry",
+		);
+	} else if (options.worker.boundPolicy) {
+		throw new Error("registry boundPolicy incompatible with v2 manifest");
+	}
+	return manifest;
+}
+
+function validateAndApplyTerminalResultLocked(options: {
+	pool: PoolRegistry;
+	poolKey: string;
+	current: PoolWorkerRecord;
+	worker: PoolWorkerRecord;
+	assignmentId: string;
+	control: ReturnType<typeof workerControlPaths>;
+	paths: ReturnType<typeof assignmentSpoolPaths>;
+	result: IpcResult;
+	leases?: WriterLeaseManager;
+}): void {
+	const { pool, poolKey, current, worker, assignmentId, control, paths, result, leases } =
+		options;
+	let command: ReturnType<typeof validateCommand> | undefined;
+	let started: ReturnType<typeof validateStarted> | undefined;
+	let manifestInfo:
+		| { version: 2 | 3; boundPolicy?: import("../ipc/spool.js").IpcModelPolicy }
+		| undefined;
+
+	const commandRaw = tryReadIpcJson(paths.command);
+	if (!commandRaw) {
+		throw new Error("missing command for terminal result");
+	}
+	command = validateCommand(commandRaw, {
+		runId: assignmentId,
+		workerId: worker.workerId,
+		generation: worker.generation,
+	});
+
+	if (existsSync(paths.started)) {
+		const startedRaw = tryReadIpcJson(paths.started);
+		if (startedRaw) {
+			started = validateStarted(startedRaw, {
+				runId: assignmentId,
+				workerId: worker.workerId,
+				generation: worker.generation,
+				parentEpoch: worker.activeParentEpoch ?? "",
+			});
+		}
+	}
+
+	const manifestRaw = tryReadIpcJson(control.manifest);
+	if (!manifestRaw) {
+		throw new Error("missing manifest for terminal result");
+	}
+	const manifest = validateWorkerManifest(manifestRaw, {
+		poolKey,
+		workerId: worker.workerId,
+		generation: worker.generation,
+		role: worker.role,
+	});
+	manifestInfo = {
+		version: manifest.version,
+		...(manifest.boundPolicy ? { boundPolicy: manifest.boundPolicy } : {}),
+	};
+
+	const protocolVersion = inferRecoveryProtocolVersion({
+		manifestVersion: manifestInfo.version,
+		...(current.boundPolicy !== undefined ? { registryBoundPolicy: current.boundPolicy } : {}),
+		command,
+		result,
+	});
+
+	let hasLeaseEvidence = false;
+	const role = getRole(worker.role);
+	if (role.canWrite && leases && worker.cwd) {
+		try {
+			const owner = leases.peekOwner(worker.cwd);
+			hasLeaseEvidence = !!(owner && owner.ownerId === worker.workerId);
+		} catch {
+			// treat as no lease evidence
+		}
+	}
+
+	const recovery = validateAssignmentRecoveryChain({
+		role,
+		protocolVersion,
+		command,
+		manifest: manifestInfo,
+		...(current.boundPolicy !== undefined ? { registryBoundPolicy: current.boundPolicy } : {}),
+		...(started !== undefined ? { started } : {}),
+		result,
+		...(hasLeaseEvidence ? { hasLeaseEvidence: true } : {}),
+	});
+
+	if (!recovery.ok) {
+		pool.upsert({
+			...current,
+			status: recovery.fence === "uncertain" ? "uncertain" : "unhealthy",
+			...(recovery.fence === "uncertain" ? { uncertainWrite: true } : {}),
+			updatedAt: new Date().toISOString(),
+		});
+		return;
+	}
+
+	if (result.uncertainWrite) {
+		pool.upsert({
+			...current,
+			status: "uncertain",
+			uncertainWrite: true,
+			updatedAt: new Date().toISOString(),
+		});
+		return;
+	}
+
+	completeCleanAssignmentLocked({
+		pool,
+		role: worker.role,
+		workerId: worker.workerId,
+		generation: worker.generation,
+		finishedAssignmentId: assignmentId,
+	});
+}
+
 export async function adoptPoolWorkers(
 	pool: PoolRegistry,
 	client: HerdrClient,
@@ -698,37 +972,10 @@ export async function adoptPoolWorkers(
 		const control = workerControlPaths(pool.poolRoot, worker.role);
 		try {
 			const manifestRaw = tryReadIpcJson(control.manifest);
-			if (!manifestRaw || typeof manifestRaw !== "object") {
+			if (!manifestRaw) {
 				throw new Error("missing manifest");
 			}
-			const manifest = manifestRaw as {
-				version?: number;
-				poolKey?: string;
-				workerId?: string;
-				generation?: number;
-				paneId?: string;
-				agentName?: string;
-				role?: string;
-				cwd?: string;
-			};
-			if (
-				manifest.version !== 2 ||
-				manifest.poolKey !== poolKey ||
-				manifest.workerId !== worker.workerId ||
-				manifest.generation !== worker.generation ||
-				manifest.paneId !== worker.paneId ||
-				manifest.agentName !== worker.agentName ||
-				manifest.role !== worker.role
-			) {
-				throw new Error("manifest identity mismatch");
-			}
-			// Live manifested workers must carry canonical cwd on registry + manifest.
-			if (worker.cwd === undefined || typeof manifest.cwd !== "string") {
-				throw new Error("missing canonical cwd on registry or manifest");
-			}
-			if (manifest.cwd !== worker.cwd) {
-				throw new Error("manifest cwd mismatch");
-			}
+			const manifest = validateAdoptionManifest(manifestRaw, { poolKey, worker });
 
 			const heartbeatRaw = tryReadIpcJson(control.heartbeat);
 			if (!heartbeatRaw) {
@@ -769,21 +1016,23 @@ export async function adoptPoolWorkers(
 							runId: worker.activeAssignmentId,
 							workerId: worker.workerId,
 						});
-						if (result.uncertainWrite) {
+						try {
+							validateAndApplyTerminalResultLocked({
+								pool,
+								poolKey,
+								current,
+								worker,
+								assignmentId: worker.activeAssignmentId,
+								control,
+								paths,
+								result,
+								leases,
+							});
+						} catch {
 							pool.upsert({
 								...current,
-								status: "uncertain",
-								uncertainWrite: true,
+								status: "unhealthy",
 								updatedAt: new Date().toISOString(),
-							});
-						} else {
-							// Shared idempotent A→B (or idle) terminal transition.
-							completeCleanAssignmentLocked({
-								pool,
-								role: worker.role,
-								workerId: worker.workerId,
-								generation: worker.generation,
-								finishedAssignmentId: worker.activeAssignmentId,
 							});
 						}
 						return;
@@ -1071,7 +1320,9 @@ function scheduleReadOnlyAdoptionGraceRecheck(options: {
 
 	const timer = setTimeout(() => {
 		adoptionGraceRechecks.delete(key);
-		void recheckReadOnlyAdoptionAfterGrace(options);
+		void recheckReadOnlyAdoptionAfterGrace(options).catch((error) => {
+			reportAdoptionGraceRecheckFailure(options, error);
+		});
 	}, Math.max(0, options.delayMs));
 	// Keep the event loop alive under Vitest fake timers; unref in production.
 	if (process.env.VITEST !== "true") {
@@ -1102,42 +1353,18 @@ async function recheckReadOnlyAdoptionAfterGrace(options: {
 	const { pool, client, poolKey, ctx, snapshot: worker, evidenceKind } = options;
 	if (!worker.paneId || !worker.agentName || !worker.activeAssignmentId) return;
 
+	adoptionGraceRecheckHookForTest?.();
+
 	const control = workerControlPaths(pool.poolRoot, worker.role);
 	try {
 		const currentBefore = pool.getByRole(worker.role);
 		if (!matchesExactSnapshot(currentBefore, worker)) return;
 
 		const manifestRaw = tryReadIpcJson(control.manifest);
-		if (!manifestRaw || typeof manifestRaw !== "object") {
+		if (!manifestRaw) {
 			throw new Error("missing manifest");
 		}
-		const manifest = manifestRaw as {
-			version?: number;
-			poolKey?: string;
-			workerId?: string;
-			generation?: number;
-			paneId?: string;
-			agentName?: string;
-			role?: string;
-			cwd?: string;
-		};
-		if (
-			manifest.version !== 2 ||
-			manifest.poolKey !== poolKey ||
-			manifest.workerId !== worker.workerId ||
-			manifest.generation !== worker.generation ||
-			manifest.paneId !== worker.paneId ||
-			manifest.agentName !== worker.agentName ||
-			manifest.role !== worker.role
-		) {
-			throw new Error("manifest identity mismatch");
-		}
-		if (worker.cwd === undefined || typeof manifest.cwd !== "string") {
-			throw new Error("missing canonical cwd on registry or manifest");
-		}
-		if (manifest.cwd !== worker.cwd) {
-			throw new Error("manifest cwd mismatch");
-		}
+		validateAdoptionManifest(manifestRaw, { poolKey, worker });
 
 		const heartbeatRaw = tryReadIpcJson(control.heartbeat);
 		if (!heartbeatRaw) {
@@ -1158,6 +1385,7 @@ async function recheckReadOnlyAdoptionAfterGrace(options: {
 		}
 
 		await withRoleLockAsync(pool.poolRoot, worker.role, () => {
+			adoptionGraceRecheckRoleLockHookForTest?.();
 			const current = pool.getByRole(worker.role);
 			if (!matchesExactSnapshot(current, worker)) return;
 
@@ -1172,20 +1400,23 @@ async function recheckReadOnlyAdoptionAfterGrace(options: {
 					runId: worker.activeAssignmentId!,
 					workerId: worker.workerId,
 				});
-				if (result.uncertainWrite) {
+				try {
+					validateAndApplyTerminalResultLocked({
+						pool,
+						poolKey,
+						current,
+						worker,
+						assignmentId: worker.activeAssignmentId!,
+						control,
+						paths,
+						result,
+						leases: options.leases,
+					});
+				} catch {
 					pool.upsert({
 						...current,
-						status: "uncertain",
-						uncertainWrite: true,
+						status: "unhealthy",
 						updatedAt: new Date().toISOString(),
-					});
-				} else {
-					completeCleanAssignmentLocked({
-						pool,
-						role: worker.role,
-						workerId: worker.workerId,
-						generation: worker.generation,
-						finishedAssignmentId: worker.activeAssignmentId!,
 					});
 				}
 				return;
@@ -1261,22 +1492,7 @@ async function recheckReadOnlyAdoptionAfterGrace(options: {
 			markUnhealthy();
 		});
 	} catch (error) {
-		await withRoleLockAsync(pool.poolRoot, worker.role, () => {
-			const current = pool.getByRole(worker.role);
-			if (!matchesExactSnapshot(current, worker)) return;
-			pool.upsert({
-				...current,
-				status: "unhealthy",
-				updatedAt: new Date().toISOString(),
-			});
-		});
-		ctx.ui?.notify?.(
-			`Adoption grace recheck failed for ${worker.workerId}: ${
-				error instanceof IpcValidationError || error instanceof Error
-					? error.message
-					: String(error)
-			}`,
-		);
+		reportAdoptionGraceRecheckFailure(options, error);
 	}
 }
 
@@ -1438,67 +1654,89 @@ export async function confirmAgentStoppedForCleanup(
 }
 
 /**
+ * Under the role lock: drop matching FIFO/claiming entries and cancel exact active
+ * assignments owned by `parentEpoch`.
+ */
+function cancelEpochAssignmentsForRoleLocked(
+	pool: PoolRegistry,
+	role: AgentName,
+	parentEpoch: string,
+): void {
+	const current = pool.getByRole(role);
+	if (!current) return;
+
+	// Remove every queued entry owned by this epoch; leave foreign FIFO order untouched.
+	for (const entry of listQueue(pool.poolRoot, role)) {
+		if (entry.parentEpoch === parentEpoch) {
+			cancelQueuedAssignment(pool.poolRoot, role, entry.assignmentId);
+		}
+	}
+
+	const activeBusy =
+		current.status === "busy" ||
+		current.status === "blocked" ||
+		current.status === "starting";
+	const activeMatchesEpoch =
+		activeBusy &&
+		current.activeParentEpoch === parentEpoch &&
+		Boolean(current.activeAssignmentId);
+
+	// Claiming entries for this epoch: cancel if they are the live active
+	// assignment; otherwise remove so they cannot recover/run after quit.
+	for (const entry of listClaiming(pool.poolRoot, role)) {
+		if (entry.parentEpoch !== parentEpoch) continue;
+		const isActiveAssignment =
+			activeMatchesEpoch && current.activeAssignmentId === entry.assignmentId;
+		if (isActiveAssignment) {
+			writeAssignmentCancelIpc({
+				poolRoot: pool.poolRoot,
+				role,
+				assignmentId: entry.assignmentId,
+				workerId: current.workerId,
+				generation: current.generation,
+			});
+		} else {
+			commitClaim(pool.poolRoot, role, entry);
+		}
+	}
+
+	// Exact active assignment cancel when this epoch owns the busy pointer.
+	if (activeMatchesEpoch && current.activeAssignmentId) {
+		writeAssignmentCancelIpc({
+			poolRoot: pool.poolRoot,
+			role,
+			assignmentId: current.activeAssignmentId,
+			workerId: current.workerId,
+			generation: current.generation,
+		});
+	}
+}
+
+/**
  * Shutdown cancels only assignments owned by this parent epoch.
- * Under each role lock: drop matching FIFO/claiming entries, cancel exact active.
+ * Iterates every known role independently; one corrupt/unreadable role records
+ * an error but never prevents healthy roles from canceling durably.
  */
 export async function cancelEpochAssignmentsOnQuit(
 	pool: PoolRegistry,
 	parentEpoch: string,
 	_client: HerdrClient,
 ): Promise<void> {
-	const { snapshot } = pool.tryRead();
-	const roles = [...new Set(snapshot.workers.map((worker) => worker.role))];
-	for (const role of roles) {
-		await withRoleLockAsync(pool.poolRoot, role, () => {
-			const current = pool.getByRole(role);
-			if (!current) return;
-
-			// Remove every queued entry owned by this epoch; leave foreign FIFO order untouched.
-			for (const entry of listQueue(pool.poolRoot, role)) {
-				if (entry.parentEpoch === parentEpoch) {
-					cancelQueuedAssignment(pool.poolRoot, role, entry.assignmentId);
-				}
-			}
-
-			const activeBusy =
-				current.status === "busy" ||
-				current.status === "blocked" ||
-				current.status === "starting";
-			const activeMatchesEpoch =
-				activeBusy &&
-				current.activeParentEpoch === parentEpoch &&
-				Boolean(current.activeAssignmentId);
-
-			// Claiming entries for this epoch: cancel if they are the live active
-			// assignment; otherwise remove so they cannot recover/run after quit.
-			for (const entry of listClaiming(pool.poolRoot, role)) {
-				if (entry.parentEpoch !== parentEpoch) continue;
-				const isActiveAssignment =
-					activeMatchesEpoch && current.activeAssignmentId === entry.assignmentId;
-				if (isActiveAssignment) {
-					writeAssignmentCancelIpc({
-						poolRoot: pool.poolRoot,
-						role,
-						assignmentId: entry.assignmentId,
-						workerId: current.workerId,
-						generation: current.generation,
-					});
-				} else {
-					commitClaim(pool.poolRoot, role, entry);
-				}
-			}
-
-			// Exact active assignment cancel when this epoch owns the busy pointer.
-			if (activeMatchesEpoch && current.activeAssignmentId) {
-				writeAssignmentCancelIpc({
-					poolRoot: pool.poolRoot,
-					role,
-					assignmentId: current.activeAssignmentId,
-					workerId: current.workerId,
-					generation: current.generation,
-				});
-			}
-		});
+	const errors: unknown[] = [];
+	for (const role of AGENT_NAMES) {
+		try {
+			await withRoleLockAsync(pool.poolRoot, role, () => {
+				cancelEpochAssignmentsForRoleLocked(pool, role, parentEpoch);
+			});
+		} catch (error) {
+			errors.push(error);
+		}
+	}
+	if (errors.length > 0) {
+		throw new AggregateError(
+			errors,
+			"cancelEpochAssignmentsOnQuit failed for one or more roles",
+		);
 	}
 }
 

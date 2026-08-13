@@ -2,7 +2,18 @@ import { createHash, randomUUID } from "node:crypto";
 import { existsSync, realpathSync } from "node:fs";
 import path from "node:path";
 import type { AgentName, AgentRole } from "../roles.js";
-import { HerdrClient } from "../herdr/client.js";
+import {
+	assertWorkerPolicyCompatible,
+	ipcV3PolicyFields,
+	toIpcModelPolicy,
+	WorkerPolicyMismatchError,
+	WORKER_POLICY_MISMATCH_MESSAGE,
+	IPC_PROTOCOL_CAPABILITY,
+	type ModelPolicySnapshot,
+	type MomoConfigV1,
+} from "../config/model-policy.js";
+import type { IpcModelPolicy } from "../ipc/spool.js";
+import { HerdrClient, isAgentNotFoundError } from "../herdr/client.js";
 import {
 	assignmentSpoolPaths,
 	ensureAssignmentSpool,
@@ -35,14 +46,18 @@ import {
 	commitClaim,
 	enqueueAssignment,
 	listClaiming,
+	roleHasPendingWorkAheadOfAssignment,
 	withRoleLock,
 	withRoleLockAsync,
 } from "../herdr/role-queue.js";
 import { completeCleanAssignmentLocked } from "../herdr/terminal-transition.js";
+import { publishAssignmentCommandLocked } from "../herdr/dispatch-publish.js";
+import { withPaneLifecycleLockAsync } from "../herdr/pane-lifecycle-lock.js";
+import { assertRolePoolPristineForProvision, RolePoolEvidenceError } from "../herdr/role-pool-evidence.js";
 import {
-	assertNoOrphanPaneEvidence,
 	OrphanPaneEvidencePersistenceError,
 	writeOrphanPaneEvidence,
+	assertNoOrphanPaneEvidence,
 } from "../herdr/orphan-panes.js";
 import {
 	atomicWriteJson,
@@ -63,6 +78,7 @@ import {
 	validateReady,
 	validateResult,
 	validateStarted,
+	assertIpcModelPolicyMatches,
 } from "../ipc/validate.js";
 import {
 	LeaseCorruptionError,
@@ -269,6 +285,8 @@ export interface HerdrFactoryOptions {
 	registry?: unknown;
 	/** @deprecated Per-run id unused; pool uses stable workers. */
 	runId?: string;
+	/** @deprecated Ignored — policy comes from ChildSessionFactoryInput at allocation. */
+	readConfig?: () => MomoConfigV1 | undefined;
 }
 
 /**
@@ -299,6 +317,11 @@ interface FactoryRuntime {
 	sleep: (ms: number) => Promise<void>;
 	direction: "right" | "down";
 	reportDiagnostic: HerdrDiagnosticReporter;
+}
+
+interface FrozenAssignmentPolicy {
+	policyFeatureActive: boolean;
+	assignmentPolicy: ModelPolicySnapshot | undefined;
 }
 
 function controlRunId(generation: number): string {
@@ -350,6 +373,9 @@ class AssignmentProxy implements ChildSession {
 	private provisioningOwnerId: string | undefined;
 	/** Set by abort(); prompt/dispatch check this and stop without publishing. */
 	private cancelRequested = false;
+	/** Set at assignment acceptance (prompt); immutable for this assignment. */
+	private assignmentPolicy: ModelPolicySnapshot | undefined = undefined;
+	private policyFeatureActive = false;
 	private readonly cancelWaiters: Array<() => void> = [];
 	/** Supervised background dispatch/provision; must not become unhandled. */
 	private backgroundDispatch: Promise<void> | undefined;
@@ -364,9 +390,12 @@ class AssignmentProxy implements ChildSession {
 	constructor(
 		readonly role: AgentRole,
 		private readonly runtime: FactoryRuntime,
+		frozen: FrozenAssignmentPolicy,
 	) {
 		this.assignmentId = createAssignmentId();
 		this.workerId = stableWorkerId(runtime.identity.poolKey, role.name);
+		this.policyFeatureActive = frozen.policyFeatureActive;
+		this.assignmentPolicy = frozen.assignmentPolicy;
 	}
 
 	get messages(): readonly unknown[] {
@@ -620,6 +649,39 @@ class AssignmentProxy implements ChildSession {
 	 */
 	private finalizeAuthoritativeResultLocked(result: IpcResult): void {
 		if (this.settled) return;
+		if (this.policyFeatureActive) {
+			assertIpcModelPolicyMatches(this.assignmentPolicy, result.modelPolicy, "result");
+			if (result.status === "completed") {
+				if (result.modelPolicyApplied !== true) {
+					throw new IpcValidationError("completed result requires modelPolicyApplied=true");
+				}
+				const record = this.runtime.pool.getByRole(this.role.name);
+				const parentEpoch = record?.activeParentEpoch ?? this.runtime.parentEpoch;
+				const startedRaw = ipcValidate.tryReadIpcJson(this.paths.started);
+				if (!startedRaw) {
+					throw new IpcValidationError("completed result requires matching started.json");
+				}
+				const started = validateStarted(startedRaw, {
+					runId: this.assignmentId,
+					workerId: this.workerId,
+					generation: this.generation,
+					parentEpoch,
+				});
+				if (started.capability !== IPC_PROTOCOL_CAPABILITY || !started.modelPolicy) {
+					throw new IpcValidationError("completed v3 result requires v3 started marker");
+				}
+				assertIpcModelPolicyMatches(this.assignmentPolicy, started.modelPolicy, "started");
+				if (
+					result.modelPolicy &&
+					started.modelPolicy &&
+					(result.modelPolicy.provider !== started.modelPolicy.provider ||
+						result.modelPolicy.model !== started.modelPolicy.model ||
+						result.modelPolicy.reasoning !== started.modelPolicy.reasoning)
+				) {
+					throw new IpcValidationError("started→result modelPolicy mismatch");
+				}
+			}
+		}
 		const record = this.runtime.pool.getByRole(this.role.name);
 		const owns =
 			!!record &&
@@ -1088,9 +1150,65 @@ class AssignmentProxy implements ChildSession {
 		return this.diagnosticFailure;
 	}
 
+	/** @internal test-only */
+	trySettleAuthoritativeResultForTest(): boolean {
+		return this.trySettleAuthoritativeResult();
+	}
+
+	/** @internal test-only: frozen assignment policy at allocation (never reread). */
+	getAssignmentPolicyForTest(): ModelPolicySnapshot | undefined {
+		return this.assignmentPolicy;
+	}
+
+	/** @internal test-only */
+	getPolicyFeatureActiveForTest(): boolean {
+		return this.policyFeatureActive;
+	}
+
+	private assertBoundPolicyBeforeDispatch(record: PoolWorkerRecord): void {
+		if (this.policyFeatureActive) {
+			if (!record.boundPolicy) {
+				throw new WorkerPolicyMismatchError(WORKER_POLICY_MISMATCH_MESSAGE);
+			}
+			assertWorkerPolicyCompatible(
+				{
+					provider: record.boundPolicy.provider,
+					model: record.boundPolicy.model,
+					reasoning: record.boundPolicy.reasoning as ModelPolicySnapshot["reasoning"],
+				},
+				this.assignmentPolicy,
+			);
+		} else if (record.boundPolicy) {
+			throw new WorkerPolicyMismatchError(WORKER_POLICY_MISMATCH_MESSAGE);
+		}
+	}
+
+	private ipcFieldsForAssignment(): { capability?: number; modelPolicy?: IpcModelPolicy } {
+		if (!this.policyFeatureActive || !this.assignmentPolicy) return {};
+		return ipcV3PolicyFields(this.assignmentPolicy);
+	}
+
+	private async assertHerdrAgentAbsentForProvision(agentName: string): Promise<void> {
+		try {
+			await this.runtime.client.agentGet(agentName);
+			throw new RolePoolEvidenceError(
+				`Herdr agent ${agentName} still exists; run /momo-cleanup before provisioning`,
+			);
+		} catch (error) {
+			if (error instanceof RolePoolEvidenceError) throw error;
+			if (isAgentNotFoundError(error)) return;
+			throw error;
+		}
+	}
+
 	private async dispatchOrEnqueue(task: string): Promise<void> {
 		this.throwIfCancelled();
 		type Plan =
+			| {
+					kind: "herdr-check";
+					generation: number;
+					agentName: string;
+			  }
 			| {
 					kind: "provision";
 					generation: number;
@@ -1106,7 +1224,7 @@ class AssignmentProxy implements ChildSession {
 			  }
 			| { kind: "done" };
 
-		const plan = await withRoleLockAsync(
+		const phaseOne = await withRoleLockAsync(
 			this.runtime.pool.poolRoot,
 			this.role.name,
 			async (): Promise<Plan> => {
@@ -1149,7 +1267,15 @@ class AssignmentProxy implements ChildSession {
 
 				// Only absent records or true generation-0 archival tombstones may provision.
 				this.throwIfCancelled();
-				if (!existing || isArchivalTombstone(existing)) {
+				if (!existing) {
+					assertRolePoolPristineForProvision(this.runtime.pool.poolRoot, this.role.name, {
+						ignoreAssignmentIds: new Set([this.assignmentId]),
+					});
+					const generation = this.runtime.pool.nextGeneration(this.role.name);
+					const agentName = herdrAgentNameForWorker(this.workerId);
+					return { kind: "herdr-check", generation, agentName };
+				}
+				if (isArchivalTombstone(existing)) {
 					assertNoOrphanPaneEvidence(this.runtime.pool.poolRoot, this.role.name);
 					const generation = this.runtime.pool.nextGeneration(this.role.name);
 					const agentName = herdrAgentNameForWorker(this.workerId);
@@ -1159,7 +1285,7 @@ class AssignmentProxy implements ChildSession {
 					this.runtime.pool.upsert({
 						workerId: this.workerId,
 						generation,
-						generationTombstone: Math.max(existing?.generationTombstone ?? 0, generation),
+						generationTombstone: Math.max(existing.generationTombstone, generation),
 						role: this.role.name,
 						agentName,
 						status: "starting",
@@ -1187,11 +1313,12 @@ class AssignmentProxy implements ChildSession {
 
 				this.throwIfCancelled();
 				if (existing.status === "idle") {
-					this.dispatchActiveLocked(task, existing);
+					this.dispatchIdleOrEnqueueLocked(task, existing);
 					return { kind: "done" };
 				}
 
 				if (existing.status === "busy" || existing.status === "blocked") {
+					this.assertBoundPolicyBeforeDispatch(existing);
 					this.throwIfCancelled();
 					enqueueAssignment(this.runtime.pool.poolRoot, this.role.name, {
 						assignmentId: this.assignmentId,
@@ -1199,6 +1326,7 @@ class AssignmentProxy implements ChildSession {
 						generation: existing.generation,
 						parentEpoch: this.runtime.parentEpoch,
 						task,
+						...this.ipcFieldsForAssignment(),
 					});
 					// Queued behind a ready physical worker still expects heartbeats.
 					this.heartbeatExpectedAt = this.runtime.now();
@@ -1209,6 +1337,68 @@ class AssignmentProxy implements ChildSession {
 			},
 			{ now: this.runtime.now, sleep: this.runtime.sleep },
 		);
+
+		let plan = phaseOne;
+		if (plan.kind === "herdr-check") {
+			const herdrCheck = plan;
+			await this.assertHerdrAgentAbsentForProvision(herdrCheck.agentName);
+			const provisioningOwnerId = randomUUID();
+			plan = await withRoleLockAsync(
+				this.runtime.pool.poolRoot,
+				this.role.name,
+				async (): Promise<Plan> => {
+					this.throwIfCancelled();
+					const existing = this.runtime.pool.getByRole(this.role.name);
+					if (existing && !isArchivalTombstone(existing)) {
+						if (existing.status === "starting" && existing.workerId === this.workerId) {
+							this.generation = existing.generation;
+							if (existing.paneId) {
+								this.paneId = existing.paneId;
+								this.physicalEnsured = true;
+							}
+							if (existing.agentName) this.agentName = existing.agentName;
+							return {
+								kind: "wait-ready",
+								generation: existing.generation,
+								workerId: existing.workerId,
+								...(existing.paneId ? { paneId: existing.paneId } : {}),
+								...(existing.agentName ? { agentName: existing.agentName } : {}),
+							};
+						}
+						throw new Error(
+							`Role ${this.role.name} registry changed during Herdr agent check; run /momo-cleanup`,
+						);
+					}
+					assertRolePoolPristineForProvision(this.runtime.pool.poolRoot, this.role.name, {
+						ignoreAssignmentIds: new Set([this.assignmentId]),
+					});
+					const nowIso = new Date(this.runtime.now()).toISOString();
+					clearControlEphemerals(this.runtime.pool.poolRoot, this.role.name);
+					this.runtime.pool.upsert({
+						workerId: this.workerId,
+						generation: herdrCheck.generation,
+						generationTombstone: Math.max(
+							existing?.generationTombstone ?? 0,
+							herdrCheck.generation,
+						),
+						role: this.role.name,
+						agentName: herdrCheck.agentName,
+						status: "starting",
+						cwd: this.runtime.cwd,
+						provisioningOwnerId,
+						provisioningHeartbeatAt: nowIso,
+						updatedAt: nowIso,
+					});
+					return {
+						kind: "provision",
+						generation: herdrCheck.generation,
+						agentName: herdrCheck.agentName,
+						provisioningOwnerId,
+					};
+				},
+				{ now: this.runtime.now, sleep: this.runtime.sleep },
+			);
+		}
 
 		if (plan.kind === "done") return;
 
@@ -1432,6 +1622,9 @@ class AssignmentProxy implements ChildSession {
 		}
 
 		// wait-ready: join the in-flight starting reservation, then dispatch/enqueue once.
+		if (plan.kind !== "wait-ready") {
+			throw new Error(`Unexpected dispatch plan: ${(plan as { kind: string }).kind}`);
+		}
 		// Cancellation must not fence. Invalid ready IPC is fail-closed (not a local timeout).
 		// Stale ready-timeout fencing happens inside waitForWorkerReady({ asJoiner: true }).
 		this.generation = plan.generation;
@@ -1462,10 +1655,11 @@ class AssignmentProxy implements ChildSession {
 				this.physicalEnsured = true;
 				this.throwIfCancelled();
 				if (record.status === "idle") {
-					this.dispatchActiveLocked(task, record);
+					this.dispatchIdleOrEnqueueLocked(task, record);
 					return;
 				}
 				if (record.status === "busy" || record.status === "blocked") {
+					this.assertBoundPolicyBeforeDispatch(record);
 					this.throwIfCancelled();
 					enqueueAssignment(this.runtime.pool.poolRoot, this.role.name, {
 						assignmentId: this.assignmentId,
@@ -1473,6 +1667,7 @@ class AssignmentProxy implements ChildSession {
 						generation: record.generation,
 						parentEpoch: this.runtime.parentEpoch,
 						task,
+						...this.ipcFieldsForAssignment(),
 					});
 					this.heartbeatExpectedAt = this.runtime.now();
 					return;
@@ -1534,6 +1729,31 @@ class AssignmentProxy implements ChildSession {
 	 * 1) command.json  2) registry busy  3) active.json (commit point).
 	 * Registry failure must not publish active.json.
 	 */
+	private dispatchIdleOrEnqueueLocked(task: string, record: PoolWorkerRecord): void {
+		this.assertBoundPolicyBeforeDispatch(record);
+		if (
+			roleHasPendingWorkAheadOfAssignment(
+				this.runtime.pool.poolRoot,
+				this.role.name,
+				record.generation,
+				this.assignmentId,
+			)
+		) {
+			this.throwIfCancelled();
+			enqueueAssignment(this.runtime.pool.poolRoot, this.role.name, {
+				assignmentId: this.assignmentId,
+				workerId: this.workerId,
+				generation: record.generation,
+				parentEpoch: this.runtime.parentEpoch,
+				task,
+				...this.ipcFieldsForAssignment(),
+			});
+			this.heartbeatExpectedAt = this.runtime.now();
+			return;
+		}
+		this.dispatchActiveLocked(task, record);
+	}
+
 	private dispatchActiveLocked(task: string, record: PoolWorkerRecord): void {
 		if (record.generation !== this.generation || record.workerId !== this.workerId) {
 			throw new Error("dispatch generation/worker fence mismatch");
@@ -1542,38 +1762,30 @@ class AssignmentProxy implements ChildSession {
 		if (!record.paneId || !record.agentName) {
 			throw new Error("dispatch requires live pane/agent identity");
 		}
-		const paths = ensureAssignmentSpool(
+		ensureAssignmentSpool(
 			this.runtime.pool.poolRoot,
 			this.role.name,
 			this.assignmentId,
 		);
-		atomicWriteJson(paths.command, {
-			version: 1,
-			type: "prompt",
-			task,
-			issuedAt: new Date(this.runtime.now()).toISOString(),
-			runId: this.assignmentId,
+		const ipcFields = this.ipcFieldsForAssignment();
+		const outcome = publishAssignmentCommandLocked({
+			pool: this.runtime.pool,
+			poolRoot: this.runtime.pool.poolRoot,
+			role: this.role.name,
 			workerId: this.workerId,
 			generation: this.generation,
-			parentEpoch: this.runtime.parentEpoch,
-		});
-		this.runtime.pool.upsert({
-			...record,
-			status: "busy",
-			activeAssignmentId: this.assignmentId,
-			activeParentEpoch: this.runtime.parentEpoch,
-			updatedAt: new Date(this.runtime.now()).toISOString(),
-		});
-		const control = workerControlPaths(this.runtime.pool.poolRoot, this.role.name);
-		const active: WorkerActivePointer = {
-			version: 1,
 			assignmentId: this.assignmentId,
-			generation: this.generation,
 			parentEpoch: this.runtime.parentEpoch,
-			dispatchedAt: new Date(this.runtime.now()).toISOString(),
-		};
-		atomicWriteJson(control.active, active);
-		// After durable dispatch, this prompted assignment should expect heartbeats.
+			task,
+			now: () => this.runtime.now(),
+			rollbackRecord: record,
+			...(ipcFields.capability !== undefined || ipcFields.modelPolicy !== undefined
+				? { commandExtras: ipcFields }
+				: {}),
+		});
+		if (!outcome.ok) {
+			throw new Error(`dispatch publication failed (${outcome.reason})`);
+		}
 		this.heartbeatExpectedAt = this.runtime.now();
 	}
 
@@ -1607,59 +1819,62 @@ class AssignmentProxy implements ChildSession {
 
 		let paneId: string | undefined;
 		try {
-			const split = await this.runtime.client.splitPane({
-				pane: this.runtime.parentPaneId,
-				direction: this.runtime.direction,
-				cwd: this.runtime.cwd,
-				noFocus: true,
-				env: workerEnv,
-			});
-			paneId = split.paneId;
-			this.paneId = paneId;
-			const splitPaneId = split.paneId;
-			this.throwIfCancelled();
-
-			// Persist paneId into the starting reservation immediately after split
-			// (before rename/start) so parent death leaves closable evidence.
-			const persisted = withRoleLock(this.runtime.pool.poolRoot, this.role.name, () => {
-				const record = this.runtime.pool.getByRole(this.role.name);
-				if (!record || !this.matchesProvisioningOwnerLocked(record, generation)) {
-					return false;
-				}
-				this.runtime.pool.upsert({
-					...record,
-					paneId: splitPaneId,
-					agentName,
-					cwd: this.runtime.cwd,
-					generationTombstone: Math.max(record.generationTombstone, generation),
-					updatedAt: new Date(this.runtime.now()).toISOString(),
-				});
-				return true;
-			});
-			if (!persisted) {
-				// Stale/superseded split: close the orphan pane; do not mutate foreign gen.
-				let closePaneSucceeded = false;
-				try {
-					await this.runtime.client.closePane(splitPaneId);
-					closePaneSucceeded = true;
-				} catch {
-					closePaneSucceeded = false;
-				}
-				if (!closePaneSucceeded) {
-					this.recordOrphanPaneCloseFailure({
-						generation,
-						paneId: splitPaneId,
-						agentName,
-						reason: "provision_superseded_after_split_close_failed",
+			const splitPaneId = await withPaneLifecycleLockAsync(
+				this.runtime.pool.poolRoot,
+				async () => {
+					const split = await this.runtime.client.splitPane({
+						pane: this.runtime.parentPaneId,
+						direction: this.runtime.direction,
+						cwd: this.runtime.cwd,
+						noFocus: true,
+						env: workerEnv,
 					});
-				}
-				throw new ProvisioningFailure({
-					message: "Worker provision superseded after pane split",
-					agentName,
-					paneId: splitPaneId,
-					closePaneSucceeded,
-				});
-			}
+					const id = split.paneId;
+					this.paneId = id;
+					const persisted = withRoleLock(this.runtime.pool.poolRoot, this.role.name, () => {
+						const record = this.runtime.pool.getByRole(this.role.name);
+						if (!record || !this.matchesProvisioningOwnerLocked(record, generation)) {
+							return false;
+						}
+						this.runtime.pool.upsert({
+							...record,
+							paneId: id,
+							agentName,
+							cwd: this.runtime.cwd,
+							generationTombstone: Math.max(record.generationTombstone, generation),
+							updatedAt: new Date(this.runtime.now()).toISOString(),
+						});
+						return true;
+					});
+					if (!persisted) {
+						let closePaneSucceeded = false;
+						try {
+							await this.runtime.client.closePane(id);
+							closePaneSucceeded = true;
+						} catch {
+							closePaneSucceeded = false;
+						}
+						if (!closePaneSucceeded) {
+							this.recordOrphanPaneCloseFailure({
+								generation,
+								paneId: id,
+								agentName,
+								reason: "provision_superseded_after_split_close_failed",
+							});
+						}
+						throw new ProvisioningFailure({
+							message: "Worker provision superseded after pane split",
+							agentName,
+							paneId: id,
+							closePaneSucceeded,
+						});
+					}
+					this.throwIfCancelled();
+					return id;
+				},
+				{ now: this.runtime.now, sleep: this.runtime.sleep },
+			);
+			paneId = splitPaneId;
 
 			await this.runtime.client.renamePane(splitPaneId, `Momo ${this.role.name}`);
 			await this.runtime.client.reportMetadata(splitPaneId, {
@@ -1685,6 +1900,16 @@ class AssignmentProxy implements ChildSession {
 				"-e",
 				herdrExtension,
 			];
+			if (this.assignmentPolicy) {
+				agentArgs.push(
+					"--provider",
+					this.assignmentPolicy.provider,
+					"--model",
+					this.assignmentPolicy.model,
+					"--thinking",
+					this.assignmentPolicy.reasoning,
+				);
+			}
 
 			await this.runtime.client.agentStart({
 				name: agentName,
@@ -1694,10 +1919,21 @@ class AssignmentProxy implements ChildSession {
 				agentArgs,
 			});
 			this.throwIfCancelled();
+			const boundPolicy =
+				this.policyFeatureActive && this.assignmentPolicy
+					? toIpcModelPolicy(this.assignmentPolicy)
+					: undefined;
 			const manifest: WorkerManifest = {
-				version: 2, poolKey: this.runtime.identity.poolKey, workerId: this.workerId,
-				generation, role: this.role.name, cwd: this.runtime.cwd, paneId: splitPaneId, agentName,
+				version: this.policyFeatureActive ? 3 : 2,
+				poolKey: this.runtime.identity.poolKey,
+				workerId: this.workerId,
+				generation,
+				role: this.role.name,
+				cwd: this.runtime.cwd,
+				paneId: splitPaneId,
+				agentName,
 				createdAt: new Date(this.runtime.now()).toISOString(),
+				...(boundPolicy !== undefined ? { boundPolicy } : {}),
 			};
 			atomicWriteJson(control.manifest, manifest);
 			return splitPaneId;
@@ -1809,10 +2045,15 @@ class AssignmentProxy implements ChildSession {
 							if (record.status === "starting") {
 								// Only the exact live provisioning owner may promote starting→idle.
 								if (this.matchesProvisioningOwnerLocked(record, this.generation)) {
+									const boundPolicy =
+										this.policyFeatureActive && this.assignmentPolicy
+											? toIpcModelPolicy(this.assignmentPolicy)
+											: undefined;
 									this.runtime.pool.upsert(
 										withoutProvisioningOwnership(record, {
 											status: "idle",
 											updatedAt: new Date(this.runtime.now()).toISOString(),
+											...(boundPolicy !== undefined ? { boundPolicy } : {}),
 										}),
 									);
 									this.paneId = record.paneId;
@@ -2063,13 +2304,16 @@ export function createHerdrChildSessionFactory(options: HerdrFactoryOptions): Ch
 		reportDiagnostic: options.reportDiagnostic ?? defaultDiagnosticReporter,
 	};
 
-	return async ({ cwd, role }: ChildSessionFactoryInput) => {
+	return async ({ cwd, role, assignmentPolicy, policyFeatureActive }: ChildSessionFactoryInput) => {
 		// Factory still accepts the parent request cwd (must match parent options).
 		if (cwd !== options.cwd) {
 			throw new Error("Child working directory must match the parent working directory");
 		}
-		// Assignment proxy only — no pane/queue until prompt().
-		return new AssignmentProxy(role, runtime);
+		const frozen: FrozenAssignmentPolicy = {
+			policyFeatureActive: policyFeatureActive === true,
+			assignmentPolicy,
+		};
+		return new AssignmentProxy(role, runtime, frozen);
 	};
 }
 
