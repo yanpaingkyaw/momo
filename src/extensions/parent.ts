@@ -382,6 +382,19 @@ export function installMomoParent(pi: ExtensionAPI, options: InstallMomoParentOp
 		},
 	});
 
+	function formatCleanupRefusedSummary(refused: readonly PoolWorkerRecord[]): string {
+		if (refused.length === 0) return "";
+		const counts = new Map<string, number>();
+		for (const worker of refused) {
+			counts.set(worker.status, (counts.get(worker.status) ?? 0) + 1);
+		}
+		const detail = [...counts.entries()]
+			.sort(([a], [b]) => a.localeCompare(b))
+			.map(([status, count]) => `${count} ${status}`)
+			.join(", ");
+		return `Refused ${refused.length} ineligible live worker(s) (${detail}).`;
+	}
+
 	pi.registerCommand("momo-cleanup", {
 		description:
 			"Close idle/unhealthy role-pool workers and retry orphan panes from supersession close failures. Use --force for uncertain (exact lease owner). Refuses busy/blocked.",
@@ -744,9 +757,7 @@ export function installMomoParent(pi: ExtensionAPI, options: InstallMomoParentOp
 				[
 					`Closed ${closed} worker pane(s).`,
 					orphanClosed > 0 ? `Closed ${orphanClosed} orphan pane(s).` : "",
-					refused.length
-						? `Refused ${refused.length} busy/blocked/starting${force ? "" : "/uncertain"} worker(s).`
-						: "",
+					refused.length ? formatCleanupRefusedSummary(refused) : "",
 					...notes,
 				]
 					.filter(Boolean)

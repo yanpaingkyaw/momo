@@ -456,7 +456,7 @@ export function selectClosablePoolWorkers(
 ): { closable: PoolWorkerRecord[]; refused: PoolWorkerRecord[] } {
 	const force = options.force === true;
 	const closable = workers.filter((worker) => {
-		if (worker.generation === 0 && !worker.paneId) return false; // tombstone-only
+		if (isArchivalTombstone(worker)) return false;
 		if (worker.status === "busy" || worker.status === "blocked" || worker.status === "starting") {
 			return false;
 		}
@@ -473,7 +473,9 @@ export function selectClosablePoolWorkers(
 	});
 	const closableIds = new Set(closable.map((worker) => worker.workerId + ":" + worker.generation));
 	const refused = workers.filter(
-		(worker) => !closableIds.has(worker.workerId + ":" + worker.generation),
+		(worker) =>
+			!isArchivalTombstone(worker) &&
+			!closableIds.has(worker.workerId + ":" + worker.generation),
 	);
 	return { closable, refused };
 }
